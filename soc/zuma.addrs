@@ -1,0 +1,15 @@
+# zuma block addresses, by devices/akita/soc/zuma-addrs.py from device-tree.dtb: notes, not boot-arguments
+zuma_chipid=0x10000000	# chip id: /chipid@10000000
+zuma_gsa=0x16490000	# GSA (security processor) mailbox: /gsa-ns
+zuma_pinctrl=0x10840000	# first of the 13 pin controllers: /pinctrl@10840000
+zuma_cmu=0x26040000	# clock management unit: /clock-controller@26040000
+zuma_pmu=0x15460000	# power management unit: /system-controller@15460000
+zuma_gpu=0x1f000000	# Mali G3D GPU: /mali@1F000000
+zuma_tpu=0x1a000000	# Edge TPU: /rio@1A000000
+zuma_decon=0x19470000	# first display controller (DECON0): /drmdecon@19470000
+zuma_dsim=0x19440000	# first DSI host (DSIM0): /drmdsim@19440000
+zuma_sysmmu_pcie=0x12060000	# SysMMU of the PCIe block: /sysmmu@12060000
+zuma_gsa_mem=0x90200000	# reserved memory: GSA: /reserved-memory/gsa@90200000
+zuma_tpu_fw_mem=0x93000000	# reserved memory: TPU firmware: /reserved-memory/tpu_fw@93000000
+zuma_aoc_mem=0x94000000	# reserved memory: always-on compute: /reserved-memory/aoc@94000000
+zuma_pkvm_fw_mem=0x8b000000	# reserved memory: pKVM guest firmware: /reserved-memory/pkvm_guest_firmware

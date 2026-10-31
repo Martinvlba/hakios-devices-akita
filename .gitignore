@@ -1,0 +1,5 @@
+# What devices/akita/pull-boot-info.sh pulls from the phone stays out: its properties, device tree and memory map carry
+# the phone's own identifiers (serial, SoC id). The first-boot logs read back from pstore are kept.
+boot-info/*
+!boot-info/first-boot-*.txt
+__pycache__/

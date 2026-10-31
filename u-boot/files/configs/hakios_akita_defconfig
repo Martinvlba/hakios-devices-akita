@@ -1,0 +1,61 @@
+# HakiOS's U-Boot for the Pixel 8a (akita, Google Tensor G3 "zuma"): started by Google's bootloader from RAM
+# (fastboot boot), never flashed. U-Boot's generic Exynos phone board (board/samsung/exynos-mobile), which takes over
+# from a vendor bootloader the way Linux does, with what zuma has in U-Boot today: nothing but the CPU, the RAM, the
+# timer, PSCI and the framebuffer the bootloader left running. No clocks, pins, GPIO, USB, UFS or eMMC: U-Boot has no
+# driver for any of zuma's, so there is no fastboot, no keys and no storage here yet, and the loader is taken from the
+# boot image's ramdisk (cmd/hakios.c) and shows what it does on the screen only.
+CONFIG_ARM=y
+CONFIG_SKIP_LOWLEVEL_INIT=y
+# the arch timer's clock-frequency in the phone's device tree; CNTFRQ_EL0 is not set by the firmware
+CONFIG_COUNTER_FREQUENCY=24576000
+CONFIG_ARMV8_CNTFRQ_BROKEN=y
+CONFIG_POSITION_INDEPENDENT=y
+CONFIG_ARCH_EXYNOS=y
+# no Exynos family (ARCH_EXYNOS9's only board is the E850-96, which would take the board's place), as upstream's
+# exynos-mobile_defconfig
+CONFIG_TARGET_EXYNOS_MOBILE=y
+CONFIG_SYS_MALLOC_LEN=0x2000000
+CONFIG_SYS_MALLOC_F_LEN=0x16000
+# four banks of 2 GiB (zuma-akita.dts, from the phone's memory@... nodes)
+CONFIG_NR_DRAM_BANKS=4
+CONFIG_DEFAULT_DEVICE_TREE="exynos/google/zuma-akita"
+CONFIG_OF_UPSTREAM=y
+CONFIG_SYS_BOOTM_LEN=0x2000000
+CONFIG_SYS_LOAD_ADDR=0x80000000
+# the device tree and the ramdisk Google's bootloader handed over (cmd/hakios.c reads /chosen linux,initrd-*)
+CONFIG_SAVE_PREV_BL_FDT_ADDR=y
+CONFIG_SAVE_PREV_BL_INITRAMFS_START_ADDR=y
+CONFIG_ENV_SOURCE_FILE="hakios-akita"
+CONFIG_SYS_PBSIZE=1024
+# CONFIG_DISPLAY_CPUINFO is not set
+# exynos-mobile's misc_init_r() wants an eMMC (the boot partition for capsules, a fastboot buffer): this phone has UFS,
+# which U-Boot cannot reach, and a failed init call would stop U-Boot
+# CONFIG_MISC_INIT_R is not set
+# preboot unmasks the panel's trigger before anything else (hakios-akita.env)
+CONFIG_USE_PREBOOT=y
+CONFIG_HUSH_PARSER=y
+CONFIG_CMD_BOOTMENU=y
+CONFIG_CMD_PAUSE=y
+CONFIG_CMD_POWEROFF=y
+CONFIG_CMD_HAKIOS=y
+# the screen is the console: no serial port is reachable on the phone
+CONFIG_VIDEO=y
+CONFIG_VIDEO_SIMPLE=y
+CONFIG_CONSOLE_RECORD=y
+CONFIG_CONSOLE_RECORD_INIT_F=y
+CONFIG_CONSOLE_RECORD_OUT_SIZE=0x6000
+# CONFIG_REQUIRE_SERIAL_CONSOLE is not set
+CONFIG_PANIC_HANG=y
+CONFIG_SYSRESET=y
+# reset through PSCI's SYSTEM_RESET (psci { method = "smc" }); ARM_SMCCC brings the PSCI firmware driver
+CONFIG_ARM_SMCCC=y
+CONFIG_SYSRESET_PSCI=y
+# CONFIG_PSCI_RESET is not set
+# The HakiOS loader keeps U-Boot's boot services while the kernel runs and has a watchdog of its own:
+# a watchdog U-Boot started would bite the phone in the middle of a run.
+# CONFIG_WATCHDOG_AUTOSTART is not set
+# Nothing on the phone's storage is ever written by this U-Boot: no capsule updates
+# CONFIG_EFI_RUNTIME_UPDATE_CAPSULE is not set
+# CONFIG_EFI_CAPSULE_ON_DISK is not set
+# CONFIG_EFI_CAPSULE_FIRMWARE_RAW is not set
+# CONFIG_TOOLS_MKEFICAPSULE is not set

@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Pixel 8a (akita): the common kernel, the zuma family's facts, and this device's own.
+#include common_defconfig
+#include zuma.config
+#include akita.config

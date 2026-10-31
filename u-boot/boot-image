@@ -1,0 +1,18 @@
+# How Google's bootloader on the Pixel 8a wants the image of `fastboot boot` (tools/mkubootimg.py, boot_image_style()).
+#
+# Read from the phone's own boot partition (devices/akita/pull-boot-info.sh, 2026-10-31; bootloader akita-16.4-14540574):
+# boot image header version 4, page 4096, the kernel in LZ4's legacy frame (02 21 4c 18), no ramdisk in boot (Android's
+# is in init_boot); vendor_boot header version 4 without a device tree (the Pixel 8 family has vendor_kernel_boot).
+# The bootloader takes the device tree and the vendor ramdisks from the phone's own active slot and puts the ramdisks in
+# front of this image's (cmd/hakios.c looks for the container behind them). u-boot.bin goes in as the phone's own kernel
+# does, LZ4-framed: an arm64 Image with Linux's header, which the bootloader starts at EL2 (the phone runs protected KVM:
+# androidboot.hypervisor.version = "kvm.arm-protected"), handing over its own device tree.
+header_version 4
+kernel lz4
+# zuma's vbmeta chains boot: an image with no AVB footer is refused even unlocked (the bootloader says "Booting OKAY" and
+# restarts into fastboot a few seconds later: seen with every image without one, 2026-10-31). An unsigned footer, which
+# an unlocked bootloader allows, made for the boot partition's size (fastboot getvar partition-size:boot_a: 0x4000000).
+avb_footer 0x4000000
+# The bootloader never loads boot's ramdisk (it takes init_boot's: the ramdisk at 0x86000000 was the vendor's and
+# init_boot's, 62926507 bytes, no container; seen 2026-10-31): the container rides in the kernel, behind U-Boot.
+container kernel

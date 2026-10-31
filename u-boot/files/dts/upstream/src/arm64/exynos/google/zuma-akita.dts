@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * The Pixel 8a (akita, Google Tensor G3 "zuma") for HakiOS's U-Boot.
+ *
+ * Google's bootloader starts U-Boot from RAM (fastboot boot), as it would start Linux; U-Boot starts the HakiOS
+ * loader from the boot image's ramdisk (cmd/hakios.c). U-Boot has no driver for any of zuma's blocks (no clocks,
+ * pins, GPIO, USB PHY or UFS), so this tree holds only what U-Boot can use as the bootloader left it: the RAM, the
+ * memory the firmware and the remote processors keep, the panel's framebuffer, the arch timer and PSCI.
+ *
+ * Every number is the phone's own, from its Android device tree (/sys/firmware/fdt; devices/akita/prebuilt/
+ * device-tree.dtb): the four 2 GiB banks of memory@..., psci { method = "smc" }, the arch timer's clock-frequency,
+ * and the statically placed /reserved-memory regions (the ones in DRAM; regions Linux places itself by size and
+ * alloc-ranges are not placed yet when U-Boot runs). Regions that are not no-map in Android's tree are no-map here
+ * too: nothing in them is U-Boot's or the loader's.
+ *
+ * Status: written from the device tree, not yet run on the phone.
+ */
+
+/dts-v1/;
+
+/ {
+	model = "Google Pixel 8a";
+	/* the loader knows the phone by "google,zuma" here (xnuloader/loader.c, firmware_tree_is()) */
+	compatible = "google,akita", "google,zuma";
+	chassis-type = "handset";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * The panel (google-ak3b, 1080 x 2400, DSI command mode) as the bootloader left it. The address is the one
+		 * DPP0's RDMA reads after Google's bootloader on the Pixel 8 Pro and 7 Pro (zuma and gs201, the same bootloader
+		 * family; derekross/omarchy-mobile, husky), and Linux's Pixel 6 trees give the same (gs101-pixel-common.dtsi). On
+		 * the 8a it has not been read yet: Android's tree does not say, and Linux reprograms DECON0 before a shell can look.
+		 * The bootloader leaves DECON0's trigger masked; the environment unmasks it (hakios-akita.env, preboot). A wrong
+		 * address writes into free RAM (between abl@f8800000 and dss_log_reserved@fd3f0000), which a restart clears.
+		 * No clocks: U-Boot keeps the display running by not touching it.
+		 */
+		framebuffer0: framebuffer@fac00000 {
+			compatible = "simple-framebuffer";
+			reg = <0x0 0xfac00000 0x0 (1080 * 2400 * 4)>;
+			width = <1080>;
+			height = <2400>;
+			stride = <(1080 * 4)>;
+			format = "a8r8g8b8";
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x80000000>,
+		      <0x8 0x80000000 0x0 0x80000000>,
+		      <0x9 0x00000000 0x0 0x80000000>,
+		      <0x9 0x80000000 0x0 0x80000000>;
+	};
+
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+
+	/* board/samsung/exynos-mobile's timer_init() takes the rate from here: the firmware leaves CNTFRQ_EL0 unset */
+	timer {
+		compatible = "arm,armv8-timer";
+		clock-frequency = <24576000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* HakiOS: the loader's payload, 64 MiB (cmd/hakios.c PAYLOAD_BASE); clear of every region below */
+		hakios-payload@f0000000 {
+			reg = <0x0 0xf0000000 0x0 0x4000000>;
+			no-map;
+		};
+
+		/* the bootloader's splash framebuffer (above): kept from U-Boot's allocations */
+		splash@fac00000 {
+			reg = <0x0 0xfac00000 0x0 (1080 * 2400 * 4)>;
+			no-map;
+		};
+
+		/* from the Android device tree, as it placed them */
+		pkvm_guest_firmware@8b000000 {
+			reg = <0x0 0x8b000000 0x0 0x100000>;
+			no-map;
+		};
+		ect_binary@90000000 {
+			reg = <0x0 0x90000000 0x0 0x60000>;
+			no-map;
+		};
+		gsa@90200000 {
+			reg = <0x0 0x90200000 0x0 0x3ff000>;
+			no-map;
+		};
+		gsa@905ff000 {
+			reg = <0x0 0x905ff000 0x0 0x1000>;
+			no-map;
+		};
+		gxp_scratchpad@91300000 {
+			reg = <0x0 0x91300000 0x0 0x60000>;
+			no-map;
+		};
+		iif_wait_table@91360000 {
+			reg = <0x0 0x91360000 0x0 0x20000>;
+			no-map;
+		};
+		iif_signal_table@91380000 {
+			reg = <0x0 0x91380000 0x0 0x20000>;
+			no-map;
+		};
+		gxp_secure_data@91400000 {
+			reg = <0x0 0x91400000 0x0 0x900000>;
+			no-map;
+		};
+		gxp_fw@91d00000 {
+			reg = <0x0 0x91d00000 0x0 0x300000>;
+			no-map;
+		};
+		gxp_mcu_fw@92000000 {
+			reg = <0x0 0x92000000 0x0 0x400000>;
+			no-map;
+		};
+		tpu_fw@93000000 {
+			reg = <0x0 0x93000000 0x0 0x1000000>;
+			no-map;
+		};
+		aoc@94000000 {
+			reg = <0x0 0x94000000 0x0 0x3000000>;
+			no-map;
+		};
+		xhci_dma_dram@97000000 {
+			reg = <0x0 0x97000000 0x0 0x400000>;
+			no-map;
+		};
+		sec_dram@b6200000 {
+			reg = <0x0 0xb6200000 0x0 0x9e00000>;
+			no-map;
+		};
+		seclog_mem@c3000000 {
+			reg = <0x0 0xc3000000 0x0 0x90000>;
+			no-map;
+		};
+		header@d8100000 {
+			reg = <0x0 0xd8100000 0x0 0x10000>;
+			no-map;
+		};
+		log_kevents@d8110000 {
+			reg = <0x0 0xd8110000 0x0 0x700000>;
+			no-map;
+		};
+		log_s2d@d8810000 {
+			reg = <0x0 0xd8810000 0x0 0x1800000>;
+			no-map;
+		};
+		log_array_reset@da010000 {
+			reg = <0x0 0xda010000 0x0 0xa00000>;
+			no-map;
+		};
+		log_array_panic@daa10000 {
+			reg = <0x0 0xdaa10000 0x0 0xa00000>;
+			no-map;
+		};
+		log_slcdump@db410000 {
+			reg = <0x0 0xdb410000 0x0 0x1100000>;
+			no-map;
+		};
+		log_preslcdump@dc510000 {
+			reg = <0x0 0xdc510000 0x0 0x1100000>;
+			no-map;
+		};
+		log_bcm@dd610000 {
+			reg = <0x0 0xdd610000 0x0 0x400000>;
+			no-map;
+		};
+		log_itmon@dda10000 {
+			reg = <0x0 0xdda10000 0x0 0x10000>;
+			no-map;
+		};
+		log_s2d_extract@dda20000 {
+			reg = <0x0 0xdda20000 0x0 0x600000>;
+			no-map;
+		};
+		sec_pt@e0000000 {
+			reg = <0x0 0xe0000000 0x0 0x3800000>;
+			no-map;
+		};
+		cp_rmem_1@e8000000 {
+			reg = <0x0 0xe8000000 0x0 0x2000000>;
+			no-map;
+		};
+		cp_rmem@ea400000 {
+			reg = <0x0 0xea400000 0x0 0xc00000>;
+			no-map;
+		};
+		cp_msi_rmem@f6200000 {
+			reg = <0x0 0xf6200000 0x0 0x1000>;
+			no-map;
+		};
+		abl@f8800000 {
+			reg = <0x0 0xf8800000 0x0 0x1000000>;
+			no-map;
+		};
+		dss_log_reserved@fd3f0000 {
+			reg = <0x0 0xfd3f0000 0x0 0xe000>;
+			no-map;
+		};
+		debug_kinfo_reserved@fd3fe000 {
+			reg = <0x0 0xfd3fe000 0x0 0x1000>;
+			no-map;
+		};
+		ramoops_mem@fd3ff000 {
+			reg = <0x0 0xfd3ff000 0x0 0x400000>;
+			no-map;
+		};
+		bldr_log_reserved@fd800000 {
+			reg = <0x0 0xfd800000 0x0 0x100000>;
+			no-map;
+		};
+	};
+};

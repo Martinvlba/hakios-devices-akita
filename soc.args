@@ -1,0 +1,3 @@
+# devices/akita/soc.args: the soc_* boot-arguments the kernel reads (tools/soc-args.py); the run scripts add them to the command line.
+# None: the Pixel 8a's SoC is Google Tensor G3 (zuma), and those arguments are the Qualcomm modem's and IPA's.
+# zuma's own block addresses are notes for drivers still to be written: soc/zuma.addrs (made by soc/zuma-addrs.py).

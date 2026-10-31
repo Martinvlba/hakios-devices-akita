@@ -1,0 +1,155 @@
+HakiOS U-Boot console (cmd/hakios.c, hakios_pstore)
+Core:  8 devices, 7 uclasses, devicetree: separate
+MMC:   
+Loading Environment from nowhere... OK
+In:    nulldev
+Out:   vidconsole
+Err:   vidconsole
+Net:   No ethernet found.
+[oosexgang] hakios: the console is kept at 0xfd5ff000 too (/sys/fs/pstore after the restart)
+[?25h
+[oosexgang] display: DECON0 trigger unmasked
+[2KHit any key to stop autoboot: 0
+[oosexgang] hakios: looking behind U-Boot as loaded: 0x80000000 (now at 0xfff84000)
+[oosexgang] hakios: the container is in the boot image's kernel, at 0x800f0000, 0xf0000 past U-Boot
+[oosexgang] hakios: payload of 14835600 bytes at 0xf0000000
+[oosexgang] hakios: loader of 76288 bytes at 0x9fffd0000
+Booting <NULL>
+== XNULOADER v3 ==
+
+   #   #   ###   #   #  #####   ###    ####
+   #   #  #   #  #  #     #    #   #  #
+   #####  #####  ###      #    #   #   ###
+   #   #  #   #  #  #     #    #   #      #
+   #   #  #   #  #   #  #####   ###   ####
+
+   hello hakios-kernel!
+   kernel.ver=2.1.13-hakios-darwin22.5-zuma-ga3384e03-dirty
+
+CurrentEL=2 MIDR=411fd461 MMFR0=22200101122 CNTFRQ=24576000 image=9ff292000
+display 1080 x 2400 at fac00000
+platform akita
+payload entry 'kernel' size e21e70
+payload entry 'ramdisk' size 4060
+payload entry 'cmdline' size a
+payload entry 'kernel.ver' size 2e
+kernel va fffffff007004000..fffffff0081b5e70 entry fffffff0074194a8
+largest free block 880000000 size 17e000000
+phys window 880000000 size 17e000000, claim status 0
+kernel loaded at pa 883004000..8841b8000
+ramdisk at pa 8841b8000 size 8000
+EL2: the kernel runs on this core alone (bootcpu= and cpus= are not done from EL2 yet)
+return slot patched at 88341a7f0, checkpoint 0
+cmdline: 91 of 607 characters
+device tree 8841c0000 len 2d4c, boot_args 8841d0000, top 8841d4000
+cmdline: debug=0x8 cpus=1 rd=md0 hakios_kver=2.1.13-hakios-darwin22.5-zuma-ga3384e03-dirty -v cpus=1
+jumping to 8834194a8
+kernel returned: log at 883ae49c0, 22224 bytes
+returned 22224 0
+== KERNEL LOG ==
+
+Hello from user space on Darwin!
+I am process 1, uid 0, console fd 0.
+
+--- kernel message buffer ---
+[   83.949254]:  vm_cache_geometry_colors: 0
+[   83.949293]: do_cacheid() - 512 bytes Unknown cache (I:256 D:256 (separate)), 16-way assoc, 64 bytes/line
+[   83.951082]: kprintf initialized
+[   83.951290]: initialize_screen: b=FAC00000, w=00000438, h=00000960, r=000010E0, d=00000000
+[   83.951367]: pe_arm_init_interrupts: args: 0xfffffff007a92720
+[   83.951374]: pe_arm_map_interrupt_controller: soc_phys:  0x10000000
+[   83.951383]: pe_arm_map_interrupt_controller: failed to find the interrupt-controller.
+[   83.951391]: pe_arm_init_debug: failed to find cpu-debug-interface
+[   83.951442]: gic: v3, distributor 0xfffffff1c7264000, cpu 0's redistributor 0xfffffff1c7274000, virtual timer on PPI 27
+[   83.951500]: Darwin Kernel Version 22.5.0: Sat Oct 31 21:44:00 EET 2026; martin:xnu-8796.121.2[xnu-8796.121.2-dirty]/BUILD/obj/DEVELOPMENT_ARM64_BCM2837
+[   83.1011888]: pmap_startup() init/release time: 54503 microsec
+[   83.1011953]: pmap_startup() delayed init/release of 0 pages
+[   83.1011984]: vm_page_bootstrap: 385367 free pages, 5801 wired pages, (up to 0 of which are delayed free)
+[   83.1021873]: VM boostrap: 102 maps, 204 entries and 512 holes available
+[   83.1022038]: Maximum number of VM swap files: 5
+[   83.1022367]: ipc_kernel_copy_map     : 0xfffffff00211c000 - 0xfffffff00291c000 (8M)
+[   83.1022391]: bsd_pageable            : 0xfffffff00291c000 - 0xfffffff003b64000 (18M)
+[   83.1022402]: gIOKitPageableFixed0    : 0xfffffff1ca000000 - 0xfffffff1d0000000 (96M)
+[   83.1022412]: ipc_kernel_map          : 0xfffffff1d0000000 - 0xfffffff1d2000000 (32M)
+[   83.1022421]: gIOKitPageableFixed1    : 0xfffffff1d2000000 - 0xfffffff1d8000000 (96M)
+[   83.1022432]: gIOKitPageableFixed3    : 0xfffffff1d8000000 - 0xfffffff1de000000 (96M)
+[   83.1022441]: bufferhdr               : 0xfffffff1de000000 - 0xfffffff1de3dc000 (3952K)
+[   83.1022450]: mb                      : 0xfffffff1de3dc000 - 0xfffffff1e43dc000 (96M)
+[   83.1022460]: kmem_data_range         : 0xfffffff1e43dc000 - 0xfffffff319acc000 (4950M)
+[   83.1022470]: compressor              : 0xfffffff319acc000 - 0xfffffff4bfae8000 (6G)
+[   83.1022480]: kmem_ptr_range          : 0xfffffff4bfae8000 - 0xfffffff55a5e8000 (2475M)
+[   83.1022489]: gIOKitPageableFixed2    : 0xfffffff55a5e8000 - 0xfffffff5605e8000 (96M)
+[   83.1022498]: kmem_ptr_range_meta     : 0xfffffff5605e8000 - 0xfffffff560660000 (480K)
+[   83.1022507]: kmem_sprayqtn_range     : 0xfffffff560660000 - 0xfffffff5fb1dc000 (2475M)
+[   83.1022517]: zone_meta               : 0xfffffff5fb1dc000 - 0xfffffff5fdbb4000 (41M)
+[   83.1022526]: io_submap               : 0xfffffff5fdbb4000 - 0xfffffff5fe3b4000 (8M)
+[   83.1022535]: zones                   : 0xfffffff5fe3b4000 - 0xfffffffbfe3b4000 (24G)
+[   83.1022837]: kmem_large_ranges[1]    : 0 - 0 (0B)
+[   83.1022846]: kmem_large_ranges[2]    : 0 - 0 (0B)
+[   83.1022852]: kmem_large_ranges[3]    : 0 - 0 (0B)
+[   83.1022859]: kmem_large_ranges[4]    : 0xfffffff573bcf800 - 0xfffffff5fb1dc000 (2166M)
+[   83.1022868]: kmem_large_ranges[5]    : 0xfffffff20aeba000 - 0xfffffff319acc000 (4332M)
+[   83.1022914]: "vm_compressor_mode" is 2
+[   83.1022953]: zone_init: pgzalloc  0xfffffff5fe3b4000:0xfffffff6012f0000 (47M) [1511 slots]
+[   83.1022985]: zone_init: map VM    0xfffffff6012f0000:0xfffffff6e7240000 (3679M)
+[   83.1023009]: zone_init: map RO    0xfffffff6e7240000:0xfffffff733cb0000 (1226M)
+[   83.1023031]: zone_init: map GEN0  0xfffffff733cb0000:0xfffffff819c00000 (3679M)
+[   83.1023056]: zone_init: map GEN1  0xfffffff819c00000:0xfffffff8ffb50000 (3679M)
+[   83.1023078]: zone_init: map GEN2  0xfffffff8ffb50000:0xfffffff9e5aa0000 (3679M)
+[   83.1023101]: zone_init: map GEN3  0xfffffff9e5aa0000:0xfffffffacb9f0000 (3679M)
+[   83.1023124]: zone_init: map DATA  0xfffffffacb9f0000:0xfffffffbfe3b4000 (4905M)
+[   83.1023142]: zone_init: metadata  0xfffffff5fb1ec000:0xfffffff5fc9ec000 (24M)
+[   83.1023154]: zone_init: metabits  0xfffffff5fc9ec000:0xfffffff5fdba4000 (17M)
+[   83.1023161]: zone_init: extra     0:0 (0B)
+[   83.1023781]: VM bootstrap done: 90 maps, 163 entries and 499 holes left
+[   84.005688]: IOKit IOMD setownership ENABLED
+[   84.005707]: ATM subsystem is initialized
+[   84.007078]: OSLog stream configured: stream: 8192 bytes, cache: 2112 bytes
+[   84.007090]: OSLog stream verification: 0
+[   84.007364]: Firehose configured: 16 chunks, 8 io pages
+[   84.007399]: Long logs support configured: size: 16384
+[   84.007573]: Log queues configured: slot count: 8, per-slot size: 32768, total size: 262144
+[   84.007610]: Telemetry: Sampling all tasks once per 1 second
+[   84.007639]: Scheduler: Default of clutch
+[   84.007648]: Setting scheduler priority decay band limit 18
+[   84.007676]: standard timeslicing quantum is 10000 us
+[   84.007682]: standard background quantum is 2500 us
+[   84.007840]: mig_table_max_displ = 54 mach_kobj_count = 371
+[   84.008389]: BANK subsystem is initialized
+[   84.015678]: panic_trace: PE_arm_debug_enable_trace enter
+[   84.015690]: panic_trace: PE_arm_debug_enable_trace exit
+[   84.015718]: kdp_core zlib memory 0x8000
+[   84.015914]: Registered coredump handler for kernel
+[   84.015929]: Serial requested, consistent debug disabled or debug boot arg not present, configuring debugging over serial
+[   84.015934]: Initializing serial KDP
+[   84.028201]: iBoot version: iBoot-8422.100.650
+[   84.028251]: iBoot Stage 2 version: 
+[   84.035282]: IONVRAM.cpp:initImageFormat:1364 - NVRAM size is 8192 bytes
+[   84.035490]: IONVRAM.cpp:getNVRAMProperties:1176 - _bankSize=0x2000, _bankCount=0x1, _currentBank=0
+[   84.035836]: IONVRAMCHRPHandler.cpp:unserializeImage:479 - NVRAM : commonPartitionOffset - 0x30, commonPartitionSize - 0x1fd0, systemPartitionOffset - 0xffffffff, systemPartitionSize - 0
+[   84.036809]: ulock_initialize>thread_max=5120, ull_hash_buckets=2048
+[   84.037404]: minicrypto: registered (md5, sha1, sha2, hmac, aes-ecb/cbc/ctr, hmac-drbg prng); no xts/gcm, no RSA
+[   84.038708]: hakios-kernel: 4 drivers built in (.config): virtio_sound virtio_input virtio_net virtio_blk
+[   84.039087]: calling mpo_policy_init for vnguard
+[   84.039204]: Security policy loaded: Guarded vnode policy (vnguard)
+[   84.039271]: calling mpo_policy_init for AMFI
+[   84.039393]: Security policy loaded: Apple Mobile File Integrity (stand-in) (AMFI)
+[   84.039461]: calling mpo_policy_init for Sandbox
+[   84.039582]: Security policy loaded: Seatbelt sandbox policy (stand-in) (Sandbox)
+[   84.045469]: No POST boot-arg set.
+[   84.046805]: PMRD: PMTraceWorker 0x152533945f43d2e9
+[   84.047567]: PMRD: changePowerStateWithTagToPriv(ON_STATE, 10001)
+[   84.048715]: GenericARMPE: platform "device-tree"
+[   84.048865]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[   84.048876]: [0]ml_processor_register>cpu_id 0xfffffff9e5bf0940 cluster_id 0 cpu_number 0 is type 0
+[   84.048941]: GenericARMCPU: cpu 0 (phys id 0x0) registered
+[   84.049522]: Copyright (c) 1982, 1986, 1989, 1991, 1993
+	The Regents of the University of California. All rights reserved.
+
+[   84.049531]: bsd_init: calling kauth_init
+[   84.049712]: bsd_init: calling process_name
+[   84.049725]: bsd_init: calling get_bsdthread_info
+[   84.049799]: MAC Framework successfully initialized
+[   84.050018]: bsd_init: calling kauth_cred_create
+[   84.050033]: bsd_init: calling chgproccnt
+[   84.050040]: bsd_init: calling kmem_suballoc
