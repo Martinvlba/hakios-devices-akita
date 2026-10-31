@@ -51,8 +51,10 @@ container behind itself (loaded at 0x80000000), the loader came up at EL2 as `pl
 `hello` printed `Hello from user space on Darwin!`, the kernel returned to the loader. What it took: an unsigned AVB
 footer (the bootloader refuses a boot image without one, unlocked or not), the container in the kernel (the bootloader
 loads init_boot's ramdisk, never boot's), DECON0's trigger unmasked, U-Boot's load address noted before it relocates.
-The phone restarts about two minutes after the bootloader hands over, whatever runs (117 and 121 s, twice): most likely
-a watchdog the bootloader leaves running; the log written to the screen was cut there.
+The phone restarted about two minutes after the bootloader handed over, whatever ran (117 and 121 s): the bootloader
+leaves both cluster watchdogs counting with reset on (cl0 WTCON 0x1af39, cl1 0x18021). U-Boot's preboot now stops them
+(`hakios wdt`); the next run went on to the end of the kernel's log and the loader's own reset, 324 s, most of it the
+log drawn on the screen (`boot-info/first-boot-2026-10-31-watchdog-off.txt`). A hang now stays a hang (power key).
 
 Reading a run back: U-Boot keeps its console (with the loader's and the kernel's lines) in the pmsg zone of ramoops
 (`hakios_pstore`); after the restart, in Android as root, `cat /sys/fs/pstore/pmsg-ramoops-0`.
