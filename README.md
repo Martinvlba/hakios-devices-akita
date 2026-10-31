@@ -56,6 +56,14 @@ leaves both cluster watchdogs counting with reset on (cl0 WTCON 0x1af39, cl1 0x1
 (`hakios wdt`); the next run went on to the end of the kernel's log and the loader's own reset, 324 s, most of it the
 log drawn on the screen (`boot-info/first-boot-2026-10-31-watchdog-off.txt`). A hang now stays a hang (power key).
 
+**2026-11-01:** eight cores (`cpus=8`): the kernel starts the other seven itself, the firmware brings them up at EL2,
+and the loader's trampoline (`/chosen/el2-trampoline`) takes each one down to EL1; the big cores join at once, the
+four A510s 28 s later, by design (`boot-info/first-boot-2026-11-01-eight-cores.txt`). zuma's redistributors are 0x20000
+apart (no VLPIS). U-Boot ran with the instruction cache off (Google's bootloader hands over so, and Exynos'
+enable_caches() turned on the data cache only): `hakios load` took 1 min 45 s, now 0.24 s; a whole run, from
+`fastboot boot` to the phone back in Android, takes 50 s (`boot-info/first-boot-2026-11-01-icache.txt`). From the loader
+on, the console goes to pstore only (`hakios_screen=1` keeps the screen too).
+
 Reading a run back: U-Boot keeps its console (with the loader's and the kernel's lines) in the pmsg zone of ramoops
 (`hakios_pstore`); after the restart, in Android as root, `cat /sys/fs/pstore/pmsg-ramoops-0`.
 

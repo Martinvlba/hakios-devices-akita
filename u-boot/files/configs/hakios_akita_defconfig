@@ -38,6 +38,9 @@ CONFIG_CMD_BOOTMENU=y
 CONFIG_CMD_PAUSE=y
 CONFIG_CMD_POWEROFF=y
 CONFIG_CMD_HAKIOS=y
+# how long each step takes, and whether the caches are on (time, dcache, icache): runs read back from pstore
+CONFIG_CMD_TIME=y
+CONFIG_CMD_CACHE=y
 # the screen is the console: no serial port is reachable on the phone
 CONFIG_VIDEO=y
 CONFIG_VIDEO_SIMPLE=y

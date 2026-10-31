@@ -1,0 +1,413 @@
+HakiOS U-Boot console (cmd/hakios.c, hakios_pstore)
+Core:  8 devices, 7 uclasses, devicetree: separate
+MMC:   
+Loading Environment from nowhere... OK
+In:    nulldev
+Out:   vidconsole
+Err:   vidconsole
+Net:   No ethernet found.
+[oosexgang] hakios: the console is kept at 0xfd5ff000 too (/sys/fs/pstore after the restart)
+[?25h
+[oosexgang] display: DECON0 trigger unmasked
+[oosexgang] watchdog at 0x10060000: WTCON 0x1af39 WTDAT 0xffaf WTCNT 0xc046: counting, resets
+[oosexgang] watchdog at 0x10060000: stopped (WTCON 0x1af18)
+[oosexgang] watchdog at 0x10070000: WTCON 0x18021 WTDAT 0x8000 WTCNT 0x8000: counting, resets
+[oosexgang] watchdog at 0x10070000: stopped (WTCON 0x18000)
+[2KHit any key to stop autoboot: 0
+[oosexgang] hakios: looking behind U-Boot as loaded: 0x80000000 (now at 0xfff84000)
+[oosexgang] hakios: the container is in the boot image's kernel, at 0x800f0000, 0xf0000 past U-Boot
+[oosexgang] hakios: payload of 14835648 bytes at 0xf0000000
+[oosexgang] hakios: loader of 80384 bytes at 0x9fffd0000
+Booting <NULL>
+== XNULOADER v3 ==
+
+   #   #   ###   #   #  #####   ###    ####
+   #   #  #   #  #  #     #    #   #  #
+   #####  #####  ###      #    #   #   ###
+   #   #  #   #  #  #     #    #   #      #
+   #   #  #   #  #   #  #####   ###   ####
+
+   hello hakios-kernel!
+   kernel.ver=2.1.13-hakios-darwin22.5-zuma-gd9b31680-dirty
+
+CurrentEL=2 MIDR=411fd461 MMFR0=22200101122 CNTFRQ=24576000 image=9ff291000
+display 1080 x 2400 at fac00000
+platform akita
+payload entry 'kernel' size e21e98
+payload entry 'ramdisk' size 4060
+payload entry 'cmdline' size a
+payload entry 'kernel.ver' size 2e
+kernel va fffffff007004000..fffffff0081b5e98 entry fffffff0074194a8
+largest free block 880000000 size 17e000000
+phys window 880000000 size 17e000000, claim status 0
+kernel loaded at pa 883004000..8841b8000
+ramdisk at pa 8841b8000 size 8000
+return slot patched at 88341a7f0, checkpoint 0
+cmdline: 84 of 607 characters
+cores for the kernel, in the order it takes them: 0 100 200 300 400 500 600 700
+device tree 8841c0000 len 3b10, boot_args 8841d0000, top 8841d4000
+cmdline: debug=0x8 rd=md0 hakios_kver=2.1.13-hakios-darwin22.5-zuma-gd9b31680-dirty -v cpus=8
+jumping to 8834194a8
+kernel returned: log at 883ae49c0, 27315 bytes
+returned 27315 0
+== KERNEL LOG ==
+cpu 3 (phys id 0x300) is a slower core: the scheduler uses it after cpu 4 (phys id 0x400)
+cpu 2 (phys id 0x200) is a slower core: the scheduler uses it after cpu 5 (phys id 0x500)
+cpu 1 (phys id 0x100) is a slower core: the scheduler uses it after cpu 6 (phys id 0x600)
+cpu 0 (phys id 0x0) is a slower core: the scheduler uses it after cpu 7 (phys id 0x700)
+
+Hello from user space on Darwin!
+I am process 1, uid 0, console fd 0.
+
+psci: cpu 5 ends the system: the return to the boot loader is the boot processor's to make
+
+--- kernel message buffer ---
+[  153.703382]:  vm_cache_geometry_colors: 0
+[  153.703427]: do_cacheid() - 512 bytes Unknown cache (I:256 D:256 (separate)), 16-way assoc, 64 bytes/line
+[  153.704835]: kprintf initialized
+[  153.704993]: initialize_screen: b=FAC00000, w=00000438, h=00000960, r=000010E0, d=00000000
+[  153.705082]: pe_arm_init_interrupts: args: 0xfffffff007a92720
+[  153.705091]: pe_arm_map_interrupt_controller: soc_phys:  0x10000000
+[  153.705106]: pe_arm_map_interrupt_controller: failed to find the interrupt-controller.
+[  153.705123]: pe_arm_init_debug: failed to find cpu-debug-interface
+[  153.705185]: gic: v3, distributor 0xfffffff19a664000, cpu 0's redistributor 0xfffffff19a674000, virtual timer on PPI 27
+[  153.705255]: Darwin Kernel Version 22.5.0: Sun Nov  1 00:06:47 EET 2026; martin:xnu-8796.121.2[xnu-8796.121.2-dirty]/BUILD/obj/DEVELOPMENT_ARM64_BCM2837
+[  153.765892]: pmap_startup() init/release time: 54719 microsec
+[  153.765943]: pmap_startup() delayed init/release of 0 pages
+[  153.765967]: vm_page_bootstrap: 385362 free pages, 5806 wired pages, (up to 0 of which are delayed free)
+[  153.775997]: VM boostrap: 102 maps, 204 entries and 512 holes available
+[  153.776161]: Maximum number of VM swap files: 5
+[  153.776493]: ipc_kernel_map          : 0xfffffff19c000000 - 0xfffffff19e000000 (32M)
+[  153.776513]: gIOKitPageableFixed0    : 0xfffffff19e000000 - 0xfffffff1a4000000 (96M)
+[  153.776523]: gIOKitPageableFixed3    : 0xfffffff1a4000000 - 0xfffffff1aa000000 (96M)
+[  153.776532]: gIOKitPageableFixed2    : 0xfffffff1aa000000 - 0xfffffff1b0000000 (96M)
+[  153.776541]: ipc_kernel_copy_map     : 0xfffffff1b0000000 - 0xfffffff1b0800000 (8M)
+[  153.776551]: compressor              : 0xfffffff1b0800000 - 0xfffffff35681c000 (6G)
+[  153.776560]: mb                      : 0xfffffff35681c000 - 0xfffffff35c81c000 (96M)
+[  153.776571]: kmem_sprayqtn_range     : 0xfffffff35c81c000 - 0xfffffff402b98000 (2659M)
+[  153.776581]: bsd_pageable            : 0xfffffff402b98000 - 0xfffffff403de0000 (18M)
+[  153.776591]: zones                   : 0xfffffff403de0000 - 0xfffffffa03de0000 (24G)
+[  153.776600]: io_submap               : 0xfffffffa03de0000 - 0xfffffffa045e0000 (8M)
+[  153.776609]: bufferhdr               : 0xfffffffa045e0000 - 0xfffffffa049bc000 (3952K)
+[  153.776619]: kmem_ptr_range_meta     : 0xfffffffa049bc000 - 0xfffffffa04a3c000 (512K)
+[  153.776628]: zone_meta               : 0xfffffffa04a3c000 - 0xfffffffa07414000 (41M)
+[  153.776636]: kmem_data_range         : 0xfffffffa07414000 - 0xfffffffb53b1c000 (5G)
+[  153.776645]: gIOKitPageableFixed1    : 0xfffffffb53b1c000 - 0xfffffffb59b1c000 (96M)
+[  153.776654]: kmem_ptr_range          : 0xfffffffb59b1c000 - 0xfffffffbffdfc000 (2658M)
+[  153.776934]: kmem_large_ranges[1]    : 0 - 0 (0B)
+[  153.776941]: kmem_large_ranges[2]    : 0 - 0 (0B)
+[  153.776946]: kmem_large_ranges[3]    : 0 - 0 (0B)
+[  153.776954]: kmem_large_ranges[4]    : 0xfffffff37148b800 - 0xfffffff402b98000 (2327M)
+[  153.776963]: kmem_large_ranges[5]    : 0xfffffffa30cf5000 - 0xfffffffb53b1c000 (4654M)
+[  153.777001]: "vm_compressor_mode" is 2
+[  153.777032]: zone_init: pgzalloc  0xfffffff403de0000:0xfffffff406d1c000 (47M) [1511 slots]
+[  153.777063]: zone_init: map VM    0xfffffff406d1c000:0xfffffff4ecc6c000 (3679M)
+[  153.777086]: zone_init: map RO    0xfffffff4ecc6c000:0xfffffff5396dc000 (1226M)
+[  153.777109]: zone_init: map GEN0  0xfffffff5396dc000:0xfffffff61f62c000 (3679M)
+[  153.777130]: zone_init: map GEN1  0xfffffff61f62c000:0xfffffff70557c000 (3679M)
+[  153.777151]: zone_init: map GEN2  0xfffffff70557c000:0xfffffff7eb4cc000 (3679M)
+[  153.777172]: zone_init: map GEN3  0xfffffff7eb4cc000:0xfffffff8d141c000 (3679M)
+[  153.777194]: zone_init: map DATA  0xfffffff8d141c000:0xfffffffa03de0000 (4905M)
+[  153.777211]: zone_init: metadata  0xfffffffa04a4c000:0xfffffffa0624c000 (24M)
+[  153.777221]: zone_init: metabits  0xfffffffa0624c000:0xfffffffa07404000 (17M)
+[  153.777227]: zone_init: extra     0:0 (0B)
+[  153.777809]: VM bootstrap done: 90 maps, 163 entries and 500 holes left
+[  153.784028]: IOKit IOMD setownership ENABLED
+[  153.784046]: ATM subsystem is initialized
+[  153.785787]: OSLog stream configured: stream: 8192 bytes, cache: 2112 bytes
+[  153.785801]: OSLog stream verification: 0
+[  153.786151]: Firehose configured: 16 chunks, 8 io pages
+[  153.786189]: Long logs support configured: size: 16384
+[  153.787422]: Log queues configured: slot count: 64, per-slot size: 32768, total size: 2097152
+[  153.787462]: Telemetry: Sampling all tasks once per 1 second
+[  153.787491]: Scheduler: Default of clutch
+[  153.787499]: Setting scheduler priority decay band limit 18
+[  153.787523]: standard timeslicing quantum is 10000 us
+[  153.787530]: standard background quantum is 2500 us
+[  153.787870]: mig_table_max_displ = 54 mach_kobj_count = 371
+[  153.788182]: BANK subsystem is initialized
+[  153.794626]: panic_trace: PE_arm_debug_enable_trace enter
+[  153.794637]: panic_trace: PE_arm_debug_enable_trace exit
+[  153.794668]: kdp_core zlib memory 0x8000
+[  153.795030]: Registered coredump handler for kernel
+[  153.795045]: Serial requested, consistent debug disabled or debug boot arg not present, configuring debugging over serial
+[  153.795050]: Initializing serial KDP
+[  153.808114]: iBoot version: iBoot-8422.100.650
+[  153.808166]: iBoot Stage 2 version: 
+[  153.815877]: IONVRAM.cpp:initImageFormat:1364 - NVRAM size is 8192 bytes
+[  153.816177]: IONVRAM.cpp:getNVRAMProperties:1176 - _bankSize=0x2000, _bankCount=0x1, _currentBank=0
+[  153.816522]: IONVRAMCHRPHandler.cpp:unserializeImage:479 - NVRAM : commonPartitionOffset - 0x30, commonPartitionSize - 0x1fd0, systemPartitionOffset - 0xffffffff, systemPartitionSize - 0
+[  153.817665]: ulock_initialize>thread_max=5120, ull_hash_buckets=2048
+[  153.818225]: minicrypto: registered (md5, sha1, sha2, hmac, aes-ecb/cbc/ctr, hmac-drbg prng); no xts/gcm, no RSA
+[  153.821223]: hakios-kernel: 4 drivers built in (.config): virtio_sound virtio_input virtio_net virtio_blk
+[  153.821581]: calling mpo_policy_init for vnguard
+[  153.821695]: Security policy loaded: Guarded vnode policy (vnguard)
+[  153.821761]: calling mpo_policy_init for AMFI
+[  153.821885]: Security policy loaded: Apple Mobile File Integrity (stand-in) (AMFI)
+[  153.821952]: calling mpo_policy_init for Sandbox
+[  153.822073]: Security policy loaded: Seatbelt sandbox policy (stand-in) (Sandbox)
+[  153.827850]: No POST boot-arg set.
+[  153.829467]: PMRD: PMTraceWorker 0x1c0b78d4b3936335
+[  153.830076]: PMRD: changePowerStateWithTagToPriv(ON_STATE, 10001)
+[  153.831766]: GenericARMPE: platform "device-tree"
+[  153.831919]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.831930]: [0]ml_processor_register>cpu_id 0xfffffff8d121f580 cluster_id 0 cpu_number 0 is type 0
+[  153.832003]: GenericARMCPU: cpu 0 (phys id 0x0) registered
+[  153.832160]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.832168]: [0]ml_processor_register>cpu_id 0xfffffff8d121cdc0 cluster_id 0 cpu_number 1 is type 0
+[  153.832239]: GenericARMCPU: cpu 1 (phys id 0x100) registered
+[  153.832399]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.832406]: [0]ml_processor_register>cpu_id 0xfffffff8d121fa00 cluster_id 0 cpu_number 2 is type 0
+[  153.832470]: GenericARMCPU: cpu 2 (phys id 0x200) registered
+[  153.832628]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.832635]: [0]ml_processor_register>cpu_id 0xfffffff8d121d540 cluster_id 0 cpu_number 3 is type 0
+[  153.832704]: GenericARMCPU: cpu 3 (phys id 0x300) registered
+[  153.832865]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.832873]: [0]ml_processor_register>cpu_id 0xfffffff8d121fac0 cluster_id 0 cpu_number 4 is type 0
+[  153.833049]: cpu 3 (phys id 0x300) is a slower core: the scheduler uses it after cpu 4 (phys id 0x400)
+[  153.833118]: GenericARMCPU: cpu 4 (phys id 0x400) registered
+[  153.833275]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.833283]: [0]ml_processor_register>cpu_id 0xfffffff8d121eb00 cluster_id 0 cpu_number 5 is type 0
+[  153.833451]: cpu 2 (phys id 0x200) is a slower core: the scheduler uses it after cpu 5 (phys id 0x500)
+[  153.833510]: GenericARMCPU: cpu 5 (phys id 0x500) registered
+[  153.833668]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.833675]: [0]ml_processor_register>cpu_id 0xfffffff8d121e680 cluster_id 0 cpu_number 6 is type 0
+[  153.833842]: cpu 1 (phys id 0x100) is a slower core: the scheduler uses it after cpu 6 (phys id 0x600)
+[  153.833904]: GenericARMCPU: cpu 6 (phys id 0x600) registered
+[  153.834060]: [0]ml_processor_register>pset_find(cluster_id=0) returned pset 0
+[  153.834068]: [0]ml_processor_register>cpu_id 0xfffffff8d121e740 cluster_id 0 cpu_number 7 is type 0
+[  153.834232]: cpu 0 (phys id 0x0) is a slower core: the scheduler uses it after cpu 7 (phys id 0x700)
+[  153.834292]: GenericARMCPU: cpu 7 (phys id 0x700) registered
+[  153.834909]: Copyright (c) 1982, 1986, 1989, 1991, 1993
+	The Regents of the University of California. All rights reserved.
+
+[  153.834917]: bsd_init: calling kauth_init
+[  153.835096]: bsd_init: calling process_name
+[  153.835110]: bsd_init: calling get_bsdthread_info
+[  153.835184]: MAC Framework successfully initialized
+[  153.835491]: bsd_init: calling kauth_cred_create
+[  153.835508]: bsd_init: calling chgproccnt
+[  153.835516]: bsd_init: calling kmem_suballoc
+[  153.835534]: bsd_init: calling bsd_bufferinit
+[  153.841099]: using 7738 buffer headers and 5917 cluster IO buffer headers
+[  153.841218]: bsd_init: calling IOKitInitializeTime
+[  153.841423]: clock_initialize_calendar system does not have monotonic clock
+[  153.841446]: clock_initialize_calendar WARNING: UTC time is less then sys time, (0 s 0 u) UTC (153 s 841248 u) sys
+[  153.841465]: bsd_init: calling vfsinit
+[  153.842318]: ktriage_register_subsystem_strings: set subsystem 8 strings
+[  153.842411]: bsd_init: calling proc_uuid_policy_init()
+[  153.843034]: mcache: 8 CPU(s), 64 bytes CPU cache line size
+[  153.843042]: bsd_init: calling mbinit
+[  153.843874]: mbinit: done [96 MB total pool size, (64/32) split]
+[  153.843895]: bsd_init: calling knote_init
+[  153.843901]: bsd_init: calling eventhandler_init
+[  153.843906]: bsd_init: calling aio_init
+[  153.844032]: bsd_init: calling pshm_cache_init
+[  153.844038]: bsd_init: calling psem_cache_init
+[  153.844072]: bsd_init: calling nwk_wq_init
+[  153.844114]: bsd_init: calling dlil_init
+[  153.844132]: SK: netagent is enabled by default for this platform
+[  153.844640]: DLIL: running SUM16 self-tests ... PASSED
+[  153.845563]: dlil_init: Waiting for all the create dlil kernel threads to get scheduled at least once.
+[  153.845999]: PMRD: power event 7 args 0x1c0b78d3cd964fd5 0x0
+[  153.846032]: PMRD: power event 7 args 0x1c0b78d3cd9647b5 0x0
+[  153.847172]: PMRD: PowerChangeOverride (OFF_STATE->ON_STATE, f, 0x2) tag 0x20064
+[  153.847258]: PMRD: sysPowerDownHandler message kIOMessageSystemCapabilityChange
+[  153.847268]: PMRD: sysPowerDownHandler cap f -> f (flags 1)
+[  153.847615]: dlil_init: All the created dlil kernel threads have been scheduled at least once. Proceeding.
+[  153.847624]: bsd_init: calling socketinit
+[  153.847652]: bsd_init: calling domaininit
+[  153.848649]: bsd_init: calling skywalk_init
+[  153.848723]: SK[0]: skmem_region_init              seg_size 16384, md_seg_size 16384, drv_buf_seg_size 65536 [eff 81920], usr_buf_seg_size 16384
+[  153.851896]: Skywalk: running self-tests
+[  153.851923]: Skywalk: sk_copy64_8 ... PASSED
+[  153.851928]: Skywalk: sk_copy32_8 ... PASSED
+[  153.851935]: Skywalk: sk_copy64_16 ... PASSED
+[  153.851942]: Skywalk: sk_copy32_16 ... PASSED
+[  153.851947]: Skywalk: sk_copy64_20 ... PASSED
+[  153.851955]: Skywalk: sk_copy64_24 ... PASSED
+[  153.851961]: Skywalk: sk_copy64_32 ... PASSED
+[  153.851966]: Skywalk: sk_copy32_32 ... PASSED
+[  153.851973]: Skywalk: sk_copy64_40 ... PASSED
+[  153.851978]: Skywalk: sk_copy64_64x ... PASSED
+[  153.851985]: Skywalk: sk_copy64_32x ... PASSED
+[  153.851992]: Skywalk: sk_copy64_8x ... PASSED
+[  153.851999]: Skywalk: sk_copy64_4x ... PASSED
+[  153.852008]: Skywalk: sk_zero_16 ... PASSED
+[  153.852013]: Skywalk: sk_zero_32 ... PASSED
+[  153.852018]: Skywalk: sk_zero_48 ... PASSED
+[  153.852024]: Skywalk: sk_zero_128 ... PASSED
+[  153.852095]: Skywalk: memcmp mask ... PASSED
+[  153.853988]: bsd_init: calling memorystatus_freeze_init
+[  153.853994]: bsd_init: calling memorystatus_init
+[  153.854311]: bsd_init: calling sysctl_mib_init
+[  153.854324]: bsd_init: calling bsd_autoconf
+[  153.854327]: bsd_autoconf: calling kminit
+[  153.860936]: bsd_init: calling loopattach
+[  153.862022]: ifnet_attach: All kernel threads created for interface lo0 have been scheduled at least once. Proceeding.
+[  153.862068]: bsd_init: calling ether_family_init
+[  153.862317]: bsd_init: calling net_init_run
+[  153.862705]: skip attaching fsw to lo0 using legacy TX modelReinit'd ND information for interface lo0
+[  153.864153]: bsd_init: calling inittodr
+[  153.864161]: bsd_init: calling setconf
+[  153.864453]: PMRD: sysPowerDownHandler message kIOMessageSystemCapabilityChange
+[  153.864464]: PMRD: sysPowerDownHandler cap f -> f (flags 2)
+[  153.864480]: PMRD: tellChangeUp OFF_STATE->ON_STATE
+[  153.864511]: PMRD: PowerChangeDone: OFF_STATE->ON_STATE
+[  153.864519]: PMRD: Force re-evaluating aggressiveness
+[  153.864528]: PMRD: changePowerStateWithTagToPriv(ON_STATE, 30002)
+[  153.864559]: PMRD: PowerChangeOverride (ON_STATE->ON_STATE, f, 0x2) tag 0x10001
+[  153.864567]: PMRD: PowerChangeDone: ON_STATE->ON_STATE
+[  153.864573]: PMRD: PowerChangeOverride (ON_STATE->ON_STATE, f, 0x302) tag 0x40064
+[  153.864591]: PMRD: PowerChangeDone: ON_STATE->ON_STATE
+[  153.864597]: PMRD: PowerChangeOverride (ON_STATE->ON_STATE, f, 0x302) tag 0x50064
+[  153.864611]: PMRD: PowerChangeDone: ON_STATE->ON_STATE
+[  153.864637]: PMRD: adjustPowerState ON_STATE, asap 0, idleSleepEnabled 0
+[  153.864646]: PMRD: changePowerStateWithTagToPriv(ON_STATE, 60008)
+[  153.864663]: PMRD: PowerChangeOverride (ON_STATE->ON_STATE, f, 0x2) tag 0x30002
+[  153.864669]: PMRD: PowerChangeDone: ON_STATE->ON_STATE
+[  153.864680]: PMRD: PowerChangeOverride (ON_STATE->ON_STATE, f, 0x2) tag 0x60008
+[  153.864686]: PMRD: PowerChangeDone: ON_STATE->ON_STATE
+[  153.865232]: psci: the other cores start at EL2: through the loader's trampoline at 0x9ff295040
+[  153.865254]: cpu_start() cpu: 0
+[  153.865321]: cpu_start() cpu: 4
+[  153.867579]: gic: v3, distributor 0xfffffff19a664000, cpu 4's redistributor 0xfffffff19a6f4000, virtual timer on PPI 27
+[  153.867593]: panic_trace: PE_arm_debug_enable_trace enter
+[  153.867599]: panic_trace: PE_arm_debug_enable_trace exit
+[  153.867601]: arm_cpu_init(): cpu 4 online
+[  153.868164]: cpu_start() cpu: 5
+[  153.869281]: gic: v3, distributor 0xfffffff19a664000, cpu 5's redistributor 0xfffffff19a714000, virtual timer on PPI 27
+[  153.869289]: panic_trace: PE_arm_debug_enable_trace enter
+[  153.869293]: panic_trace: PE_arm_debug_enable_trace exit
+[  153.869296]: arm_cpu_init(): cpu 5 online
+[  153.869969]: cpu_start() cpu: 6
+[  153.871063]: gic: v3, distributor 0xfffffff19a664000, cpu 6's redistributor 0xfffffff19a734000, virtual timer on PPI 27
+[  153.871071]: panic_trace: PE_arm_debug_enable_trace enter
+[  153.871076]: panic_trace: PE_arm_debug_enable_trace exit
+[  153.871079]: arm_cpu_init(): cpu 6 online
+[  153.871743]: cpu_start() cpu: 7
+[  153.872827]: gic: v3, distributor 0xfffffff19a664000, cpu 7's redistributor 0xfffffff19a754000, virtual timer on PPI 27
+[  153.872836]: panic_trace: PE_arm_debug_enable_trace enter
+[  153.872838]: panic_trace: PE_arm_debug_enable_trace exit
+[  153.872840]: arm_cpu_init(): cpu 7 online
+[  153.873472]: GenericARMPE: 5 of 8 processors are running
+[  153.874127]: MiniIOMobileFramebuffer: display 1125x2436 on a panel of 1080x2400 (4320 bytes per row)
+[  153.967763]: !BSD
+[  153.968049]: Added memory device md0/rmd0 (01000000/0D000000) at FFFFFFF0081B8000 for 0000000000008000
+[  153.968071]: BSD root: md0, major 1, minor 0
+[  153.968147]: bsd_init: vfs_mountroot
+[  153.969173]: bsd_init: calling VFS_ROOT
+[  153.969220]: bsd_init: calling devfs_kernel_mount
+[  153.970264]: hakios-kernel: version 2.1.13-hakios-darwin22.5-zuma-gd9b31680-dirty
+[  153.970351]: bsd_init: calling siginit
+[  153.970359]: bsd_init: calling bsd_utaskbootstrap
+[  153.970980]: bsd_init: calling mountroot_post_hook
+[  153.970989]: bsd_init: done
+[  153.971002]: vm_free_delayed_pages: initialized 0 free pages
+[  153.971052]: No POST boot-arg set.
+[  153.971059]: bsd_init: bsd_do_post - doneload_init_program: attempting to load /usr/appleinternal/sbin/launchd.development
+[  153.971360]: Failed to open swap file 2
+[  153.971368]: vm_swap_create_file failed @ 153 secs
+[  153.971372]: vm_swap_create_file failed @ 153 secs
+[  153.971519]: VM Swap Subsystem is ON
+[  153.971792]: load_init_program: attempting to load /sbin/launchd
+[  153.976094]: pid 1 exited -- no exit reason available -- (signal 0, exit 0)
+[  153.976239]: coredump (launchd, pid 1): writing core to /private/var/cores/launchd.core
+[  153.976409]: coredump (launchd, pid 1): failed to open core dump file /private/var/cores/launchd.core: error 2
+[  153.976484]: coredump (launchd, pid 1): core dump failed: error 2
+
+[  153.976594]: Failed to generate core file for pid: 1: error 2, took 0.000 seconds
+[  153.976641]: cpu_signal failed in DebuggerXCallEnter
+[  153.976644]: cpu_signal failed in DebuggerXCallEnter
+[  153.976646]: cpu_signal failed in DebuggerXCallEnter
+
+--- panic buffer ---
+panic(cpu 5 caller 0xfffffff007781908): initproc failed to start -- no exit reason available -- (signal 0, exit status 0 )
+Debugger message: panic
+Device: Not set yet
+Hardware Model: Not set yet
+ECID: 0000052445730001
+Boot args: debug=0x8 rd=md0 hakios_kver=2.1.13-hakios-darwin22.5-zuma-gd9b31680-dirty -v cpus=8
+Memory ID: 0x0
+OS release type: Not set yet
+OS version: Not set yet
+Kernel version: Darwin Kernel Version 22.5.0: Sun Nov  1 00:06:47 EET 2026; martin:xnu-8796.121.2[xnu-8796.121.2-dirty]/BUILD/obj/DEVELOPMENT_ARM64_BCM2837
+Kernel UUID: 430CA2E8-B054-3644-AAD7-D782DED71F40
+Boot session UUID: D82E4CAA-C127-4C49-82B5-1B20EB591158
+iBoot version: iBoot-8422.100.650
+iBoot Stage 2 version: 
+secure boot?: NO
+roots installed: 0
+Paniclog version: 14
+Kernel text base:  0xfffffff007004000
+mach_absolute_time: 0xe196a835
+Epoch Time:        sec       usec
+  Boot    : 0x00000099 0x000cd620
+  Sleep   : 0x00000000 0x00000000
+  Wake    : 0x00000000 0x00000000
+  Calendar: 0x0000009a 0x000006d7
+
+Zone info:
+  Zone map: 0xfffffff403de0000 - 0xfffffffa03de0000
+  . PGZ   : 0xfffffff403de0000 - 0xfffffff406d1c000
+  . VM    : 0xfffffff406d1c000 - 0xfffffff4ecc6c000
+  . RO    : 0xfffffff4ecc6c000 - 0xfffffff5396dc000
+  . GEN0  : 0xfffffff5396dc000 - 0xfffffff61f62c000
+  . GEN1  : 0xfffffff61f62c000 - 0xfffffff70557c000
+  . GEN2  : 0xfffffff70557c000 - 0xfffffff7eb4cc000
+  . GEN3  : 0xfffffff7eb4cc000 - 0xfffffff8d141c000
+  . DATA  : 0xfffffff8d141c000 - 0xfffffffa03de0000
+  Metadata: 0xfffffffa04a4c000 - 0xfffffffa0624c000
+  Bitmaps : 0xfffffffa0624c000 - 0xfffffffa07404000
+  Extra   : 0 - 0
+
+TPIDRx_ELy = {1: 0xfffffff7eb430c10  0: 0x0000000000000005  0ro: 0x0000000000000000 }
+CORE 0: PC=0xfffffff00741dcb8, LR=0xfffffff00741dcb4, FP=0xfffffff35c8a7e80
+CORE 1: PC=0x0000000000000000, LR=0x0000000000000000, FP=0x0000000000000000
+CORE 2: PC=0x0000000000000000, LR=0x0000000000000000, FP=0x0000000000000000
+CORE 3: PC=0x0000000000000000, LR=0x0000000000000000, FP=0x0000000000000000
+CORE 4: PC=0xfffffff00741dcb8, LR=0xfffffff00741dcb4, FP=0xfffffff35c9c7e80
+CORE 5 is the one that panicked. Check the full backtrace for details.
+CORE 6: PC=0xfffffff00741dcb8, LR=0xfffffff00741dcb4, FP=0xfffffff35ca0fe80
+CORE 7: PC=0xfffffff00741dcb8, LR=0xfffffff00741dcb4, FP=0xfffffff35c823e80
+Compressor Info: 0% of compressed pages limit (OK) and 0% of segments limit (OK) with 0 swapfiles and OK swap space
+Panicked task 0xfffffff61f6f26d0: 2 pages, 1 threads: pid 1: launchd
+Panicked thread: 0xfffffff7eb430c10, backtrace: 0xfffffff35c8e34f0, tid: 189
+		  lr: 0xfffffff00728bd44  fp: 0xfffffff35c8e3580
+		  lr: 0xfffffff0074279c8  fp: 0xfffffff35c8e35a0
+		  lr: 0xfffffff007417e1c  fp: 0xfffffff35c8e3610
+		  lr: 0xfffffff007416e50  fp: 0xfffffff35c8e3730
+		  lr: 0xfffffff0074165a4  fp: 0xfffffff35c8e3740
+		  lr: 0xfffffff00728b384  fp: 0xfffffff35c8e3af0
+		  lr: 0xfffffff00728c4d8  fp: 0xfffffff35c8e3b70
+		  lr: 0xfffffff007a2fc34  fp: 0xfffffff35c8e3b90
+		  lr: 0xfffffff007781908  fp: 0xfffffff35c8e3cc0
+		  lr: 0xfffffff007780ed4  fp: 0xfffffff35c8e3d50
+		  lr: 0xfffffff007780d04  fp: 0xfffffff35c8e3d60
+		  lr: 0xfffffff0078ed55c  fp: 0xfffffff35c8e3df0
+		  lr: 0xfffffff007416f30  fp: 0xfffffff35c8e3f10
+		  lr: 0xfffffff0074165a4  fp: 0xfffffff35c8e3f20
+
+PMOCﾀ0ﾈkcd_c_type0ﾈkcd_c_totaloutﾂ0ﾈkcd_c_totalin￀AXﾢYﾀHbf``0￢ ﾁ￢ﾒￄ￤￬￢ﾌ￼ﾒ￸ￌﾼ￸ﾴﾜￄ￴bﾈ8ﾌdgy￭cﾃh￿￿b@ￜￄ ﾀﾢ﾿ 3,ﾈD￼$.￿￿brﾀﾸﾈAﾠﾸﾲﾸ$57hLI*6￻A￶!￿￿￤d`
+￴ "ﾱ￿￿RBﾓgGﾒ1￿￿@ﾓgp@U￿￿￢ￊO
+ﾵ@ﾅ]ﾋￊ3￳ﾼSﾋ￲RsￂRﾋﾊ3￳￳ﾌﾌ￴L￵ﾬﾂK￳￼￲ￋﾬￌﾬLￌ\]CﾌﾌￌﾬrﾋJ2￳ﾬ*￲Ju-ￌ-ￍ￴ﾍ￵ﾌﾢQﾹﾺ)ﾙE%ﾕﾱ￺Nﾡﾞ>.￺￹IY￺.ﾮaﾮ>￾ﾾﾮ~!￱ﾎAﾾf&￱NￎﾾFￆ￦`￿￿￢ﾺ/￈￪ﾆﾺ/%5ﾩ4￝ￖﾠￂBﾡ(ￅ67ￅ@!#1;3﾿8>ﾻ,ﾵ￈ￖHￏPￏ￐X"ﾤﾛ￶
+￈￩ﾺUﾥﾹﾉﾺ￩)ﾖIￆﾆf7(￨ﾖ)$ﾔￛZ@ﾍS￿￿2ﾒ@ￜￄ ￀iￋ￀￐￀aﾃH￿￿2@ￜￄ  ￧ￃCB￿￿2R@ￜￄ ￰ﾹￇﾐￂﾂﾐ￿￿R@ￌ￡28ﾡ￈20￿￿r￲ﾀr@ﾌﾓY=￈3￿￿ﾁjﾂ￱￿￿bﾚ￧kﾆﾊ￟ￛsjￕSVﾸ�ﾠ￴&+ﾕ$@ﾁￌ￿￿ﾂﾹﾦﾔh>2￿￿ￒrﾀﾤￖﾈ￘?￩ￌﾳ￨ￅﾆ3ﾗUￗﾯ7￝ﾻ.￯ﾒ￿￿b￪o2:ﾀ024( ￳ﾏ￙ﾳﾀﾹ3ﾑ￑￘ ;qﾁlpﾂﾎ/I,ￎￆﾥ,￿￿RﾺG￈￪￳ﾘﾡ4ﾌ￿￿ￒBﾓﾇﾉￃh￿￿ﾂﾅO*Tﾀﾨ￿￿b￲ﾀ 0u?ￖﾂￃ)fﾃ%ﾘﾆ￈￢&(JﾠHv￞hz5￀ﾬﾍfﾈﾫ[￺ﾺt￳ﾕ
+n￧ﾈﾀNﾠB ﾻﾈA ￌ7ﾾ 1=5﾿ﾴ$ﾾ891"H)	4OﾨﾾMO&##X${ﾇ6ￌi`>￿￿ﾁﾪKﾅￒ￿￿ﾂﾅ_ﾔﾏ~￿￿B?ﾘ:ﾨrﾢﾩﾴw*`ﾵL-￮ﾩﾍAﾬﾇ￁tDNﾮ￝H\￸eﾦ￤ﾤ*(￀￵ﾑￊ￀~￯:￁F￭￈ￖ￥D6S￈a ￊlﾹ￣N?su￀￴ﾁ(}"￿￿ﾪXﾸ￿￿ﾂﾅw:Dﾘ=ﾼ￿￿BoﾘﾺﾂLﾈﾹ0ﾪ'uﾅUￊ'￞￨￩5ﾞ!ﾬ￐ﾵﾃﾸ￰.NￎHMﾉￏMￌￌ+IￍKￌKNﾍ/￉(JMLAﾵ7WxﾯﾀjiￍBￕ￿￿ﾁra￡￿￿￲ﾀ8ﾈA=￼￿￿B﾿ﾰ*ﾆ3￩ﾐ￰ﾃ￑PaﾜﾔﾪTwﾈ￟Cﾐﾮ￰￻ﾺ{￸￡￲ﾯ8ￔ￸ￖ(J￿￿ﾁￒP￿￿ﾂ￹7ￊG￷/￿￿B￷/L]G￟)pz|￱ELCﾵ￣ﾤ￾ﾛﾣJﾹﾺﾵ`￵oCX￡ￕ￘�ￋ￉ﾉZﾾﾥ$ﾦ￦￦￧￩ﾥﾤﾦﾥﾥﾦ￨ﾦﾤ&￦￤￤''ﾖﾛ9ﾨ6b￧￡
+﾿Ph￼￘￴ﾣ￪￿￿ﾁra￡￿￿ﾂﾅ,Yﾡﾇ￿￿B?ﾘﾺKI?ﾘ+ﾠￎﾂq1ￒK,C,XNv!I￡￉dﾺ￠ￖ0ￜlbﾸￂﾗ^ﾠﾄ3ﾱ'ﾰmﾤ￉7@.￿￿ﾁￒﾰp￿￿ﾂﾅo6T=|￿￿B_ﾘﾺKhﾾﾰ￴￻ﾘﾜ￰MﾭHN- 6iﾂ}L￭￰￿￿ﾂﾅ/,ﾜ￿￿ﾂﾅoﾎ￰￿￿B_ﾘ:ﾥ_X￸ﾾ�LN￸&;ﾃ%Eﾉ￉ﾩP￟ﾦﾨﾾ￿￿ﾁZﾙﾥ￿￿ﾂﾅo.ﾔﾏﾞ~￿￿B_ﾘﾺ￵ﾥ￠r￵ￃ=ﾢￊￗﾛ\PﾠￔﾓL￬￵qCXE￪J￢ￂR0ￄ'KￕxHYﾋj!ﾮ￰-ﾆj4oA5￿￿ﾁra￡￿￿ﾂﾅ_T=￼￿￿B?ﾘﾺ	O￯n0ￛￃ!,&ﾨ￀ﾱl￵1C ﾂ￀￟z￢ￂￏￓ?8ﾵﾨ,395$ﾵ(73/ﾱ$5ﾄ*￭>ﾨ;ﾅ￭ﾠ(ﾥﾤﾀﾘﾈA￥ﾫﾍﾱ8<!￥l+ﾄￎﾨￕﾋￏﾘ8Lﾀﾶ'￿￿￪ﾁ<ￅ￿￿ﾂﾅﾔﾏ￾￿￿Bﾘﾺ= �ￕﾎﾓ:ﾄ&Sﾽﾠ￩!Hﾽ=$ￏ Vy￶q￡ﾏￔ￿IO,Jvﾅ￢ﾓ￳srRﾓK￀ￆ$pﾥ_ﾨN	4￿￿ﾁ￲a￡￿￿ﾂﾅ_1T=￼￿￿B?ﾘﾺﾀLￚￔ_￶￶`ﾗﾈ￞&.￼ﾠ￭ﾫ￤￼ﾢT￝ￄﾼￄﾜￊﾒￌ￤b￝ￔﾲￔﾼﾘSﾡ>ￃN￡
+?￬ﾪ4ﾀ@ￌￄﾠ￴ﾋ￞>￿￿ﾊﾃￌr￿￿ﾲﾀﾸﾈA=|￿￿B￟ﾰ*^ￇ￉ﾛﾯTpￋhMﾧﾨ0Nﾪ￤ $￰ﾤￃ￯!ﾈﾋﾞ>a￥ￃￛￏ%`￳Ajﾀ(￀￼P￹~&ﾘJ￿￿ﾁrKﾠ4￿￿ﾂ￹ﾷￊG￷/￿￿B￷/L]ﾃ0ﾤ>ﾩ9ﾮGﾔﾭﾍﾠ@ﾩﾻￋﾛﾰ￺ￖ￞<{	ﾻ99Qￛ￫ﾐ￺DTﾟ(ddﾦg((ﾢZDﾀﾇ+￼ￄﾡ￡ﾖ*ﾄj￿￿ﾁra￡￿￿ﾂﾅ_T=￼￿￿B?ﾘﾺﾷ￑ﾤﾥﾗ￧!PﾠTￅￊhﾬ￡K/k7~ﾞ￾ﾾE￹￹%.￹ﾹﾉﾙyﾨvￃￃ~ﾝￌ￝ﾝﾨﾦ￿￿ﾁr+ﾠ4￿￿ﾂﾅ_?ﾔﾏ~￿￿B?ﾘﾺﾊ￟k￀￩Nﾦ￈ﾂﾨ￴￷ﾉjﾔ￪N￁~￱￱`W#ￊﾰ￦7￴￴ﾬ2￳￣ﾋRﾊ2￳ﾋ2K2ﾫR￣!Iￕ:ﾜ<\￡'ￕ1EU+￿￿ﾂﾉￃￂ￿￿J￱ ￴￰￿￿B﾿	`UBﾐ￶L￉￝Jﾢￂￏ-￼nﾈﾇb?X￺k￭ￂ~ﾸ￼ￋuￗfQ(J￿￿ﾁￒﾠ4￿￿ﾂ￹w"ﾔﾏ￮_￿￿B￷/Lﾝￃￔc`NH￷"ￊ﾿iﾌPﾠﾔﾝ$~￿ﾞﾝDﾚ￹ﾠ￦&ﾊﾠￚ￿￿ﾂqa￮￿￿ﾂ￹wTﾺ￿￿B￷/Lﾝￔ﾿6ￄ￹W
+ￍ﾿R￸�￻ￕﾲk￾￀﾿ￜP￷;ￂ<￥￿￿ﾂqa￮￿￿ﾂ￹w2T￝﾿￿￿B￷/L￝ﾇCﾐ￴ﾼFﾫﾞﾨ￸m￢ﾇZﾥni￢￷￯ZCￒ￼ﾻj￮T{￿￿ﾁra￮￿￿￲ﾀx
+ﾃﾺ￿￿B￷￯ﾰ*ﾆﾆﾍￋ￀￾￼SVJﾔ-￑￢WX﾿{H￳//ￔ]ﾇﾹﾡ(￿￿ﾁￒSﾠ4￿￿ﾂ￹w*ﾔﾏ￮_￿￿B￷/Lﾩ￾}
+5F� ￠￟﾿￿Iￋ﾿ﾜPﾃﾗﾡ￹￿￿ﾁﾊￃￜ￿￿ﾂ￹wT￝﾿￿￿B￷/L￝_ￒￊ￧￿P￳aￔw￼￱ﾛﾪIZ￼rAﾶF￳/￿￿ﾁﾊￃￜ￿￿ﾂ￹w:T￝﾿￿￿B￷/L￝ﾕﾕﾋ￁￩ﾘ￘￺ﾈﾃjﾔ￺ﾯﾋ￟﾿W%H￳/ￌﾛgaﾵ￿￿ﾁￒ0w￿￿￲ﾀxﾃﾺ￿￿B￷￯ﾰ*ﾆﾐ￼Kﾬ?B￵￁ﾨz￸�ﾛLﾚa￱[ﾏ￦_￿￿ﾁZ8J￿￿ﾂ￹w&ﾔﾏ￮_￿￿B￷/L￝	cHzﾾ￲.ﾜﾨ￲Jﾂjﾔﾲ￪￀￟￞=Dﾚﾵﾡ￦￲{ﾠￚ￿￿ﾁra￮￿￿ﾂ￹wT￝﾿￿￿B￷/Lﾝﾃ)ￄ﾿<￬D￹7ﾎjﾔ2ﾈzb￢￪ￚ:ﾑ￦_=ﾨﾹ￿lﾠ(￿￿ﾁￒ0w￿￿ﾂ￹w6T￝﾿￿￿B￷/L]ￅmﾈﾉMￏﾗﾡ￦ￃ(￞N￼￱ﾻ4ﾛ4￿r@63ﾂ￙ﾡ￿￿ﾁra￮￿￿￲ﾀxﾃﾺ￿￿B￷￯ﾰ*ﾆﾃﾻXￏ_ﾨ￠ﾖ￉￈ﾪ"*~g1A5Bﾩ￙Hﾬ￱￫￈*b￷/''ﾃ￐ﾌ `￿#757﾿ﾨﾲﾸ$ﾱﾤﾴ8￞"L4ﾉﾫﾽ&5a/ﾪQ￿￿ﾁr￧@i￿￿ﾂﾅ￟\(=￼￿￿B?ﾘﾺﾏ$ﾆ￟\FﾨPJￖ{￾ﾀﾅ_ﾫy￡ﾇﾖ\P-ￅￂￃ~ﾂPﾵﾦRﾨﾚ￿￿ﾁra￡￿￿ﾂﾅ￟<ﾨ8z￸￿￿B?ﾘ:ￅ￝ﾤﾥ﾿ﾏﾨￎ`￠￳ￇ~ﾢ￑￤ﾅﾟ1ﾚ=ﾄﾸﾸￂﾏﾪQ-￼￿￿ﾁﾊￃￂ￿￿ﾂﾅ￟ﾨ8z￸￿￿B?ﾘﾺ"ￇ￁￹V￣r2Q￹ﾷ-�ﾝ￩C-ﾯ`ￒﾁﾁ`ﾗﾸr~ￎnﾞ>￱￁!ﾎ!￁￱Aﾮ￾A!PK￡
+?ﾨﾓ9PM￿￿ﾁr@i￿￿ﾂﾅ￟B(=￼￿￿B?ﾘ:ﾨrﾢﾩUﾰZ&ﾈﾖﾧSﾚﾂXBￂﾱ"'￟~ﾙ)9ﾩ
+ￊ&p}ﾤ2pﾅ_t7#￘(ﾑj]Nd3ﾀfbﾠￌﾖ;ﾎ￠￴3'QLHﾁￒG!￢￿￿ﾪﾁﾅﾊ￿￿ﾂﾅ￷b(=ﾼ￿￿Boﾘ:ﾨrﾆﾨ￹0>.zMﾁDﾊBﾙ￙ﾷ<ﾱﾚ￞ￆﾀ￩ﾈ0ﾜ|ﾻ{￿ﾇ￨Gﾠﾪ HxﾛB8dﾐﾸￂﾛ}#￘ﾴUﾨ￡￿￿ﾁￚ￿￿ﾂﾅ￟Rﾨ8z￸￿￿B?ﾘ:ﾨrﾢﾩO￪ﾐ￰ﾃﾥￗ5ﾮﾐ￰ￛ6-￶!￈ﾐ4ﾓbﾓ~fhﾺﾉ￧￢
+﾿￿ￓ ￡ﾧKaz￿￿ﾁ:n￿￿ﾂﾅ￷rﾨ8zx￿￿Boﾘ:￢}Q￙ﾩﾡf￀ￂﾛ￣*ﾤ|Pﾷﾍￃ￞ﾲﾉﾤﾄﾷ9ﾩￎﾁﾫￇ￞!￡�!5ﾽ*uﾂ0S>￿￿ﾪXﾸ￿￿ﾲﾀx5ﾃzx￿￿Boﾘ:V￞ﾕg/ￛﾣ`MD-P5LP￺ﾽh<8ﾜQ￻￀ￚ,ﾬb￩j￢ￂ;ﾭ(17ﾵXﾡ$_ﾡ$#Uﾡ 1/5jqﾮ￰fﾅj￧A3F￈wbv ﾅﾷﾍﾱﾸ￶Pﾄﾔￃ-ﾬ:ﾣV,ﾲ~&ﾘﾮﾙﾡ@ￋiﾠv0￿￿ﾁￒﾰp￿￿￲ﾀxﾃz|￿￿Bﾏﾏ5`UﾮﾤￅGT,>Tￄ￱ￇￇￗJﾲ￣ￃJ!Q!#5ﾧ ﾵj'>ﾊP|pﾣiV￲ﾀﾘﾈﾉﾉﾏh￱￿￿￪ﾁ5`ﾒﾁ￿￿ﾂﾅ￿Z(=￼￿￿Bﾘ:Rￃ﾿j>,￼3$￰ﾇ﾿￨￬￡￾￿￿ﾁﾆ,￿￿ﾂﾅ￿&￡￿￿Bﾘ:ﾱﾥﾐ|v\LCﾵ￣ﾤ`￶￁|￉l|bￃￊ#F9ﾰ￲￨ﾯ=q￡_ﾒQﾔﾚﾘﾢﾐﾜﾘﾓﾣﾐﾝZ,ﾎﾔAf	pﾥvﾨ~>4s￿￿ﾁ￲a￡￿￿ﾂﾅ￟ﾨ8z￺￿￿B?ﾘﾺﾧￖﾂￃ￭LﾻQ￡W H￝ﾲￊvAJ￸qB￭ﾏfﾈﾳR3!￡ﾧ￤b NﾠB ￝ￄ ￦_ﾐﾘﾞﾚ_ZﾟZQ￀ￄﾜ￸ￌ|HﾨBT￠'qﾅ?Tﾛ,ﾚv￿￿ﾁ￲ﾷ@i￿￿ﾂﾅ￟V(=￼￿￿B?ﾘﾺ7￻,￁￡ﾣﾡￚqR<ﾌﾨRﾞﾱﾇﾟ<ﾃ<X￡ￚB￢ￒ(￼ﾊRﾋﾋKﾋRQ- ﾒﾇ+￼ﾸﾡ￺￑ￌ￿￿ﾁ￲a￡￿￿ﾂﾅ￟6ﾨ8z￸￿￿B?ﾘﾺﾭg￀￡WRlAT￺ﾫDsﾇ￲b￬￡KﾶMDﾇ_~RVjrI<0ﾫﾬx￢ﾓ￘Eﾸￂﾏ￪^^4w￿￿ﾁ￲a￡￿￿ﾂﾅ￟vﾨ8z￸￿￿B?ﾘﾺ3ﾝk￀￡ﾖ1￙ﾘﾨ￰￳cDuﾈￏ￼￡￧￪ﾁ=￼p￹￦O	Tk￿￿ﾁ￲a￮￿￿ﾂ￹wT￝﾿￿￿B￷/L]￀iHye￐K\yￅﾇ￦_ﾎￍ￸�ￛ;ﾡd￳h￻￶ￔm ﾊﾓﾣﾼJￎￏgﾹ￼"$uￄ2qﾅ7ￔP￸ ￿￿ﾁrv@i￿￿ﾂﾅ￟N(=￼￿￿B?ﾘ:p:ﾁ￑P￭8ﾩ﾿h2ﾙ[￰ﾇ￟ￕDﾇ_qybﾰﾼGﾳﾀH.ﾮ￰￣ﾂ￪￧G3￿￿ﾁ￲a￡￿￿ﾂﾅ￟.ﾨ8z￸￿￿B?ﾘﾺ7!￹ﾭￆﾎhￖ`p￿ﾰﾠ
+ﾝ￞ﾅ?￼dﾒ~iﾙ9ﾩ￱￉￀"ﾫ$ￕB<\￡g
+ￕhﾇf￿￿ﾁ￲a￡￿￿ﾂﾅ￟nﾨ8z￸￿￿B?ﾘﾺ￐￰[￣E\￸�ﾀﾚﾯﾥEv￠﾿ￔﾕﾐ￰￳ﾪ?ￄ<@X￲/(�ﾁￃ/=ﾢﾆW￸qAB3￿￿ﾁ￲a￡￿￿ﾂ￱aￊ￿￿2ﾀﾘ*￀ￌ	e@)￿￿ￒￒ
+@ﾒ7bﾱ3^￩v�￥ﾴ￙ﾱ0￶ﾟﾁO￀ﾐ8￿￿b￪o2:ﾀ@jAﾀﾓﾡﾠDﾣﾃﾙPﾁﾆ0ﾄfRￌP!t
+dfNbi^rF
+ﾺ￿￿RﾺG(ￚﾕA7￿￿ￒBﾓ￧A8ﾬ￿￿rﾃￊﾷ@￵ﾣS￿￿ﾂﾅ￟^ﾨzz￿￿BOﾏ0u￨￦￰ﾠ@￹ﾌￆM￭ﾥm[ﾂD:￭ 4ﾈ￠￶+ﾃk4?701ﾊ;0,ﾒ￨￩ﾇ,ￊ￀ﾰjﾏﾔﾣﾀ ￅﾇ'ﾃj)ￅﾀﾘﾈEﾀ￲-ﾛ5￀￥￼ﾍ#ￚ￤ￏ"0ﾟCﾲL_￡ﾃ￐,ﾼ:￦jXￜ ￟L/Iﾅ￐@￣￀￿￿ﾁￒ{ﾡ4￿￿ﾂ￱ﾡ|￿￿ﾹￋﾈ{ﾀﾊKﾓﾳﾋ3￲K￢r2￢ﾋ3ﾫR!￢pﾦ*￿￿ﾒ￦ﾄﾤ￯n($ﾭSﾬﾀﾦ(￿￿ﾒﾂﾪ￯ﾀﾪ￑ￍ=eaﾧ￿￿c
+qﾃￂ}ﾠ.GZNbz1DJﾲﾳﾼvDￂﾞVￕ￭Xﾑ￱
+** Stackshot Succeeded ** Bytes Traced 5746 (Uncompressed 16832) **
+
+== END OF LOG ==
+resetting ...
