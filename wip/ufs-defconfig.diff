@@ -1,5 +1,5 @@
 --- devices/akita/u-boot/files/configs/hakios_akita_defconfig	2026-11-01 03:03:06.631874454 +0200
-+++ u-boot/configs/hakios_akita_defconfig	2026-11-01 15:36:57.521030901 +0200
++++ u-boot/configs/hakios_akita_defconfig	2026-11-01 16:25:04.624030558 +0200
 @@ -85,3 +85,12 @@
  # CONFIG_EFI_CAPSULE_ON_DISK is not set
  # CONFIG_EFI_CAPSULE_FIRMWARE_RAW is not set
@@ -8,7 +8,7 @@
 +# (one a LUN: sda..sdd under Android) and, through U-Boot's EFI layer, as block devices the loader can read
 +CONFIG_SCSI=y
 +CONFIG_UFS=y
-+CONFIG_UFS_HAKIOS_HANDOVER=y
++CONFIG_UFS_EXYNOS_GS=y
 +CONFIG_CMD_SCSI=y
 +CONFIG_CMD_PART=y
 +CONFIG_EFI_PARTITION=y

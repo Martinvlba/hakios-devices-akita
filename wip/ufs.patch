@@ -1,0 +1,2798 @@
+diff --git a/drivers/ufs/Kconfig b/drivers/ufs/Kconfig
+index 49472933..10fe6c5a 100644
+--- a/drivers/ufs/Kconfig
++++ b/drivers/ufs/Kconfig
+@@ -8,6 +8,21 @@ config UFS
+ 	  This selects support for Universal Flash Subsystem (UFS).
+ 	  Say Y here if you want UFS Support.
+ 
++config UFS_HAKIOS_HANDOVER
++	bool "HakiOS: a UFS controller a bootloader left running, taken over as it is"
++	depends on UFS
++	help
++	  For a phone whose bootloader before U-Boot leaves the UFS link up and has no driver of U-Boot's for its PHY (the
++	  Pixel 8a, Google Tensor G3): the controller is not reset, the request lists are moved to U-Boot's memory, and
++	  PRDT entries are kept to 4 KB (compatible "hakios,ufs-handover").
++
++config UFS_EXYNOS_GS
++	bool "HakiOS: the UFS host of Google's Tensor G3 (zuma), brought up as Google's Linux driver does"
++	depends on UFS
++	help
++	  Samsung's UFS controller on Google's zuma (the Pixel 8a): a host reset, Samsung's CAL for the PHY and UniPro
++	  (drivers/ufs/exynos-gs, from Google's kernel), link startup (compatible "hakios,zuma-ufs").
++
+ config UFS_AMD_VERSAL2
+ 	bool "AMD Versal Gen 2 UFS controller platform driver"
+ 	depends on UFS && ZYNQMP_FIRMWARE
+diff --git a/drivers/ufs/Makefile b/drivers/ufs/Makefile
+index e7f3c1d3..60276dea 100644
+--- a/drivers/ufs/Makefile
++++ b/drivers/ufs/Makefile
+@@ -4,6 +4,8 @@
+ #
+ 
+ obj-$(CONFIG_UFS) += ufs-uclass.o
++obj-$(CONFIG_UFS_HAKIOS_HANDOVER) += ufs-hakios.o
++obj-$(CONFIG_UFS_EXYNOS_GS) += ufs-exynos-gs.o exynos-gs/ufs-cal-if.o
+ obj-$(CONFIG_UFS_AMD_VERSAL2) += ufs-amd-versal2.o ufshcd-dwc.o
+ obj-$(CONFIG_UFS_CADENCE) += cdns-platform.o
+ obj-$(CONFIG_UFS_MEDIATEK) += ufs-mediatek.o
+diff --git a/drivers/ufs/exynos-gs/ufs-cal-if.c b/drivers/ufs/exynos-gs/ufs-cal-if.c
+new file mode 100644
+index 00000000..5c384dd9
+--- /dev/null
++++ b/drivers/ufs/exynos-gs/ufs-cal-if.c
+@@ -0,0 +1,899 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* HakiOS: Google's zuma UFS CAL (google-modules/soc/gs drivers/ufs/zuma, android-gs-akita-6.1-android15-qpr2), as is but
++ * for this line and the printf macro taken out (U-Boot has printf). */
++/*
++ * Copyright 2022 Samsung Electronics Co., Ltd.
++ */
++#if defined(__UFS_CAL_LK__)		/* LK */
++#include <platform/types.h>
++#include <lk/reg.h>
++#include <platform/ufs-vs-mmio.h>
++#include <platform/ufs-cal-if.h>
++#include <stdio.h>
++#elif defined(__UFS_CAL_FW__)		/* FW */
++#include <sys/types.h>
++#include <bits.h>
++#include "ufs-vs-mmio.h"
++#include "ufs-cal-if.h"
++#include <stdio.h>
++#else					/* Kernel */
++#include <linux/io.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include "ufs-vs-mmio.h"
++#include "ufs-cal-if.h"
++#endif
++
++/*
++ * An order of including header files should be this.
++ *
++ * ufs-vs-mmio.h > ufs-cal-if.h > ufs-cal.h
++ */
++#include "ufs-cal.h"
++
++/*
++ * UFS CAL just requires some things that don't have an impact on
++ * external components, such as macros, not functions.
++ * The requirement list is below: readl, writel, udelay
++ */
++
++#define NUM_OF_UFS_HOST	2
++
++enum {
++	PA_HS_MODE_A	= 1,
++	PA_HS_MODE_B	= 2,
++};
++
++enum {
++	FAST_MODE	= 1,
++	SLOW_MODE	= 2,
++	FASTAUTO_MODE	= 4,
++	SLOWAUTO_MODE	= 5,
++	UNCHANGED	= 7,
++};
++
++enum {
++	TX_LANE_0 = 0,
++	RX_LANE_0 = 4,
++};
++
++#define TX_LINE_RESET_TIME		3200
++#define RX_LINE_RESET_DETECT_TIME	1000
++
++#define DELAY_PERIOD_IN_US		40		/* 1us */
++#define TIMEOUT_IN_US			(40 * 1000)	/* 40ms */
++
++#define UNIP_DL_ERROR_IRQ_MASK		0x4844	/* shadow of DL error */
++#define PA_ERROR_IND_RECEIVED		BIT(15)
++
++#define PHY_PMA_LANE_OFFSET		0x800
++#define PHY_PMA_COMN_ADDR(reg)			(reg)
++#define PHY_PMA_TRSV_ADDR(reg, lane)	((reg) + (PHY_PMA_LANE_OFFSET * (lane)))
++
++#define UNIP_COMP_AXI_AUX_FIELD			0x040
++#define __WSTRB					(0xF << 24)
++#define __SEL_IDX(L)				((L) & 0xFFFF)
++
++/* ah8 H8T_Granularity, UFS_PH_AH8_H8T[18:16], unit : 0x1(1us)*/
++#define H8T_GRANULARITY			0x00010000
++
++#define REFCLK_WTV_MAX			220
++#define AH8_EXIT_REQUIRED		80
++
++/*
++ * private data
++ */
++static struct ufs_cal_param *ufs_cal[NUM_OF_UFS_HOST];
++
++/*
++ * inline functions
++ */
++static inline int is_pwr_mode_hs(u8 m)
++{
++	return ((m == FAST_MODE) || (m == FASTAUTO_MODE));
++}
++
++static inline int is_pwr_mode_pwm(u8 m)
++{
++	return ((m == SLOW_MODE) || (m == SLOWAUTO_MODE));
++}
++
++static inline u32 __get_mclk_period(struct ufs_cal_param *p)
++{
++	return (1000000000U / p->mclk_rate);
++}
++
++static inline u32 __get_mclk_period_unipro_18(struct ufs_cal_param *p)
++{
++	return (16 * 1000 * 1000000UL / p->mclk_rate);
++}
++
++static inline u32 __get_round_off(u32 value, u32 divider)
++{
++	return value / divider + ((value % divider) > (divider >> 1));
++}
++
++static inline u32 __get_mclk_period_rnd_off(struct ufs_cal_param *p)
++{
++#if defined(__UFS_CAL_FW__)
++	return (u32)(((float)1000000000L / (float)p->mclk_rate) + 0.5);
++#else
++	/* assume that mclk_rate is supposed to be unsigned */
++	return __get_round_off(1000000000U, p->mclk_rate);
++#endif
++}
++
++/*
++ * This function returns how many ticks is required to line reset
++ * for predefined time value.
++ */
++static inline u32 __get_line_reset_ticks(struct ufs_cal_param *p,
++					 u32 time_in_us)
++{
++#if defined(__UFS_CAL_FW__)
++	return (u32)((float)time_in_us *
++			((float)p->mclk_rate / 1000000));
++#else
++	u64 val = (u64)p->mclk_rate;
++
++	val *= time_in_us;
++	return (u32)(val / 1000000U);
++#endif
++}
++
++static inline enum ufs_cal_errno __match_board_by_cfg(u8 board, u8 cfg_board)
++{
++	enum ufs_cal_errno match = UFS_CAL_ERROR;
++
++	if (board & cfg_board)
++		match = UFS_CAL_NO_ERROR;
++
++	return match;
++}
++
++static enum ufs_cal_errno __match_mode_by_cfg(struct uic_pwr_mode *pmd,
++					      int mode)
++{
++	enum ufs_cal_errno match;
++	u8 _m, _g;
++
++	_m = pmd->mode;
++	_g = pmd->gear;
++
++	if (mode == PMD_ALL) {
++		match = UFS_CAL_NO_ERROR;
++	} else if (is_pwr_mode_hs(_m) && mode >= PMD_HS_G1 &&
++		   mode <= (int)PMD_HS) {
++		match = UFS_CAL_NO_ERROR;
++		if (mode != PMD_HS && _g != (mode - PMD_HS_G1 + 1))
++			match = UFS_CAL_ERROR;
++	} else if (is_pwr_mode_pwm(_m) && mode >= PMD_PWM_G1 &&
++		   mode <= (int)PMD_PWM) {
++		match = UFS_CAL_NO_ERROR;
++		if (mode != PMD_PWM && _g != (mode - PMD_PWM_G1 + 1))
++			match = UFS_CAL_ERROR;
++	} else {
++		/* invalid lanes */
++		match = UFS_CAL_ERROR;
++	}
++
++	return match;
++}
++
++static enum ufs_cal_errno ufs_cal_wait_pll_lock(struct ufs_vs_handle *handle,
++						u32 addr, u32 mask)
++{
++	u32 reg;
++#if !defined(__UFS_CAL_FW__)
++	u32 residue = TIMEOUT_IN_US;
++#endif
++
++#if defined(__UFS_CAL_FW__)
++	while (1)
++#else
++	while (residue--)
++#endif
++	{
++		reg = pma_readl(handle, PHY_PMA_COMN_ADDR(addr));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++		if (handle->udelay)
++			handle->udelay(DELAY_PERIOD_IN_US);
++	}
++
++	return UFS_CAL_ERROR;
++}
++
++static enum ufs_cal_errno ufs_cal_wait_cdr_lock(struct ufs_vs_handle *handle,
++						u32 addr, u32 mask, int lane)
++{
++	u32 reg;
++#if !defined(__UFS_CAL_FW__)
++	u32 residue = TIMEOUT_IN_US;
++#endif
++
++#if defined(__UFS_CAL_FW__)
++	while (1)
++#else
++	while (residue--)
++#endif
++	{
++		reg = pma_readl(handle, PHY_PMA_TRSV_ADDR(addr, lane));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++		if (handle->udelay)
++			handle->udelay(DELAY_PERIOD_IN_US);
++	}
++
++	return UFS_CAL_ERROR;
++}
++
++static enum ufs_cal_errno ufs30_cal_wait_cdr_lock(struct ufs_vs_handle *handle,
++						  u32 addr, u32 mask, int lane)
++{
++	u32 reg;
++	u32 i;
++
++	for (i = 0; i < 100; i++) {
++		if (handle->udelay)
++			handle->udelay(DELAY_PERIOD_IN_US);
++
++		reg = pma_readl(handle, PHY_PMA_TRSV_ADDR(addr, lane));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++#if defined(__UFS_CAL_FW__)
++		else
++			return UFS_CAL_ERROR;
++#endif
++		if (handle->udelay)
++			handle->udelay(DELAY_PERIOD_IN_US);
++
++		pma_writel(handle, 0x10, PHY_PMA_TRSV_ADDR(0x888, lane));
++		pma_writel(handle, 0x18, PHY_PMA_TRSV_ADDR(0x888, lane));
++	}
++
++	return UFS_CAL_ERROR;
++}
++
++static enum ufs_cal_errno
++ufs_cal_wait_cdr_afc_check(struct ufs_vs_handle *handle, u32 addr, u32 mask,
++			   int lane)
++{
++	u32 i;
++
++	for (i = 0; i < 100; i++) {
++		u32 reg = 0;
++
++		if (handle->udelay)
++			handle->udelay(DELAY_PERIOD_IN_US);
++
++		reg = pma_readl(handle, PHY_PMA_TRSV_ADDR(addr, lane));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++#if defined(__UFS_CAL_FW__)
++		else
++			return UFS_CAL_ERROR;
++#endif
++		if (handle->udelay)
++			handle->udelay(DELAY_PERIOD_IN_US);
++
++		pma_writel(handle, 0x7F, PHY_PMA_TRSV_ADDR(0xF0, lane));
++		pma_writel(handle, 0xFF, PHY_PMA_TRSV_ADDR(0xF0, lane));
++	}
++
++	return UFS_CAL_ERROR;
++}
++
++static enum ufs_cal_errno ufs30_cal_done_wait(struct ufs_vs_handle *handle,
++					      u32 addr, u32 mask, int lane)
++{
++	u32 i;
++
++	for (i = 0; i < 100; i++) {
++		u32 reg = 0;
++
++		if (handle->udelay)
++			handle->udelay(DELAY_PERIOD_IN_US);
++
++		reg = pma_readl(handle, PHY_PMA_TRSV_ADDR(addr, lane));
++		if (mask == (reg & mask))
++			return UFS_CAL_NO_ERROR;
++	}
++
++#if defined(__UFS_CAL_FW__)
++	if (i >= 100) {
++		//printf("%s : failed(cnt:%d)\n", __func__, i);
++		return UFS_CAL_ERROR;
++	}
++#endif
++
++	return UFS_CAL_NO_ERROR;
++}
++
++static inline void __set_pcs(struct ufs_vs_handle *handle,
++			     u8 lane, u32 offset, u32 value)
++{
++	unipro_writel(handle, __WSTRB | __SEL_IDX(lane),
++		      UNIP_COMP_AXI_AUX_FIELD);
++	unipro_writel(handle, value, offset);
++	unipro_writel(handle, __WSTRB, UNIP_COMP_AXI_AUX_FIELD);
++}
++
++static enum ufs_cal_errno __config_uic(struct ufs_vs_handle *handle, u8 lane,
++				       struct ufs_cal_phy_cfg *cfg,
++				       struct ufs_cal_param *p)
++{
++	u32 value;
++	u32 ticks;
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++
++	switch (cfg->lyr) {
++	/* hci */
++	case HCI_AH8_THIBERN:
++		value = H8T_GRANULARITY | ((p->ah8_thinern8_time - AH8_EXIT_REQUIRED) & 0x3FF);
++		hci_writel(handle, value, cfg->addr);
++		break;
++	case HCI_AH8_REFCLKGATINGTING:
++		if (p->ah8_brefclkgatingwaittime > REFCLK_WTV_MAX)
++			p->ah8_brefclkgatingwaittime = REFCLK_WTV_MAX;
++		hci_writel(handle, p->ah8_brefclkgatingwaittime + 5, cfg->addr);
++		break;
++	case HCI_AH8_ACTIVE_LANE:
++		value = (p->connected_rx_lane << 16) | PHY_PMA_LANE_OFFSET;
++		hci_writel(handle, value, cfg->addr);
++		break;
++	case HCI_AH8_CMN:
++		hci_writel(handle, cfg->val, cfg->addr);
++		break;
++	case HCI_AH8_TRSV:
++		value = ((p->connected_rx_lane - 1) << 31) | cfg->val;
++		hci_writel(handle, value, cfg->addr);
++		break;
++	case HCI_STD:
++		hci_writel(handle, cfg->val, cfg->addr);
++		break;
++	/* unipro */
++	case UNIPRO_STD_MIB:
++	case UNIPRO_DBG_MIB:
++		unipro_writel(handle, cfg->val, cfg->addr);
++		break;
++	case UNIPRO_ADAPT_LENGTH:
++		value = unipro_readl(handle, cfg->addr);
++		if (value & 0x80) {
++			if ((value & 0x7F) < 2)
++				unipro_writel(handle, 0x82, cfg->addr);
++		} else {
++			if (((value + 1) % 4) != 0) {
++				do {
++					value++;
++				} while (((value + 1) % 4) != 0);
++				unipro_writel(handle, value, cfg->addr);
++			}
++		}
++		break;
++	case UNIPRO_DBG_PRD:
++		unipro_writel(handle, p->mclk_period_unipro_18, cfg->addr);
++		break;
++	case UNIPRO_DBG_APB:
++		unipro_writel(handle, cfg->val, cfg->addr);
++		break;
++
++	/* pcs */
++	case PHY_PCS_COMN:
++		unipro_writel(handle, cfg->val, cfg->addr);
++		break;
++	case PHY_PCS_RX:
++		__set_pcs(handle, RX_LANE_0 + lane, cfg->addr, cfg->val);
++		break;
++	case PHY_PCS_TX:
++		__set_pcs(handle, TX_LANE_0 + lane, cfg->addr, cfg->val);
++		break;
++	case PHY_PCS_RX_PRD:
++		__set_pcs(handle, RX_LANE_0 + lane, cfg->addr, p->mclk_period);
++		break;
++	case PHY_PCS_TX_PRD:
++		__set_pcs(handle, TX_LANE_0 + lane, cfg->addr, p->mclk_period);
++		break;
++	case PHY_PCS_RX_PRD_ROUND_OFF:
++		__set_pcs(handle, RX_LANE_0 + lane, cfg->addr,
++			  p->mclk_period_rnd_off);
++		break;
++	case PHY_PCS_TX_PRD_ROUND_OFF:
++		__set_pcs(handle, TX_LANE_0 + lane, cfg->addr,
++			  p->mclk_period_rnd_off);
++		break;
++	case PHY_PCS_RX_LR_PRD:
++		ticks = __get_line_reset_ticks(p, RX_LINE_RESET_DETECT_TIME);
++		__set_pcs(handle, RX_LANE_0 + lane, cfg->addr,
++			  (ticks >> 16) & 0xFF);
++		__set_pcs(handle, RX_LANE_0 + lane, cfg->addr + 4,
++			  (ticks >> 8) & 0xFF);
++		__set_pcs(handle, RX_LANE_0 + lane, cfg->addr + 8,
++			  (ticks >> 0) & 0xFF);
++		break;
++	case PHY_PCS_TX_LR_PRD:
++		ticks = __get_line_reset_ticks(p, TX_LINE_RESET_TIME);
++		__set_pcs(handle, TX_LANE_0 + lane, cfg->addr,
++			  (ticks >> 16) & 0xFF);
++		__set_pcs(handle, TX_LANE_0 + lane, cfg->addr + 4,
++			  (ticks  >> 8) & 0xFF);
++		__set_pcs(handle, TX_LANE_0 + lane, cfg->addr + 8,
++			  (ticks >> 0) & 0xFF);
++		break;
++
++	/* pma */
++	case PHY_PMA_COMN:
++		pma_writel(handle, cfg->val, PHY_PMA_COMN_ADDR(cfg->addr));
++		break;
++	case PHY_PMA_TRSV:
++		pma_writel(handle, cfg->val,
++			   PHY_PMA_TRSV_ADDR(cfg->addr, lane));
++		break;
++	case PHY_PLL_WAIT:
++		if (ufs_cal_wait_pll_lock(handle, cfg->addr, cfg->val)
++		    == UFS_CAL_ERROR)
++			ret = UFS_CAL_TIMEOUT;
++		break;
++	case PHY_CDR_WAIT:
++		/* after gear change */
++		if (ufs_cal_wait_cdr_lock(handle, cfg->addr, cfg->val, lane)
++		    == UFS_CAL_ERROR)
++			ret = UFS_CAL_TIMEOUT;
++		break;
++	case PHY_EMB_CDR_WAIT:
++		/* after gear change */
++		if (ufs30_cal_wait_cdr_lock(p->handle, cfg->addr, cfg->val,
++					    lane)
++		    == UFS_CAL_ERROR)
++			ret = UFS_CAL_TIMEOUT;
++		break;
++		/* after gear change */
++	case PHY_CDR_AFC_WAIT:
++		if (ufs_cal_wait_cdr_afc_check(p->handle, cfg->addr,
++					       cfg->val, lane)
++		    == UFS_CAL_ERROR)
++			ret = UFS_CAL_TIMEOUT;
++		break;
++	case PHY_EMB_CAL_WAIT:
++		if (ufs30_cal_done_wait(p->handle, cfg->addr, cfg->val, lane)
++		    == UFS_CAL_ERROR)
++			ret = UFS_CAL_TIMEOUT;
++		break;
++	case COMMON_WAIT:
++		if (handle->udelay)
++			handle->udelay(cfg->val);
++		break;
++	case PHY_PMA_TRSV_SQ:
++		/* for hibern8 time */
++		pma_writel(handle, cfg->val,
++			   PHY_PMA_TRSV_ADDR(cfg->addr, lane));
++		break;
++	case PHY_PMA_TRSV_LANE1_SQ_OFF:
++		/* for hibern8 time */
++		pma_writel(handle, cfg->val,
++			   PHY_PMA_TRSV_ADDR(cfg->addr, lane));
++		break;
++	default:
++		break;
++	}
++
++	return ret;
++}
++
++static enum ufs_cal_errno ufs_cal_config_uic(struct ufs_cal_param *p,
++					     struct ufs_cal_phy_cfg *cfg,
++					     struct uic_pwr_mode *pmd)
++{
++	struct ufs_vs_handle *handle = p->handle;
++	u8 i = 0;
++	int skip;
++	enum ufs_cal_errno ret = UFS_CAL_INV_ARG;
++
++	if (!cfg)
++		goto out;
++
++	ret = UFS_CAL_NO_ERROR;
++	for (; cfg->lyr != PHY_CFG_NONE; cfg++) {
++		for (i = 0; i < p->available_lane; i++) {
++			if (p->board && UFS_CAL_ERROR ==
++				__match_board_by_cfg(p->board, cfg->board))
++				continue;
++			if (pmd && UFS_CAL_ERROR ==
++				__match_mode_by_cfg(pmd, cfg->flg))
++				continue;
++
++			if (i > 0) {
++				skip = 0;
++				switch (cfg->lyr) {
++				case HCI_AH8_THIBERN:
++				case HCI_AH8_REFCLKGATINGTING:
++				case HCI_AH8_ACTIVE_LANE:
++				case HCI_AH8_CMN:
++				case HCI_AH8_TRSV:
++				case HCI_STD:
++				case PHY_PCS_COMN:
++				case UNIPRO_STD_MIB:
++				case UNIPRO_DBG_MIB:
++				case UNIPRO_ADAPT_LENGTH:
++				case UNIPRO_DBG_PRD:
++				case PHY_PMA_COMN:
++				case UNIPRO_DBG_APB:
++				case PHY_PLL_WAIT:
++				case COMMON_WAIT:
++					skip = 1;
++					break;
++				default:
++					break;
++				}
++				if (skip)
++					continue;
++			} else {
++				skip = 0;
++				switch (cfg->lyr) {
++				case HCI_AH8_THIBERN:
++				case HCI_AH8_REFCLKGATINGTING:
++				case HCI_AH8_ACTIVE_LANE:
++				case HCI_AH8_CMN:
++				case HCI_AH8_TRSV:
++					if (!p->support_ah8_cal)
++						skip = 1;
++					break;
++				default:
++					break;
++				}
++				if (skip)
++					continue;
++			}
++
++			if (i >= p->active_rx_lane) {
++				skip = 0;
++				switch (cfg->lyr) {
++				case PHY_CDR_WAIT:
++				case PHY_EMB_CDR_WAIT:
++				case PHY_CDR_AFC_WAIT:
++					skip = 1;
++					break;
++				default:
++					break;
++				}
++				if (skip)
++					continue;
++			}
++			if (cfg->lyr == PHY_PMA_TRSV_LANE1_SQ_OFF &&
++			    i < p->connected_rx_lane)
++				continue;
++			if (cfg->lyr == PHY_PMA_TRSV_SQ &&
++			    i >= p->connected_rx_lane)
++				continue;
++
++			ret = __config_uic(handle, i, cfg, p);
++			if (ret)
++				goto out;
++		}
++	}
++out:
++	return ret;
++}
++
++/*
++ * public functions
++ */
++enum ufs_cal_errno ufs_cal_loopback_init(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	cfg = (p->tbl == HOST_CARD) ? loopback_init_card : loopback_init;
++	ret = ufs_cal_config_uic(p, cfg, NULL);
++
++	return ret;
++}
++
++enum ufs_cal_errno ufs_cal_loopback_set_1(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	cfg = (p->tbl == HOST_CARD) ? loopback_set_1_card : loopback_set_1;
++	ret = ufs_cal_config_uic(p, cfg, NULL);
++
++	return ret;
++}
++
++enum ufs_cal_errno ufs_cal_loopback_set_2(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	cfg = (p->tbl == HOST_CARD) ? loopback_set_2_card : loopback_set_2;
++	ret = ufs_cal_config_uic(p, cfg, NULL);
++
++	return ret;
++}
++
++enum ufs_cal_errno ufs_cal_post_h8_enter(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	cfg = (p->tbl == HOST_CARD) ? post_h8_enter_card : post_h8_enter;
++	ret = ufs_cal_config_uic(p, cfg, p->pmd);
++
++	return ret;
++}
++
++enum ufs_cal_errno ufs_cal_pre_h8_exit(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	cfg = (p->tbl == HOST_CARD) ? pre_h8_exit_card : pre_h8_exit;
++	ret = ufs_cal_config_uic(p, cfg, p->pmd);
++
++	return ret;
++}
++
++/*
++ * This currently uses only SLOW_MODE and FAST_MODE.
++ * If you want others, you should modify this function.
++ */
++enum ufs_cal_errno ufs_cal_pre_pmc(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++	struct ufs_vs_handle *handle = p->handle;
++	u32 dl_error;
++
++	/* block PA_ERROR_IND_RECEIVED */
++	dl_error = unipro_readl(handle, UNIP_DL_ERROR_IRQ_MASK) |
++						PA_ERROR_IND_RECEIVED;
++	unipro_writel(handle, dl_error, UNIP_DL_ERROR_IRQ_MASK);
++
++	if (p->pmd->mode == SLOW_MODE || p->pmd->mode == SLOWAUTO_MODE)
++		cfg = (p->tbl == HOST_CARD) ? calib_of_pwm_card : calib_of_pwm;
++	else if (p->pmd->hs_series == PA_HS_MODE_B)
++		cfg = (p->tbl == HOST_CARD) ? calib_of_hs_rate_b_card :
++							calib_of_hs_rate_b;
++	else if (p->pmd->hs_series == PA_HS_MODE_A)
++		cfg = (p->tbl == HOST_CARD) ? calib_of_hs_rate_a_card :
++							calib_of_hs_rate_a;
++	else
++		return UFS_CAL_INV_ARG;
++
++	ret = ufs_cal_config_uic(p, cfg, p->pmd);
++
++	return ret;
++}
++
++/*
++ * This currently uses only SLOW_MODE and FAST_MODE.
++ * If you want others, you should modify this function.
++ */
++enum ufs_cal_errno ufs_cal_post_pmc(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	if (p->pmd->mode == SLOWAUTO_MODE || p->pmd->mode == SLOW_MODE)
++		cfg = (p->tbl == HOST_CARD) ? post_calib_of_pwm_card :
++					post_calib_of_pwm;
++	else if (p->pmd->hs_series == PA_HS_MODE_B)
++		cfg = (p->tbl == HOST_CARD) ? post_calib_of_hs_rate_b_card :
++					post_calib_of_hs_rate_b;
++	else if (p->pmd->hs_series == PA_HS_MODE_A)
++		cfg = (p->tbl == HOST_CARD) ? post_calib_of_hs_rate_a_card :
++					post_calib_of_hs_rate_a;
++	else
++		return UFS_CAL_INV_ARG;
++
++	ret = ufs_cal_config_uic(p, cfg, p->pmd);
++
++	if (ret == UFS_CAL_NO_ERROR && p->support_ah8_cal) {
++		if (p->evt_ver == 0)
++			cfg = post_ah8_cfg_evt0;
++		else
++			cfg = post_ah8_cfg_evt1;
++
++		ret = ufs_cal_config_uic(p, cfg, p->pmd);
++	}
++
++	return ret;
++}
++
++enum ufs_cal_errno ufs_cal_post_link(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	switch (p->max_gear) {
++	case GEAR_1:
++	case GEAR_2:
++	case GEAR_3:
++	case GEAR_4:
++		if (p->evt_ver == 0)
++			cfg = (p->tbl == HOST_CARD) ? post_init_cfg_card :
++						post_init_cfg_evt0;
++		else
++			cfg = (p->tbl == HOST_CARD) ? post_init_cfg_card :
++						post_init_cfg_evt1;
++		break;
++	default:
++		ret = UFS_CAL_INV_ARG;
++		break;
++	}
++
++	if (ret)
++		return ret;
++
++	ret = ufs_cal_config_uic(p, cfg, NULL);
++
++	/*
++	 * If a number of target lanes is 1 and a host's
++	 * a number of available lanes is 2,
++	 * you should turn off phy power of lane #1.
++	 *
++	 * This must be modified when a number of available lanes
++	 * would grow in the future.
++	 */
++	if (ret == UFS_CAL_NO_ERROR) {
++		if (p->available_lane == 2 && p->connected_rx_lane == 1) {
++			cfg = (p->tbl == HOST_CARD) ?
++				lane1_sq_off_card : lane1_sq_off;
++			ret = ufs_cal_config_uic(p, cfg, NULL);
++		}
++	}
++
++	/* eom */
++	p->eom_sz = EOM_PH_SEL_MAX * EOM_DEF_VREF_MAX *
++		ufs_s_eom_repeat[p->max_gear];
++
++	return ret;
++}
++
++enum ufs_cal_errno ufs_cal_pre_link(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	/* preset mclk periods */
++	p->mclk_period = __get_mclk_period(p);
++	p->mclk_period_rnd_off = __get_mclk_period_rnd_off(p);
++	p->mclk_period_unipro_18 = __get_mclk_period_unipro_18(p);
++
++	if (p->evt_ver == 0)
++		cfg = (p->tbl == HOST_CARD) ? init_cfg_card : init_cfg_evt0;
++	else
++		cfg = (p->tbl == HOST_CARD) ? init_cfg_card : init_cfg_evt1;
++
++	ret = ufs_cal_config_uic(p, cfg, NULL);
++
++	return ret;
++}
++
++static enum ufs_cal_errno ufs_cal_eom_prepare(struct ufs_cal_param *p)
++{
++	enum ufs_cal_errno ret = UFS_CAL_NO_ERROR;
++	struct ufs_cal_phy_cfg *cfg;
++
++	cfg = eom_prepare;
++	ret = ufs_cal_config_uic(p, cfg, p->pmd);
++	return ret;
++}
++
++static u32 ufs_cal_get_eom_err_cnt(struct ufs_vs_handle *handle, u32 lane_loop)
++{
++	u32 val;
++
++	val = (u32)(pma_readl(handle,
++			      PHY_PMA_TRSV_ADDR(0xCAC, lane_loop)) << 24);
++	val += (u32)(pma_readl(handle,
++			      PHY_PMA_TRSV_ADDR(0xCB0, lane_loop)) << 16);
++	val += (u32)(pma_readl(handle,
++			       PHY_PMA_TRSV_ADDR(0xCB4, lane_loop)) << 8);
++	val += (u32)(pma_readl(handle,
++			       PHY_PMA_TRSV_ADDR(0xCB8, lane_loop)));
++	return val;
++}
++
++static enum ufs_cal_errno
++ufs_cal_sweep_get_eom_data(struct ufs_vs_handle *handle, u32 *cnt,
++			   struct ufs_cal_param *p, u32 lane, u32 repeat)
++{
++	u32 phase, vref;
++	u32 errors;
++	struct ufs_eom_result_s *data = p->eom[lane];
++	u32 retries = 100 * 1000;	/* 100ms */
++	u32 val;
++
++	for (phase = 0; phase < EOM_PH_SEL_MAX; phase++) {
++		pma_writel(handle, phase << 1,
++			   PHY_PMA_TRSV_ADDR(0x91C, lane));
++
++		for (vref = 0; vref < EOM_DEF_VREF_MAX; vref++) {
++			pma_writel(handle, 0x18,
++				   PHY_PMA_TRSV_ADDR(0xB84, lane));
++			pma_writel(handle, vref,
++				   PHY_PMA_TRSV_ADDR(0xB9C, lane));
++			pma_writel(handle, 0x19,
++				   PHY_PMA_TRSV_ADDR(0xB84, lane));
++
++			do {
++				val = pma_readl(handle,
++						PHY_PMA_TRSV_ADDR(0xC60, lane));
++				if (val & 0x1)
++					break;
++#if defined(__UFS_CAL_FW__)
++			} while (1);
++#else
++				/* expecting a multiple of 10us */
++				if (handle->udelay)
++					handle->udelay(10);
++			} while (retries--);
++#endif
++			errors = ufs_cal_get_eom_err_cnt(handle, lane);
++
++			if (handle->udelay)
++				handle->udelay(1);
++
++			data[*cnt].v_phase =
++					phase + (repeat * EOM_PH_SEL_MAX);
++			data[*cnt].v_vref = vref;
++			data[*cnt].v_err = errors;
++			(*cnt)++;
++		}
++	}
++
++	return UFS_CAL_NO_ERROR;
++}
++
++enum ufs_cal_errno ufs_cal_eom(struct ufs_cal_param *p)
++{
++	u32 repeat;
++	u32 lane;
++	u32 i;
++	u32 cnt;
++	struct ufs_vs_handle *handle = p->handle;
++	u32 num_of_active_rx = p->available_lane;
++	enum ufs_cal_errno res = UFS_CAL_NO_ERROR;
++
++	ufs_cal_eom_prepare(p);
++
++	repeat = (p->max_gear <= GEAR_MAX) ? ufs_s_eom_repeat[p->pmd->gear] : 0;
++	if (repeat == 0) {
++		res = UFS_CAL_ERROR;
++		goto end;
++	} else {
++		for (i = GEAR_1 ; i < GEAR_MAX ; i++) {
++			if (repeat > EOM_RTY_MAX) {
++				res = UFS_CAL_INV_CONF;
++				goto end;
++			}
++		}
++	}
++
++	for (lane = 0; lane < num_of_active_rx; lane++) {
++		cnt = 0;
++		for (i = 0; i < repeat; i++) {
++			res = ufs_cal_sweep_get_eom_data(handle,
++							 &cnt, p, lane, i);
++			if (res)
++				goto end;
++		}
++	}
++end:
++	return res;
++}
++
++enum ufs_cal_errno ufs_cal_init(struct ufs_cal_param *p, int idx)
++{
++	/*
++	 * Return if innput index is greater than
++	 * the maximum that cal supports
++	 */
++	if (idx >= NUM_OF_UFS_HOST)
++		return UFS_CAL_INV_ARG;
++
++	ufs_cal[idx] = p;
++
++	return UFS_CAL_NO_ERROR;
++}
+diff --git a/drivers/ufs/exynos-gs/ufs-cal-if.h b/drivers/ufs/exynos-gs/ufs-cal-if.h
+new file mode 100644
+index 00000000..a9dddfcf
+--- /dev/null
++++ b/drivers/ufs/exynos-gs/ufs-cal-if.h
+@@ -0,0 +1,130 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright 2022 Samsung Electronics Co., Ltd.
++ */
++#ifndef _UFS_CAL_
++#define _UFS_CAL_
++
++#undef NULL
++#define NULL    0
++
++#undef BIT
++#define BIT(a)	(1U << (a))
++
++struct uic_pwr_mode {
++	u8 lane;
++	u8 gear;
++	u8 mode;
++	u8 hs_series;
++};
++
++enum {
++	HOST_EMBD = 0,
++	HOST_CARD = 1,
++};
++
++enum {
++	EOM_RTY_G1 = 8,
++	EOM_RTY_G2 = 4,
++	EOM_RTY_G3 = 2,
++	EOM_RTY_G4 = 1,
++	EOM_RTY_MAX = 8,
++};
++
++enum {
++	GEAR_1 = 1,
++	GEAR_2,
++	GEAR_3,
++	GEAR_4,
++	GEAR_MAX = GEAR_4,
++};
++
++#define MAX_LANE		4
++
++#define EOM_PH_SEL_MAX		128
++#define EOM_DEF_VREF_MAX	256
++#define EOM_MAX_SIZE		(EOM_RTY_MAX * EOM_PH_SEL_MAX * \
++					EOM_DEF_VREF_MAX)
++
++static const u32 ufs_s_eom_repeat[GEAR_MAX + 1] = {
++		0, EOM_RTY_G1, EOM_RTY_G2, EOM_RTY_G3, EOM_RTY_G4
++};
++
++struct ufs_eom_result_s {
++	u32 v_phase;
++	u32 v_vref;
++	u32 v_err;
++};
++
++/* interface */
++struct ufs_cal_param {
++	/* input */
++	struct ufs_vs_handle *handle;
++	u8 available_lane;
++	u8 connected_tx_lane;
++	u8 connected_rx_lane;
++	u8 active_tx_lane;
++	u8 active_rx_lane;
++	u32 mclk_rate;
++	u8 tbl;
++	u8 board;
++	u8 evt_ver;
++	u8 max_gear;
++	struct uic_pwr_mode *pmd;
++
++	/* output */
++	u32 eom_sz;
++	struct ufs_eom_result_s *eom[MAX_LANE];	/* per lane */
++
++	/* private data */
++	u32 mclk_period;
++	u32 mclk_period_rnd_off;
++	u32 mclk_period_unipro_18;
++
++	/* AH8 */
++	u32 support_ah8_cal;
++	u32 ah8_thinern8_time;
++	u32 ah8_brefclkgatingwaittime;
++};
++
++enum ufs_cal_errno {
++	UFS_CAL_NO_ERROR = 0,
++	UFS_CAL_TIMEOUT,
++	UFS_CAL_ERROR,
++	UFS_CAL_INV_ARG,
++	UFS_CAL_INV_CONF,
++};
++
++enum {
++	__BRD_SMDK,
++	__BRD_ASB,
++	__BRD_HSIE,
++	__BRD_ZEBU,
++	__BRD_UNIV,
++	__BRD_MAX,
++};
++
++#define BRD_SMDK	BIT(__BRD_SMDK)
++#define BRD_ASB		BIT(__BRD_ASB)
++#define BRD_HSIE	BIT(__BRD_HSIE)
++#define BRD_ZEBU	BIT(__BRD_ZEBU)
++#define BRD_UNIV	BIT(__BRD_UNIV)
++#define BRD_MAX		BIT(__BRD_MAX)
++#define BRD_ALL		(BIT(__BRD_MAX) - 1)
++
++/* UFS CAL interface */
++typedef enum ufs_cal_errno (*cal_if_func_init) (struct ufs_cal_param *, int);
++typedef enum ufs_cal_errno (*cal_if_func) (struct ufs_cal_param *);
++enum ufs_cal_errno ufs_cal_post_h8_enter(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_pre_h8_exit(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_post_pmc(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_pre_pmc(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_post_link(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_pre_link(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_init(struct ufs_cal_param *p, int idx);
++enum ufs_cal_errno ufs_cal_eom(struct ufs_cal_param *p);
++
++enum ufs_cal_errno ufs_cal_loopback_init(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_loopback_set_1(struct ufs_cal_param *p);
++enum ufs_cal_errno ufs_cal_loopback_set_2(struct ufs_cal_param *p);
++#endif /*_UFS_CAL_ */
+diff --git a/drivers/ufs/exynos-gs/ufs-cal.h b/drivers/ufs/exynos-gs/ufs-cal.h
+new file mode 100644
+index 00000000..a25ab865
+--- /dev/null
++++ b/drivers/ufs/exynos-gs/ufs-cal.h
+@@ -0,0 +1,538 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright 2022 Samsung Electronics Co., Ltd.
++ */
++#ifndef _UFS_CAL_TABLE_
++#define _UFS_CAL_TABLE_
++
++#define UFS_CAL_VER 0
++#include "ufs-cal-if.h"
++
++struct ufs_cal_phy_cfg {
++	u32 mib;
++	u32 addr;
++	u32 val;
++	u32 flg;
++	u32 lyr;
++	u8 board;
++};
++
++enum {
++	PHY_CFG_NONE = 0,
++	PHY_PCS_COMN,
++	PHY_PCS_RXTX,
++	PHY_PMA_COMN,
++	PHY_PMA_TRSV,
++	PHY_PLL_WAIT,
++	PHY_CDR_WAIT,
++	PHY_CDR_AFC_WAIT,
++	UNIPRO_STD_MIB,
++	UNIPRO_DBG_MIB,
++	UNIPRO_DBG_APB,
++
++	PHY_PCS_RX,
++	PHY_PCS_TX,
++	PHY_PCS_RX_PRD,
++	PHY_PCS_TX_PRD,
++	UNIPRO_DBG_PRD,
++	PHY_PMA_TRSV_LANE1_SQ_OFF,
++	PHY_PMA_TRSV_SQ,
++	COMMON_WAIT,
++
++	PHY_PCS_RX_LR_PRD,
++	PHY_PCS_TX_LR_PRD,
++	PHY_PCS_RX_PRD_ROUND_OFF,
++	PHY_PCS_TX_PRD_ROUND_OFF,
++	UNIPRO_ADAPT_LENGTH,
++	PHY_EMB_CDR_WAIT,
++	PHY_EMB_CAL_WAIT,
++
++	HCI_AH8_THIBERN,
++	HCI_AH8_REFCLKGATINGTING,
++	HCI_AH8_ACTIVE_LANE,
++	HCI_AH8_CMN,
++	HCI_AH8_TRSV,
++	HCI_STD,
++};
++
++enum {
++	PMD_PWM_G1 = 0,
++	PMD_PWM_G2,
++	PMD_PWM_G3,
++	PMD_PWM_G4,
++	PMD_PWM_G5,
++	PMD_PWM,
++
++	PMD_HS_G1,
++	PMD_HS_G2,
++	PMD_HS_G3,
++	PMD_HS_G4,
++	PMD_HS,
++
++	PMD_ALL,
++};
++
++#undef USE_38_4_MHZ
++#define USE_38_4_MHZ	 /* 38.4MHz */
++
++static struct ufs_cal_phy_cfg init_cfg_evt0[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x44, 0x00, PMD_ALL, UNIPRO_DBG_PRD, BRD_ALL},
++
++	{0x200, 0x2800, 0x40, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++#ifdef USE_38_4_MHZ /*38.4MHz*/
++	{0x202, 0x2808, 0x22, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++#else/*26MHz*/
++	{0x202, 0x2808, 0x12, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++#endif
++	{0x12, 0x2048, 0x00, PMD_ALL, PHY_PCS_RX_PRD_ROUND_OFF, BRD_ALL},
++	{0xAA, 0x22A8, 0x00, PMD_ALL, PHY_PCS_TX_PRD_ROUND_OFF, BRD_ALL},
++	{0xA9, 0x22A4, 0x02, PMD_ALL, PHY_PCS_TX, BRD_ALL},
++	{0xAB, 0x22AC, 0x00, PMD_ALL, PHY_PCS_TX_LR_PRD, BRD_ALL},
++	{0x11, 0x2044, 0x00, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++	{0x1B, 0x206C, 0x00, PMD_ALL, PHY_PCS_RX_LR_PRD, BRD_ALL},
++	{0x2F, 0x20BC, 0x79, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++
++	{0x84, 0x2210, 0x01, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++	{0x04, 0x2010, 0x01, PMD_ALL, PHY_PCS_TX, BRD_ALL},
++	{0x25, 0x2094, 0xF6, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++	{0x7F, 0x21FC, 0x00, PMD_ALL, PHY_PCS_TX, BRD_ALL},
++	{0x200, 0x2800, 0x0, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++
++	{0x155E, 0x3178, 0x0, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x3000, 0x5000, 0x0, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x3001, 0x5004, 0x1, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x4021, 0x6084, 0x1, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x4020, 0x6080, 0x1, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++
++	{0x0000, 0x140, 0x08, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x014, 0x19, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x02C, 0x44, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x030, 0xC4, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x034, 0xC3, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x03C, 0x88, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x058, 0x1A, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x064, 0x04, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x150, 0x88, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x19C, 0x4C, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x1A0, 0x4C, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x804, 0x44, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x808, 0x44, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x80C, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x810, 0x18, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x814, 0xC0, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x81C, 0x1C, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xBB0, 0x8C, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x9F0, 0xD0, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0xA20, 0xFA, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xA24, 0x60, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x8D0, 0x30, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x8E4, 0x05, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x8F4, 0x05, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x934, 0x1A, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x938, 0x12, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x93C, 0x5E, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x964, 0x2A, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x980, 0x54, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x998, 0x54, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x9CC, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x9D0, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0xAAC, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xAB0, 0x02, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x140, 0x0C, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x140, 0x00, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0xC74, 0x01, PMD_ALL, PHY_EMB_CAL_WAIT, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg init_cfg_evt1[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x44, 0x00, PMD_ALL, UNIPRO_DBG_PRD, BRD_ALL},
++
++	{0x200, 0x2800, 0x40, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++#ifdef USE_38_4_MHZ /*38.4MHz*/
++	{0x202, 0x2808, 0x22, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++#else/*26MHz*/
++	{0x202, 0x2808, 0x12, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++#endif
++	{0x12, 0x2048, 0x00, PMD_ALL, PHY_PCS_RX_PRD_ROUND_OFF, BRD_ALL},
++	{0xAA, 0x22A8, 0x00, PMD_ALL, PHY_PCS_TX_PRD_ROUND_OFF, BRD_ALL},
++	{0xA9, 0x22A4, 0x02, PMD_ALL, PHY_PCS_TX, BRD_ALL},
++	{0xAB, 0x22AC, 0x00, PMD_ALL, PHY_PCS_TX_LR_PRD, BRD_ALL},
++	{0x11, 0x2044, 0x00, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++	{0x1B, 0x206C, 0x00, PMD_ALL, PHY_PCS_RX_LR_PRD, BRD_ALL},
++	{0x2F, 0x20BC, 0x79, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++
++	{0x84, 0x2210, 0x01, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++	{0x04, 0x2010, 0x01, PMD_ALL, PHY_PCS_TX, BRD_ALL},
++	{0x25, 0x2094, 0xF6, PMD_ALL, PHY_PCS_RX, BRD_ALL},
++	{0x7F, 0x21FC, 0x00, PMD_ALL, PHY_PCS_TX, BRD_ALL},
++	{0x200, 0x2800, 0x0, PMD_ALL, PHY_PCS_COMN, BRD_ALL},
++
++	{0x155E, 0x3178, 0x0, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x3000, 0x5000, 0x0, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x3001, 0x5004, 0x1, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x4021, 0x6084, 0x1, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x4020, 0x6080, 0x1, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++
++	{0x0000, 0x140, 0x08, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x014, 0x19, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x02C, 0x44, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x030, 0xC4, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x034, 0xC3, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x03C, 0x88, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x058, 0x1A, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x064, 0x04, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x150, 0x88, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x19C, 0x4C, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0x1A0, 0x4C, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x804, 0x44, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x808, 0x44, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x80C, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x810, 0x18, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x814, 0xC0, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x81C, 0x1C, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xBB0, 0x8C, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x9F0, 0xD0, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0xA20, 0xFA, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xA24, 0x60, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x8D0, 0x30, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x8E4, 0x05, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x8F4, 0x05, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x934, 0x1A, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x938, 0x12, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x93C, 0x5E, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x964, 0x2A, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x980, 0x54, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x998, 0x54, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x9CC, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x9D0, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0xAAC, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xAB0, 0x02, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x140, 0x0C, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x140, 0x00, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0xC74, 0x01, PMD_ALL, PHY_EMB_CAL_WAIT, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_init_cfg_evt0[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x15D2, 0x3348, 0x0, PMD_ALL, UNIPRO_ADAPT_LENGTH, BRD_ALL},
++	{0x15D3, 0x334C, 0x0, PMD_ALL, UNIPRO_ADAPT_LENGTH, BRD_ALL},
++	{0x9529, 0x38A4, 0x01, PMD_ALL, UNIPRO_DBG_MIB, BRD_ALL},
++	{0x15A4, 0x3290, 0x3E8, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x9529, 0x38A4, 0x00, PMD_ALL, UNIPRO_DBG_MIB, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_init_cfg_evt1[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x15D2, 0x3348, 0x0, PMD_ALL, UNIPRO_ADAPT_LENGTH, BRD_ALL},
++	{0x15D3, 0x334C, 0x0, PMD_ALL, UNIPRO_ADAPT_LENGTH, BRD_ALL},
++	{0x9529, 0x38A4, 0x01, PMD_ALL, UNIPRO_DBG_MIB, BRD_ALL},
++	{0x15A4, 0x3290, 0x3E8, PMD_ALL, UNIPRO_STD_MIB, BRD_ALL},
++	{0x9529, 0x38A4, 0x00, PMD_ALL, UNIPRO_DBG_MIB, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg calib_of_pwm[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x2041, 0x4104, 8064, PMD_PWM, UNIPRO_STD_MIB, BRD_ALL},
++	{0x2042, 0x4108, 28224, PMD_PWM, UNIPRO_STD_MIB, BRD_ALL},
++	{0x2043, 0x410C, 20160, PMD_PWM, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B0, 0x32C0, 12000, PMD_PWM, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B1, 0x32C4, 32000, PMD_PWM, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B2, 0x32C8, 16000, PMD_PWM, UNIPRO_STD_MIB, BRD_ALL},
++
++	{0x0000, 0x7888, 8064, PMD_PWM, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x788C, 28224, PMD_PWM, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x7890, 20160, PMD_PWM, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78B8, 12000, PMD_PWM, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78BC, 32000, PMD_PWM, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78C0, 16000, PMD_PWM, UNIPRO_DBG_APB, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_pwm[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg calib_of_hs_rate_a[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x15D4, 0x3350, 0x1, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++
++	{0x2041, 0x4104, 8064, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x2042, 0x4108, 28224, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x2043, 0x410C, 20160, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B0, 0x32C0, 12000, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B1, 0x32C4, 32000, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B2, 0x32C8, 16000, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++
++	{0x0000, 0x7888, 8064, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x788C, 28224, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x7890, 20160, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78B8, 12000, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78BC, 32000, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78C0, 16000, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_hs_rate_a[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg calib_of_hs_rate_b[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x15D4, 0x3350, 0x1, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++
++	{0x2041, 0x4104, 8064, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x2042, 0x4108, 28224, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x2043, 0x410C, 20160, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B0, 0x32C0, 12000, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B1, 0x32C4, 32000, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++	{0x15B2, 0x32C8, 16000, PMD_HS, UNIPRO_STD_MIB, BRD_ALL},
++
++	{0x0000, 0x7888, 8064, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x788C, 28224, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x7890, 20160, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78B8, 12000, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78BC, 32000, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++	{0x0000, 0x78C0, 16000, PMD_HS, UNIPRO_DBG_APB, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_hs_rate_b[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_ah8_cfg_evt0[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x1604, 0x00, PMD_HS, HCI_AH8_THIBERN, BRD_ALL},
++	{0x0000, 0x1608, 0x00, PMD_HS, HCI_AH8_REFCLKGATINGTING, BRD_ALL},
++	{0x0000, 0x161C, 0x00, PMD_HS, HCI_AH8_ACTIVE_LANE, BRD_ALL},
++	{0x0000, 0x1624, 0x35B60, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0x0000, 0x1620, 0x120013, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0x0000, 0x1710, 0x000009F4, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x1750, 0x00000008, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1714, 0x00000A00, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x1754, 0x0000003A, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1718, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1758, 0x00000051, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0x0000, 0x1790, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x17D0, 0x00000011, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1794, 0x401E0000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x17D4, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1798, 0x000009F4, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x17D8, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x179C, 0x00000A00, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x17DC, 0x00000030, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_ah8_cfg_evt1[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x1604, 0x00, PMD_HS, HCI_AH8_THIBERN, BRD_ALL},
++	{0x0000, 0x1608, 0x00, PMD_HS, HCI_AH8_REFCLKGATINGTING, BRD_ALL},
++	{0x0000, 0x161C, 0x00, PMD_HS, HCI_AH8_ACTIVE_LANE, BRD_ALL},
++	{0x0000, 0x1624, 0x35B60, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0x0000, 0x1620, 0x120013, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0x0000, 0x1710, 0x000009F4, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x1750, 0x00000008, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1714, 0x00000A00, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x1754, 0x0000003A, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1718, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1758, 0x00000051, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0x0000, 0x1790, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x17D0, 0x00000011, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1794, 0x401E0000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x17D4, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x1798, 0x000009F4, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x17D8, 0x00000000, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++	{0x0000, 0x179C, 0x00000A00, PMD_HS, HCI_AH8_TRSV, BRD_ALL},
++	{0x0000, 0x17DC, 0x00000030, PMD_HS, HCI_AH8_CMN, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg lane1_sq_off[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x9F4, 0x08, PMD_ALL, PHY_PMA_TRSV_LANE1_SQ_OFF, BRD_ALL},
++	{0x0000, 0xA00, 0x3A, PMD_ALL, PHY_PMA_TRSV_LANE1_SQ_OFF, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_h8_enter[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x9F4, 0x08, PMD_ALL, PHY_PMA_TRSV_SQ, BRD_ALL},
++	{0x0000, 0xA00, 0x3A, PMD_ALL, PHY_PMA_TRSV_SQ, BRD_ALL},
++	{0x0000, 0x000, 0x51, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++
++	{0x0000, 0xB64, 0x30, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xB64, 0x33, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg pre_h8_exit[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x000, 0x11, PMD_ALL, PHY_PMA_COMN, BRD_ALL},
++	{0x0000, 0x000, 0x0A, PMD_ALL, COMMON_WAIT, BRD_ALL},
++	{0x0000, 0x9F4, 0x00, PMD_ALL, PHY_PMA_TRSV_SQ, BRD_ALL},
++	{0x0000, 0xA00, 0x30, PMD_ALL, PHY_PMA_TRSV_SQ, BRD_ALL},
++
++	{0x0000, 0xB64, 0x32, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xB64, 0x22, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg loopback_init[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0xB44, 0xA3, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xA24, 0x24, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x844, 0x01, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xA14, 0x58, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg loopback_set_1[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0xB44, 0xAB, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg loopback_set_2[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0xA14, 0x70, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x920, 0x1C, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg eom_prepare[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0x0000, 0x870, 0x03, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0xB8C, 0xE3, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x8C8, 0x33, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++	{0x0000, 0x91C, 0x00, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0xB90, 0x14, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0x0000, 0x870, 0x03, PMD_ALL, PHY_PMA_TRSV, BRD_ALL},
++
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg init_cfg_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_init_cfg_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg calib_of_pwm_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_pwm_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg calib_of_hs_rate_a_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_hs_rate_a_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg calib_of_hs_rate_b_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_calib_of_hs_rate_b_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg lane1_sq_off_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg post_h8_enter_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg pre_h8_exit_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg loopback_init_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg loopback_set_1_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++
++static struct ufs_cal_phy_cfg loopback_set_2_card[] = {
++	/* mib(just to monitor), sfr offset, value, .. */
++	{0, 0, 0, 0, PHY_CFG_NONE, BRD_ALL}
++};
++#endif	/* _UFS_CAL_TABLE_ */
+diff --git a/drivers/ufs/exynos-gs/ufs-vs-mmio.h b/drivers/ufs/exynos-gs/ufs-vs-mmio.h
+new file mode 100644
+index 00000000..b66c99c8
+--- /dev/null
++++ b/drivers/ufs/exynos-gs/ufs-vs-mmio.h
+@@ -0,0 +1,100 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright 2022 Samsung Electronics Co., Ltd.
++ */
++#ifndef _UFS_VS_HANDLE_H_
++#define _UFS_VS_HANDLE_H_
++
++struct ufs_vs_handle {
++	void *std;	/* Need to care conditions */
++	void *hci;
++	void *ufsp;
++	void *unipro;
++	void *pma;
++	void *cport;
++	void (*udelay)(u32 us);
++	void *private;
++};
++
++static inline void std_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
++{
++	writel(val, handle->std + ofs);
++}
++
++static inline u32 std_readl(struct ufs_vs_handle *handle, u32 ofs)
++{
++	return readl(handle->std + ofs);
++}
++
++static inline void hci_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
++{
++	writel(val, handle->hci + ofs);
++}
++
++static inline u32 hci_readl(struct ufs_vs_handle *handle, u32 ofs)
++{
++	return readl(handle->hci + ofs);
++}
++
++static inline void unipro_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
++{
++	writel(val, handle->unipro + ofs);
++}
++
++static inline u32 unipro_readl(struct ufs_vs_handle *handle, u32 ofs)
++{
++	return readl(handle->unipro + ofs);
++}
++
++static inline void cport_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
++{
++	writel(val, handle->cport + ofs);
++}
++
++static inline u32 cport_readl(struct ufs_vs_handle *handle, u32 ofs)
++{
++	return readl(handle->cport + ofs);
++}
++
++#if defined(__UFS_CAL_FW__)
++
++#undef MISC_CAL
++#undef MPHY_APBCLK_CAL
++
++#define	MISC_CAL		0x11B4
++#define	MPHY_APBCLK_CAL	(1 << 10)
++
++static inline void pma_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
++{
++	u32 clkstop_ctrl = readl(handle->hci + MISC_CAL);
++
++	writel(clkstop_ctrl & ~MPHY_APBCLK_CAL, handle->hci + MISC_CAL);
++	writel(val, handle->pma + ofs);
++	writel(clkstop_ctrl | MPHY_APBCLK_CAL, handle->hci + MISC_CAL);
++}
++
++static inline u32 pma_readl(struct ufs_vs_handle *handle, u32 ofs)
++{
++	u32 clkstop_ctrl = readl(handle->hci + MISC_CAL);
++	u32 val;
++
++	writel(clkstop_ctrl & ~MPHY_APBCLK_CAL, handle->hci + MISC_CAL);
++	DSB;
++	val = readl(handle->pma + ofs);
++	DSB;
++	writel(clkstop_ctrl | MPHY_APBCLK_CAL, handle->hci + MISC_CAL);
++	return val;
++}
++#else
++static inline void pma_writel(struct ufs_vs_handle *handle, u32 val, u32 ofs)
++{
++	writel(val, handle->pma + ofs);
++}
++
++static inline u32 pma_readl(struct ufs_vs_handle *handle, u32 ofs)
++{
++	return readl(handle->pma + ofs);
++}
++#endif
++
++#endif /* _UFS_VS_HANDLE_H_ */
+diff --git a/drivers/ufs/exynos-gs/ufs-vs-regs.h b/drivers/ufs/exynos-gs/ufs-vs-regs.h
+new file mode 100644
+index 00000000..bbcd41e1
+--- /dev/null
++++ b/drivers/ufs/exynos-gs/ufs-vs-regs.h
+@@ -0,0 +1,330 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++//
++// Copyright (C) 2019 Samsung Electronics Co., Ltd.
++//
++// Authors:
++//	Kiwoong <kwmad.kim@samsung.com>
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++#ifndef _UFS_VS_REGS_H_
++#define _UFS_VS_REGS_H_
++
++/* HCI */
++#define HCI_TXPRDT_ENTRY_SIZE		0x00
++#define HCI_RXPRDT_ENTRY_SIZE		0x04
++#define HCI_TO_CNT_DIV_VAL              0x08
++#define HCI_1US_TO_CNT_VAL		0x0C
++ #define CNT_VAL_1US_MASK	0x3ff
++#define HCI_INVALID_UPIU_CTRL		0x10
++#define HCI_INVALID_UPIU_BADDR		0x14
++#define HCI_INVALID_UPIU_UBADDR		0x18
++#define HCI_INVALID_UTMR_OFFSET_ADDR	0x1C
++#define HCI_INVALID_UTR_OFFSET_ADDR	0x20
++#define HCI_INVALID_DIN_OFFSET_ADDR	0x24
++#define HCI_VENDOR_SPECIFIC_IS		0x38
++#define HCI_VENDOR_SPECIFIC_IE		0x3C
++
++#define AH8_ERR_UECPA_EN                BIT(10)
++#define AH8_ERR_UECDL_EN                BIT(9)
++#define AH8_ERR_UECN_EN                 BIT(8)
++#define AH8_ERR_UECT_EN                 BIT(7)
++#define AH8_ERR_UECDME_EN               BIT(6)
++/* When the controller is in auto-hibernation sequence and UIC error happens,
++ * report as UIC error with IS.UE register.
++ */
++#define AH8_ERR_REPORT_UE               (AH8_ERR_UECPA_EN | AH8_ERR_UECDL_EN |\
++					AH8_ERR_UECN_EN | AH8_ERR_UECT_EN |\
++					AH8_ERR_UECDME_EN)
++
++#define HCI_UTRL_NEXUS_TYPE		0x40
++#define HCI_UTMRL_NEXUS_TYPE		0x44
++#define HCI_E2EFC_CTRL			0x48
++#define HCI_SW_RST			0x50
++ #define UFS_LINK_SW_RST		BIT(0)
++ #define UFS_UNIPRO_SW_RST		BIT(1)
++ #define UFS_SW_RST_MASK	(UFS_UNIPRO_SW_RST | UFS_LINK_SW_RST)
++#define HCI_LINK_VERSION		0x54
++#define HCI_IDLE_TIMER_CONFIG		0x58
++#define HCI_RX_UPIU_MATCH_ERROR_CODE	0x5C
++#define HCI_DATA_REORDER		0x60
++#define HCI_MAX_DOUT_DATA_SIZE		0x64
++#define HCI_UNIPRO_APB_CLK_CTRL		0x68
++#define HCI_AXIDMA_RWDATA_BURST_LEN	0x6C
++ #define BURST_LEN(x)		((x) << 27 | (x))
++ #define WLU_EN				BIT(31)
++ #define AXIDMA_RWDATA_BURST_LEN	(0xF)
++#define HCI_GPIO_OUT			0x70
++#define HCI_WRITE_DMA_CTRL		0x74
++#define HCI_ERROR_EN_PA_LAYER		0x78
++#define HCI_ERROR_EN_DL_LAYER		0x7C
++#define HCI_ERROR_EN_N_LAYER		0x80
++#define HCI_ERROR_EN_T_LAYER		0x84
++#define HCI_ERROR_EN_DME_LAYER		0x88
++#define HCI_UFSHCI_V2P1_CTRL			0X8C
++#define IA_TICK_SEL				BIT(16)
++#define HCI_REQ_HOLD_EN			0xAC
++
++#define HCI_CLKSTOP_CTRL		0xB0
++ #define REFCLKOUT_STOP			BIT(4)
++ #define MPHY_APBCLK_STOP		BIT(3)
++ #define REFCLK_STOP			BIT(2)
++ #define UNIPRO_MCLK_STOP		BIT(1)
++ #define UNIPRO_PCLK_STOP		BIT(0)
++ #define CLK_STOP_ALL		(REFCLKOUT_STOP |\
++					REFCLK_STOP |\
++					UNIPRO_MCLK_STOP |\
++					UNIPRO_PCLK_STOP)
++
++#define HCI_FORCE_HCS			0xB4
++ #define REFCLKOUT_STOP_EN	BIT(11)
++ #define MPHY_APBCLK_STOP_EN	BIT(10)
++ #define UFSP_DRCG_EN		BIT(8)   //FMP
++ #define REFCLK_STOP_EN		BIT(7)
++ #define UNIPRO_PCLK_STOP_EN	BIT(6)
++ #define UNIPRO_MCLK_STOP_EN	BIT(5)
++ #define HCI_CORECLK_STOP_EN	BIT(4)
++ #define CLK_STOP_CTRL_EN_ALL	(UFSP_DRCG_EN |\
++					MPHY_APBCLK_STOP_EN |\
++					REFCLKOUT_STOP_EN |\
++					REFCLK_STOP_EN |\
++					UNIPRO_PCLK_STOP_EN |\
++					UNIPRO_MCLK_STOP_EN)
++
++#define HCI_FSM_MONITOR			0xC0
++#define HCI_PRDT_HIT_RATIO		0xC4
++#define HCI_DMA0_MONITOR_STATE		0xC8
++#define HCI_DMA0_MONITOR_CNT		0xCC
++#define HCI_DMA1_MONITOR_STATE		0xD0
++#define HCI_DMA1_MONITOR_CNT		0xD4
++#define HCI_DMA0_DOORBELL_DEBUG		0xD8
++#define HCI_DMA1_DOORBELL_DEBUG		0xDC
++
++#define HCI_UFS_AXI_DMA_IF_CTRL		0xF8
++#define HCI_UFS_ACG_DISABLE		0xFC
++ #define HCI_UFS_ACG_DISABLE_EN		BIT(0)
++#define HCI_IOP_ACG_DISABLE		0x100
++ #define HCI_IOP_ACG_DISABLE_EN		BIT(0)
++#define HCI_MPHY_REFCLK_SEL		0x108
++ #define MPHY_REFCLK_SEL		BIT(0)
++#define HCI_SMU_RD_ABORT_MATCH_INFO		0x118
++#define HCI_SMU_WR_ABORT_MATCH_INFO		0x11C
++#define HCI_DBR_DUPLICATION_INFO		0x120
++#define HCI_INVALID_PRDT_CTRL		0x130
++
++#define HCI_DBR_TIMER_CONFIG		0x140
++#define HCI_UTRL_DBR_TIMER_ENABLE		0x144
++#define HCI_UTRL_DBR_TIMER_STATUS		0x148
++#define HCI_UTMRL_DBR_TIMER_ENABLE		0x14C
++#define HCI_UTMRL_DBR_TIMER_STATUS		0x150
++
++#define HCI_UTRL_DBR_3_0_TIMER_EXPIRED_VALUE		0x160
++#define HCI_UTRL_DBR_7_4_TIMER_EXPIRED_VALUE		0x164
++#define HCI_UTRL_DBR_11_8_TIMER_EXPIRED_VALUE		0x168
++#define HCI_UTRL_DBR_15_12_TIMER_EXPIRED_VALUE		0x16C
++#define HCI_UTRL_DBR_19_16_TIMER_EXPIRED_VALUE		0x170
++#define HCI_UTRL_DBR_23_20_TIMER_EXPIRED_VALUE		0x174
++#define HCI_UTRL_DBR_27_24_TIMER_EXPIRED_VALUE		0x178
++#define HCI_UTRL_DBR_31_28_TIMER_EXPIRED_VALUE		0x17C
++
++#define HCI_UTMRL_DBR_3_0_TIMER_EXPIRED_VALUE		0x180
++
++#define HCI_AH8_RESET                   0x500
++#define HCI_AH8_STATE                   0x50C
++#define HCI_AH8_STATE_ERROR             BIT(16)
++#define HCI_AH8_HIBERNATION_STATE       BIT(8)
++#define HCI_AH8_IDLE_STATE              BIT(0)
++
++/* Device fatal error */
++#define DFES_ERR_EN	BIT(31)
++#define DFES_DEF_DL_ERRS	(UIC_DATA_LINK_LAYER_ERROR_RX_BUF_OF |\
++				 UIC_DATA_LINK_LAYER_ERROR_PA_INIT)
++#define DFES_DEF_N_ERRS		(UIC_NETWORK_UNSUPPORTED_HEADER_TYPE |\
++				 UIC_NETWORK_BAD_DEVICEID_ENC |\
++				 UIC_NETWORK_LHDR_TRAP_PACKET_DROPPING)
++#define DFES_DEF_T_ERRS		(UIC_TRANSPORT_UNSUPPORTED_HEADER_TYPE |\
++				 UIC_TRANSPORT_UNKNOWN_CPORTID |\
++				 UIC_TRANSPORT_NO_CONNECTION_RX |\
++				 UIC_TRANSPORT_BAD_TC)
++
++/* TXPRDT defines */
++#define PRDT_PREFECT_EN		BIT(31)
++#define PRDT_SET_SIZE(x)	((x) & 0x1F)
++
++/*
++ * UNIPRO registers
++ */
++#define UNIP_COMP_VERSION			0x000
++#define UNIP_COMP_INFO				0x004
++#define UNIP_COMP_RESET				0x010
++
++#define UNIP_PA_AVAILTXDATALENS			0x3080
++#define UNIP_PA_AVAILRXDATALENS			0x3100
++#define UNIP_PA_ACTIVETXDATALENS		0x3180
++#define UNIP_PA_CONNECTEDTXDATALANES            0x3184	/* PA_ConnectedTxDataLanes */
++#define UNIP_PA_ACTIVERXDATALENS		0x3200
++#define UNIP_PA_CONNECTEDRXDATALANES            0x3204	/* PA_ConnectedRxDataLanes */
++#define UNIP_PA_MAXRXHSGEAR			0x321C
++#define UNIP_DBG_RX_INFO_CONTROL_DIRECT		0x4818	/* to raise an error */
++#define DBG_DL_RX_INFO_FORCE	(1 << 28)
++#define DBG_DL_RX_INFO_TYPE	(21 << 18)
++#define DBG_RX_BUFFER_OVERFLOW	(1 << 15)
++
++#define UNIP_DME_POWERON_REQ			0x7800
++#define UNIP_DME_POWERON_CNF_RESULT		0x7804
++#define UNIP_DME_POWEROFF_REQ			0x7810
++#define UNIP_DME_POWEROFF_CNF_RESULT		0x7814
++#define UNIP_DME_RESET_REQ			0x7820
++#define UNIP_DME_RESET_REQ_LEVEL		0x7824
++#define UNIP_DME_ENABLE_REQ			0x7830
++#define UNIP_DME_ENABLE_CNF_RESULT		0x7834
++#define UNIP_DME_ENDPOINTRESET_REQ		0x7840
++#define UNIP_DME_ENDPOINTRESET_CNF_RESULT	0x7844
++#define UNIP_DME_LINKSTARTUP_REQ		0x7850
++#define UNIP_DME_LINKSTARTUP_CNF_RESULT		0x7854
++#define UNIP_DME_HIBERN8_ENTER_REQ		0x7860
++#define UNIP_DME_HIBERN8_ENTER_CNF_RESULT	0x7864
++#define UNIP_DME_HIBERN8_ENTER_IND_RESULT	0x7868
++#define UNIP_DME_HIBERN8_EXIT_REQ		0x7870
++#define UNIP_DME_HIBERN8_EXIT_CNF_RESULT	0x7874
++#define UNIP_DME_HIBERN8_EXIT_IND_RESULT	0x7878
++#define UNIP_DME_PWR_REQ			0x7880
++#define UNIP_DME_PWR_REQ_POWERMODE		0x7884
++#define UNIP_DME_PWR_REQ_LOCALL2TIMER0		0x7888
++#define UNIP_DME_PWR_REQ_LOCALL2TIMER1		0x788C
++#define UNIP_DME_PWR_REQ_LOCALL2TIMER2		0x7890
++#define UNIP_DME_PWR_REQ_REMOTEL2TIMER0		0x78B8
++#define UNIP_DME_PWR_REQ_REMOTEL2TIMER1		0x78BC
++#define UNIP_DME_PWR_REQ_REMOTEL2TIMER2		0x78C0
++#define UNIP_DME_PWR_CNF_RESULT			0x78E8
++#define UNIP_DME_PWR_IND_RESULT			0x78EC
++#define UNIP_DME_TEST_MODE_REQ			0x7900
++#define UNIP_DME_TEST_MODE_CNF_RESULT		0x7904
++
++#define UNIP_DME_ERROR_IND_LAYER		0x0C0
++#define UNIP_DME_ERROR_IND_ERRCODE		0x0C4
++#define UNIP_DME_PACP_CNFBIT			0x0C8
++#define UNIP_DME_DL_FRAME_IND			0x0D0
++#define UNIP_DME_INTR_STATUS			0x0E0
++#define UNIP_DME_INTR_ENABLE			0x0E4
++
++#define UNIP_DME_GETSET_CONTROL                0x7A00
++#define UNIP_DME_GETSET_ADDR                   0x7A04
++#define UNIP_DME_GETSET_WDATA                  0x7A08
++#define UNIP_DME_GETSET_RDATA                  0x7A0C
++#define UNIP_DME_GETSET_RESULT                 0x7A10
++#define UNIP_DME_PEER_GETSET_CONTROL           0x7A20
++#define UNIP_DME_PEER_GETSET_ADDR              0x7A24
++#define UNIP_DME_PEER_GETSET_WDATA             0x7A28
++#define UNIP_DME_PEER_GETSET_RDATA             0x7A2C
++#define UNIP_DME_PEER_GETSET_RESULT            0x7A30
++
++#define UNIP_DME_INTR_STATUS_LSB			   0x7B00
++#define UNIP_DME_INTR_STATUS_MSB	           0x7B04
++#define UNIP_DME_INTR_ERROR_CODE			   0x7B20
++#define UNIP_DME_DISCARD_PORT_ID	           0x7B24
++#define UNIP_DME_DBG_OPTION_SUITE			   0x7C00
++#define UNIP_DME_DBG_CTRL_FSM		           0x7D00
++#define UNIP_DME_DBG_FLAG_STATUS			   0x7D14
++#define UNIP_DME_DBG_LINKCFG_FSM	           0x7D18
++
++#define UNIP_DME_INTR_ERROR_CODE		0x7B20
++#define UNIP_DME_DEEPSTALL_ENTER_REQ		0x7910
++#define UNIP_DME_DISCARD_CPORT_ID		0x7B24
++
++#define UNIP_DBG_FORCE_DME_CTRL_STATE		0x150
++#define UNIP_DBG_AUTO_DME_LINKSTARTUP		0x158
++#define UNIP_DBG_PA_CTRLSTATE			0x15C
++#define UNIP_DBG_PA_TX_STATE			0x160
++#define UNIP_DBG_BREAK_DME_CTRL_STATE		0x164
++#define UNIP_DBG_STEP_DME_CTRL_STATE		0x168
++#define UNIP_DBG_NEXT_DME_CTRL_STATE		0x16C
++
++/*
++ * UFS Protector registers
++ */
++#define UFSPRCTRL	0x000
++#define UFSPRSTAT	0x008
++#define UFSPRSECURITY	0x010
++ #define NSSMU		BIT(14)
++#define DESCTYPE(type)		((type & 0x3) << 19)
++#define ARPROTPRDT(type)	((type & 0x3) << 16)
++#define ARPROTDESC(type)	((type & 0x3) << 9)
++#define ARPROTDATA(type)	((type & 0x3) << 6)
++#define AWPROTDESC(type)	((type & 0x3) << 3)
++#define AWPROTDATA(type)	((type & 0x3))
++#define CFG_AXPROT(type)	(ARPROTPRDT(type) | ARPROTDESC(type) | \
++				ARPROTDATA(type) | AWPROTDESC(type) | \
++				AWPROTDATA(type))
++#define UFSPVERSION	0x01C
++#define UFSPRENCKEY0	0x020
++#define UFSPRENCKEY1	0x024
++#define UFSPRENCKEY2	0x028
++#define UFSPRENCKEY3	0x02C
++#define UFSPRENCKEY4	0x030
++#define UFSPRENCKEY5	0x034
++#define UFSPRENCKEY6	0x038
++#define UFSPRENCKEY7	0x03C
++#define UFSPRTWKEY0	0x040
++#define UFSPRTWKEY1	0x044
++#define UFSPRTWKEY2	0x048
++#define UFSPRTWKEY3	0x04C
++#define UFSPRTWKEY4	0x050
++#define UFSPRTWKEY5	0x054
++#define UFSPRTWKEY6	0x058
++#define UFSPRTWKEY7	0x05C
++#define UFSPWCTRL	0x100
++#define UFSPWSTAT	0x108
++#define UFSPWSECURITY	0x110
++#define UFSPWENCKEY0	0x120
++#define UFSPWENCKEY1	0x124
++#define UFSPWENCKEY2	0x128
++#define UFSPWENCKEY3	0x12C
++#define UFSPWENCKEY4	0x130
++#define UFSPWENCKEY5	0x134
++#define UFSPWENCKEY6	0x138
++#define UFSPWENCKEY7	0x13C
++#define UFSPWTWKEY0	0x140
++#define UFSPWTWKEY1	0x144
++#define UFSPWTWKEY2	0x148
++#define UFSPWTWKEY3	0x14C
++#define UFSPWTWKEY4	0x150
++#define UFSPWTWKEY5	0x154
++#define UFSPWTWKEY6	0x158
++#define UFSPWTWKEY7	0x15C
++#define UFSPSBEGIN0	0x200
++#define UFSPSEND0	0x204
++#define UFSPSLUN0	0x208
++#define UFSPSCTRL0	0x20C
++#define UFSPSBEGIN1	0x210
++#define UFSPSEND1	0x214
++#define UFSPSLUN1	0x218
++#define UFSPSCTRL1	0x21C
++#define UFSPSBEGIN2	0x220
++#define UFSPSEND2	0x224
++#define UFSPSLUN2	0x228
++#define UFSPSCTRL2	0x22C
++#define UFSPSBEGIN3	0x230
++#define UFSPSEND3	0x234
++#define UFSPSLUN3	0x238
++#define UFSPSCTRL3	0x23C
++#define UFSPSBEGIN4	0x240
++#define UFSPSEND4	0x244
++#define UFSPSLUN4	0x248
++#define UFSPSCTRL4	0x24C
++#define UFSPSBEGIN5	0x250
++#define UFSPSEND5	0x254
++#define UFSPSLUN5	0x258
++#define UFSPSCTRL5	0x25C
++#define UFSPSBEGIN6	0x260
++#define UFSPSEND6	0x264
++#define UFSPSLUN6	0x268
++#define UFSPSCTRL6	0x26C
++#define UFSPSBEGIN7	0x270
++#define UFSPSEND7	0x274
++#define UFSPSLUN7	0x278
++#define UFSPSCTRL7	0x27C
++
++#endif /* _UFS_VS_REGS_H_ */
+diff --git a/drivers/ufs/ufs-exynos-gs.c b/drivers/ufs/ufs-exynos-gs.c
+new file mode 100644
+index 00000000..788d93a0
+--- /dev/null
++++ b/drivers/ufs/ufs-exynos-gs.c
+@@ -0,0 +1,277 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * HakiOS: the UFS host of Google's Tensor G3 (zuma; the Pixel 8a), brought up the way Google's Linux driver does it:
++ * google-modules/soc/gs drivers/ufs/ufs-exynos.c (android-gs-akita-6.1-android15-qpr2), with Samsung's CAL for the PHY
++ * and UniPro (exynos-gs/, as is). In U-Boot's terms: a UFS platform driver whose hooks do what Linux's do.
++ *
++ *   init            the register ranges; IO coherency (sysreg_ufs + 0x710); the PHY out of isolation (the PMU, through
++ *                   the secure monitor) if it is not; the CAL told what it needs (UniPro clock 178 MHz, board 1 as
++ *                   Android's tree has it, EVT 0, gear 4, 2 lanes)
++ *   hce_enable      before: the host's link and UniPro reset (HCI_SW_RST) and its configuration (exynos_ufs_config_host),
++ *                   then the device's reset pin (HCI_GPIO_OUT); after: the clock-stop controls, the lanes there are
++ *   link_startup    before: the error reporting, UniPro's debug suites, the CAL's pre_link; after: the lanes and gear the
++ *                   link came up with, the CAL's post_link
++ *
++ * What Linux also does and this does not: inline encryption (KDN, through the GSA), the power-mode change to HS gear 4
++ * (not yet: the link stays in PWM-G1, a few MB/s), clock gating and hibernation.
++ *
++ * Found on the phone (2026-11-01): the bootloader hands over with the link up, but the controller does not take a
++ * request without the reset and bring-up above (the port's log 4).
++ */
++#include <dm.h>
++#include <time.h>
++#include <ufs.h>
++#include <asm/io.h>
++#include <dm/device_compat.h>
++#include <linux/arm-smccc.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include "ufs.h"
++#include "unipro.h"
++#include "exynos-gs/ufs-vs-mmio.h"
++#include "exynos-gs/ufs-vs-regs.h"
++#include "exynos-gs/ufs-cal-if.h"
++
++#define TENSOR_SMC_PMU_SEC_REG		0x82000504
++#define TENSOR_PMUREG_READ		0
++#define TENSOR_PMUREG_RMW		2
++#define SMC_CMD_SMU			0xc2001850
++#define SMU_INIT			0
++#define SMU_EMBEDDED			0
++
++#define UNIP_PA_DBG_OPTION_SUITE_1	0x39A8
++#define DBG_SUITE1_ENABLE		0x90913C1C
++#define UNIP_PA_DBG_OPTION_SUITE_2	0x39B4
++#define DBG_SUITE2_ENABLE		0xE01C115F
++
++struct ufs_exynos_gs {
++	struct ufs_vs_handle handle;
++	struct ufs_cal_param cal;
++	struct uic_pwr_mode pmd;
++	void __iomem *sysreg;
++	ulong pmu_phy_iso;
++	u32 mclk_rate;
++	u32 lanes;
++};
++
++static void ufs_gs_udelay(u32 us)
++{
++	udelay(us);
++}
++
++static struct ufs_exynos_gs *gs_of(struct ufs_hba *hba)
++{
++	return dev_get_priv(hba->dev);
++}
++
++static int ufs_gs_cal(struct ufs_exynos_gs *gs, enum ufs_cal_errno (*fn)(struct ufs_cal_param *), const char *what)
++{
++	enum ufs_cal_errno r;
++	u32 reg;
++
++	/* the PHY's APB clock let run around the CAL (Linux's ufs_call_cal) */
++	reg = hci_readl(&gs->handle, HCI_FORCE_HCS);
++	hci_writel(&gs->handle, reg & ~(UNIPRO_MCLK_STOP_EN | MPHY_APBCLK_STOP_EN), HCI_FORCE_HCS);
++	r = fn(&gs->cal);
++	reg = hci_readl(&gs->handle, HCI_FORCE_HCS);
++	hci_writel(&gs->handle, reg | MPHY_APBCLK_STOP_EN, HCI_FORCE_HCS);
++	printf("UFS: CAL %s: %d\n", what, r);
++	return r == UFS_CAL_NO_ERROR ? 0 : -EIO;
++}
++
++static int ufs_gs_init(struct ufs_hba *hba)
++{
++	struct ufs_exynos_gs *gs = gs_of(hba);
++	struct udevice *dev = hba->dev;
++	struct arm_smccc_res res;
++	u32 w[4];
++	int i;
++
++	gs->handle.std = hba->mmio_base;
++	for (i = 1; i <= 5; i++) {
++		void __iomem *p = dev_remap_addr_index(dev, i);
++
++		if (!p) {
++			dev_err(dev, "UFS: no register range %d\n", i);
++			return -EINVAL;
++		}
++		switch (i) {
++		case 1: gs->handle.hci = p; break;
++		case 2: gs->handle.unipro = p; break;
++		case 3: gs->handle.ufsp = p; break;
++		case 4: gs->handle.pma = p; break;
++		case 5: gs->handle.cport = p; break;
++		}
++	}
++	gs->handle.udelay = ufs_gs_udelay;
++	gs->handle.private = gs;
++
++	/*
++	 * Google's bootloader switches the UFS device off before it hands over: its supply (Android's tree: ufs-vcc, a
++	 * fixed regulator on gpp0-1) low, and its reference clock pin (gph5-0, ufs-refclk-out) made a GPIO driven low. The
++	 * controller's registers still say the link is up. Both are put back as Android has them:
++	 *   hakios,vcc-gpio = <CON PIN>         a Samsung GPIO (CON register, DAT at +4) made an output, high
++	 *   hakios,pinmux = <ADDR MASK VALUE>... registers read, MASK cleared, VALUE set
++	 */
++	if (!dev_read_u32_array(dev, "hakios,vcc-gpio", w, 2)) {
++		void __iomem *con = (void __iomem *)(uintptr_t)w[0];
++
++		writel(readl(con + 4) | BIT(w[1]), con + 4);
++		writel((readl(con) & ~(0xf << (4 * w[1]))) | (1 << (4 * w[1])), con);
++		printf("UFS: the device's supply on (GPIO %#x pin %u)\n", w[0], w[1]);
++	}
++	for (i = 0; ; i += 3) {
++		u32 m[3];
++		void __iomem *a;
++
++		if (dev_read_u32_index(dev, "hakios,pinmux", i, &m[0]) ||
++		    dev_read_u32_index(dev, "hakios,pinmux", i + 1, &m[1]) ||
++		    dev_read_u32_index(dev, "hakios,pinmux", i + 2, &m[2]))
++			break;
++		a = (void __iomem *)(uintptr_t)m[0];
++		writel((readl(a) & ~m[1]) | m[2], a);
++	}
++	mdelay(10);
++
++	/* IO coherency, as Linux sets it for 'dma-coherent' (Android's tree: ufs-iocc, sysreg_ufs 0x710 mask 3 val 3) */
++	gs->sysreg = (void __iomem *)(uintptr_t)dev_read_u32_default(dev, "hakios,sysreg", 0);
++	if (gs->sysreg)
++		writel(readl(gs->sysreg + 0x710) | 0x3, gs->sysreg + 0x710);
++
++	/* the PHY out of isolation (Android's tree: ufs-phy-iso, PMU + 0x3ec0 bit 0), if the bootloader has not */
++	gs->pmu_phy_iso = dev_read_u32_default(dev, "hakios,pmu-phy-iso", 0);
++	if (gs->pmu_phy_iso) {
++		arm_smccc_smc(TENSOR_SMC_PMU_SEC_REG, gs->pmu_phy_iso, TENSOR_PMUREG_READ, 0, 0, 0, 0, 0, &res);
++		printf("UFS: PHY isolation register %#lx = %#lx\n", gs->pmu_phy_iso, res.a0);
++		if (!(res.a0 & 1))
++			arm_smccc_smc(TENSOR_SMC_PMU_SEC_REG, gs->pmu_phy_iso, TENSOR_PMUREG_RMW, 1, 1, 0, 0, 0, &res);
++	}
++
++	/* the UFS protector as Linux starts it (no FMP descriptors: they would change the PRDT entry size) */
++	arm_smccc_smc(SMC_CMD_SMU, SMU_INIT, SMU_EMBEDDED, 0, 0, 0, 0, 0, &res);
++	printf("UFS: SMC_CMD_SMU(SMU_INIT): %ld\n", (long)res.a0);
++
++	hba->quirks |= UFSHCD_QUIRK_HAKIOS_PRDT_4K | UFSHCD_QUIRK_HAKIOS_EXYNOS_NEXUS;
++	if (!dev_read_u32_array(dev, "hakios,dma-window", w, 4)) {
++		hba->hakios_dma = (void *)(uintptr_t)(((u64)w[0] << 32) | w[1]);
++		hba->hakios_dma_size = ((u64)w[2] << 32) | w[3];
++	}
++
++	gs->mclk_rate = dev_read_u32_default(dev, "hakios,mclk-rate", 178000000);
++	gs->pmd.gear = dev_read_u32_default(dev, "hakios,gear", 4);
++	gs->pmd.lane = dev_read_u32_default(dev, "hakios,lanes", 2);
++	gs->cal.handle = &gs->handle;
++	gs->cal.board = dev_read_u32_default(dev, "hakios,cal-board", 1);
++	gs->cal.evt_ver = 0;
++	gs->cal.tbl = HOST_EMBD;
++	gs->cal.max_gear = gs->pmd.gear;
++	gs->cal.mclk_rate = gs->mclk_rate;
++	return ufs_cal_init(&gs->cal, 0) == UFS_CAL_NO_ERROR ? 0 : -EIO;
++}
++
++/* Linux's exynos_ufs_config_host() */
++static void ufs_gs_config_host(struct ufs_exynos_gs *gs)
++{
++	struct ufs_vs_handle *h = &gs->handle;
++
++	hci_writel(h, hci_readl(h, HCI_FORCE_HCS) & ~HCI_CORECLK_STOP_EN, HCI_FORCE_HCS);
++	hci_writel(h, hci_readl(h, HCI_UFSHCI_V2P1_CTRL) | IA_TICK_SEL, HCI_UFSHCI_V2P1_CTRL);
++	hci_writel(h, (gs->mclk_rate / 1000000) & CNT_VAL_1US_MASK, HCI_1US_TO_CNT_VAL);
++	hci_writel(h, 0xA, HCI_DATA_REORDER);
++	hci_writel(h, PRDT_PREFECT_EN | PRDT_SET_SIZE(12), HCI_TXPRDT_ENTRY_SIZE);
++	hci_writel(h, PRDT_SET_SIZE(12), HCI_RXPRDT_ENTRY_SIZE);
++	hci_writel(h, 0xFFFFFFFF, HCI_UTRL_NEXUS_TYPE);
++	hci_writel(h, 0xFFFFFFFF, HCI_UTMRL_NEXUS_TYPE);
++	hci_writel(h, WLU_EN | BURST_LEN(3), HCI_AXIDMA_RWDATA_BURST_LEN);
++	hci_writel(h, hci_readl(h, HCI_IOP_ACG_DISABLE) & ~HCI_IOP_ACG_DISABLE_EN, HCI_IOP_ACG_DISABLE);
++	unipro_writel(h, DBG_SUITE1_ENABLE, UNIP_PA_DBG_OPTION_SUITE_1);
++	unipro_writel(h, DBG_SUITE2_ENABLE, UNIP_PA_DBG_OPTION_SUITE_2);
++	hci_writel(h, hci_readl(h, HCI_VENDOR_SPECIFIC_IE) | AH8_ERR_REPORT_UE, HCI_VENDOR_SPECIFIC_IE);
++}
++
++static int ufs_gs_hce_enable_notify(struct ufs_hba *hba, enum ufs_notify_change_status status)
++{
++	struct ufs_exynos_gs *gs = gs_of(hba);
++	struct ufs_vs_handle *h = &gs->handle;
++	ulong start;
++
++	if (status == PRE_CHANGE) {
++		/* host reset (Linux's exynos_ufs_init_host), then its configuration */
++		hci_writel(h, UFS_SW_RST_MASK, HCI_SW_RST);
++		start = timer_get_us();
++		while (hci_readl(h, HCI_SW_RST) & UFS_SW_RST_MASK) {
++			if (timer_get_us() - start > 1000) {
++				dev_err(hba->dev, "UFS: host reset does not complete\n");
++				return -ETIMEDOUT;
++			}
++		}
++		ufs_gs_config_host(gs);
++		/* the device's reset (Linux's exynos_ufs_dev_hw_reset) */
++		hci_writel(h, 0, HCI_GPIO_OUT);
++		udelay(5);
++		hci_writel(h, 1, HCI_GPIO_OUT);
++		return 0;
++	}
++	/* POST_CHANGE: clock-stop controls as Linux leaves them, and the lanes the host has */
++	hci_writel(h, hci_readl(h, HCI_FORCE_HCS) | CLK_STOP_CTRL_EN_ALL, HCI_FORCE_HCS);
++	hci_writel(h, hci_readl(h, HCI_CLKSTOP_CTRL) & ~CLK_STOP_ALL, HCI_CLKSTOP_CTRL);
++	gs->lanes = unipro_readl(h, UNIP_PA_AVAILRXDATALENS);
++	printf("UFS: host reset and configured; %u lanes (tx %u)\n", gs->lanes,
++	       unipro_readl(h, UNIP_PA_AVAILTXDATALENS));
++	return gs->lanes ? 0 : -ENODEV;
++}
++
++static int ufs_gs_link_startup_notify(struct ufs_hba *hba, enum ufs_notify_change_status status)
++{
++	struct ufs_exynos_gs *gs = gs_of(hba);
++	struct ufs_vs_handle *h = &gs->handle;
++	u32 tx, rx, gear;
++
++	if (status == PRE_CHANGE) {
++		hci_writel(h, DFES_ERR_EN | DFES_DEF_DL_ERRS, HCI_ERROR_EN_DL_LAYER);
++		hci_writel(h, DFES_ERR_EN | DFES_DEF_N_ERRS, HCI_ERROR_EN_N_LAYER);
++		hci_writel(h, DFES_ERR_EN | DFES_DEF_T_ERRS, HCI_ERROR_EN_T_LAYER);
++		unipro_writel(h, DBG_SUITE1_ENABLE, UNIP_PA_DBG_OPTION_SUITE_1);
++		unipro_writel(h, DBG_SUITE2_ENABLE, UNIP_PA_DBG_OPTION_SUITE_2);
++		gs->cal.mclk_rate = gs->mclk_rate;
++		gs->cal.available_lane = gs->lanes;
++		return ufs_gs_cal(gs, ufs_cal_pre_link, "pre_link");
++	}
++	tx = unipro_readl(h, UNIP_PA_CONNECTEDTXDATALANES);
++	rx = unipro_readl(h, UNIP_PA_CONNECTEDRXDATALANES);
++	gear = unipro_readl(h, UNIP_PA_MAXRXHSGEAR);
++	printf("UFS: link up: %u/%u lanes connected, the device up to HS gear %u\n", tx, rx, gear);
++	gs->cal.connected_tx_lane = rx;
++	gs->cal.connected_rx_lane = rx;
++	gs->cal.max_gear = min_t(u8, gear, gs->pmd.gear);
++	return ufs_gs_cal(gs, ufs_cal_post_link, "post_link");
++}
++
++static struct ufs_hba_ops ufs_gs_ops = {
++	.init			= ufs_gs_init,
++	.hce_enable_notify	= ufs_gs_hce_enable_notify,
++	.link_startup_notify	= ufs_gs_link_startup_notify,
++};
++
++static int ufs_gs_probe(struct udevice *dev)
++{
++	int err = ufshcd_probe(dev, &ufs_gs_ops);
++
++	if (err)
++		dev_err(dev, "UFS: no storage: %d\n", err);
++	return err;
++}
++
++static const struct udevice_id ufs_gs_ids[] = {
++	{ .compatible = "hakios,zuma-ufs" },
++	{ }
++};
++
++U_BOOT_DRIVER(ufs_exynos_gs) = {
++	.name		= "ufs-exynos-gs",
++	.id		= UCLASS_UFS,
++	.of_match	= ufs_gs_ids,
++	.probe		= ufs_gs_probe,
++	.priv_auto	= sizeof(struct ufs_exynos_gs),
++};
+diff --git a/drivers/ufs/ufs-hakios.c b/drivers/ufs/ufs-hakios.c
+new file mode 100644
+index 00000000..0bfb95da
+--- /dev/null
++++ b/drivers/ufs/ufs-hakios.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * HakiOS: a UFS host controller that a bootloader before U-Boot left running, taken over as it is (the Pixel 8a,
++ * Google Tensor G3 "zuma": Samsung's UFSHCI 3.0 with the link up in HS gear 4 on two lanes). Nothing of the controller,
++ * its PHY or the device is reset or reconfigured; U-Boot's UFS core moves the request lists to its own memory and goes
++ * on from there (UFSHCD_QUIRK_HAKIOS_KEEP_LINK), with PRDT entries of 4 KB as the Exynos HCI is set up for
++ * (UFSHCD_QUIRK_HAKIOS_PRDT_4K). Found so on the phone: HCE 1, HCS 0x10f, the bootloader's lists running at 0xf8c42000.
++ *
++ * zuma's controller is a standard UFSHCI in what this uses: Android's tree has fixed-prdt-req_list-ocs, with which
++ * Google's driver drops the Exynos quirks (PRDT_BYTE_GRAN and the rest), and the bootloader's own descriptors use
++ * dword offsets and 16-byte PRDT entries (no FMP descriptors).
++ *
++ *	ufs@13200000 { compatible = "hakios,ufs-handover"; reg = <0x0 0x13200000 0x0 0x200>; };
++ */
++#include <dm.h>
++#include <ufs.h>
++#include <dm/device_compat.h>
++#include <linux/arm-smccc.h>
++#include "ufs.h"
++
++/*
++ * The UFS protector's SMU (Samsung's "UFSPR", which decides what memory a UFS transfer may touch) as Google's driver
++ * starts it at every boot, through the secure monitor: SMC_CMD_SMU(SMU_INIT, SMU_EMBEDDED). Not SMC_CMD_FMP_SECURITY
++ * with descriptor type 3: that turns PRDT entries into FMP's 128-byte ones, and the bootloader's are the 16-byte ones.
++ */
++#define SMC_CMD_SMU		0xc2001850
++#define SMU_INIT		0
++#define SMU_EMBEDDED		0
++
++static int ufs_hakios_init(struct ufs_hba *hba)
++{
++	struct arm_smccc_res res;
++	u32 w[4];
++
++	hba->quirks |= UFSHCD_QUIRK_HAKIOS_KEEP_LINK | UFSHCD_QUIRK_HAKIOS_PRDT_4K;
++	if (dev_read_bool(hba->dev, "hakios,smu-init")) {
++		arm_smccc_smc(SMC_CMD_SMU, SMU_INIT, SMU_EMBEDDED, 0, 0, 0, 0, 0, &res);
++		printf("UFS: SMC_CMD_SMU(SMU_INIT): %ld\n", (long)res.a0);
++	}
++	/*
++	 * hakios,dma-window = <base-hi base-lo size-hi size-lo>: the memory the controller may reach. On the Pixel 8a an
++	 * S2MPU in front of HSI2 (s2mpu_s0_hsi2@131f0000, always on) lets it reach what Google's bootloader used for its own
++	 * UFS lists and no more (a request in U-Boot's memory was never fetched: the doorbell stayed set, no completion,
++	 * no error).
++	 */
++	if (!dev_read_u32_array(hba->dev, "hakios,dma-window", w, 4)) {
++		hba->hakios_dma = (void *)(uintptr_t)(((u64)w[0] << 32) | w[1]);
++		hba->hakios_dma_size = ((u64)w[2] << 32) | w[3];
++	}
++	return 0;
++}
++
++static struct ufs_hba_ops ufs_hakios_ops = {
++	.init = ufs_hakios_init,
++};
++
++static int ufs_hakios_probe(struct udevice *dev)
++{
++	int err = ufshcd_probe(dev, &ufs_hakios_ops);
++
++	if (err)
++		dev_err(dev, "the UFS controller could not be taken over: %d\n", err);
++	return err;
++}
++
++static const struct udevice_id ufs_hakios_ids[] = {
++	{ .compatible = "hakios,ufs-handover" },
++	{ }
++};
++
++U_BOOT_DRIVER(ufs_hakios) = {
++	.name		= "ufs-hakios-handover",
++	.id		= UCLASS_UFS,
++	.of_match	= ufs_hakios_ids,
++	.probe		= ufs_hakios_probe,
++};
+diff --git a/drivers/ufs/ufs-uclass.c b/drivers/ufs/ufs-uclass.c
+index 6a51f337..44a678b3 100644
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -27,6 +27,7 @@
+ #include <linux/bitops.h>
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
++#include <linux/sizes.h>
+ 
+ #include "ufs.h"
+ 
+@@ -359,6 +360,13 @@ static int ufshcd_dme_link_startup(struct ufs_hba *hba)
+ 	uic_cmd.command = UIC_CMD_DME_LINK_STARTUP;
+ 
+ 	ret = ufshcd_send_uic_cmd(hba, &uic_cmd);
++	/*
++	 * HakiOS: the command's result, as Linux returns it: a link startup that completed but failed (result not 0)
++	 * is a failure, retried after the host is enabled again, not a success with no device.
++	 */
++	if (!ret)
++		ret = uic_cmd.argument2 & MASK_UIC_COMMAND_RESULT;
++	printf("UFS: DME_LINKSTARTUP: %d\n", ret);
+ 	if (ret)
+ 		dev_dbg(hba->dev,
+ 			"dme-link-startup: error code %d\n", ret);
+@@ -515,6 +523,25 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
+ 		ret = ufshcd_dme_link_startup(hba);
+ 
+ 		/* check if device is detected by inter-connect layer */
++		if (!ret && !ufshcd_is_device_present(hba)) {
++			/* HakiOS diagnostics: what the link says, and a while to see the device bit come */
++			u32 v[4] = { 0 };
++			ulong t0 = get_timer(0);
++
++			printf("UFS: link startup done, no device: HCS %08x IS %08x UECPA %08x UECDL %08x UECN %08x UECT %08x UECDME %08x\n",
++			       ufshcd_readl(hba, REG_CONTROLLER_STATUS), ufshcd_readl(hba, REG_INTERRUPT_STATUS),
++			       ufshcd_readl(hba, 0x38), ufshcd_readl(hba, 0x3c), ufshcd_readl(hba, 0x40),
++			       ufshcd_readl(hba, 0x44), ufshcd_readl(hba, 0x48));
++			ufshcd_dme_get(hba, UIC_ARG_MIB(0xd083), &v[0]);
++			ufshcd_dme_get(hba, UIC_ARG_MIB(0x1561), &v[1]);	/* PA_CONNECTEDTXDATALANES */
++			ufshcd_dme_get(hba, UIC_ARG_MIB(0x1581), &v[2]);	/* PA_CONNECTEDRXDATALANES */
++			ufshcd_dme_get(hba, UIC_ARG_MIB(0x1571), &v[3]);
++			printf("UFS: VS_POWERSTATE %x, connected lanes tx %x rx %x, PA_PWRMODE %x\n", v[0], v[1], v[2], v[3]);
++			while (!ufshcd_is_device_present(hba) && get_timer(t0) < 100)
++				;
++			printf("UFS: after %lu ms the device is %spresent (HCS %08x)\n", get_timer(t0),
++			       ufshcd_is_device_present(hba) ? "" : "still not ", ufshcd_readl(hba, REG_CONTROLLER_STATUS));
++		}
+ 		if (!ret && !ufshcd_is_device_present(hba)) {
+ 			dev_err(hba->dev, "%s: Device not present\n", __func__);
+ 			ret = -ENXIO;
+@@ -687,6 +714,18 @@ static void ufshcd_host_memory_configure(struct ufs_hba *hba)
+  */
+ static int ufshcd_memory_alloc(struct ufs_hba *hba)
+ {
++	if (hba->hakios_dma) {
++		/* HakiOS: in the DMA window: the transfer descriptor, the command descriptor, then the bounce buffer */
++		hba->utrdl = hba->hakios_dma;
++		hba->ucdl = hba->hakios_dma + SZ_4K;
++		hba->hakios_bounce = hba->hakios_dma + 2 * SZ_4K;
++		hba->hakios_bounce_size = hba->hakios_dma_size - 2 * SZ_4K;
++		memset(hba->hakios_dma, 0, 2 * SZ_4K);
++		printf("UFS: DMA window %p, %lu KB for data bounced through it\n", hba->hakios_dma,
++		       hba->hakios_bounce_size / 1024);
++		return 0;
++	}
++
+ 	/* Allocate one Transfer Request Descriptor
+ 	 * Should be aligned to 1k boundary.
+ 	 */
+@@ -915,6 +954,13 @@ static int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
+ 	u32 intr_status;
+ 	u32 enabled_intr_status;
+ 
++	if (hba->quirks & UFSHCD_QUIRK_HAKIOS_EXYNOS_NEXUS) {
++		u32 type = ufshcd_readl(hba, 0x1140);
++		bool cmd = (((u8 *)hba->ucd_req_ptr)[0] & 0x3f) == UPIU_TRANSACTION_COMMAND;
++
++		ufshcd_writel(hba, cmd ? type | BIT(task_tag) : type & ~BIT(task_tag), 0x1140);
++	}
++
+ 	ufshcd_writel(hba, 1 << task_tag, REG_UTP_TRANSFER_REQ_DOOR_BELL);
+ 
+ 	/* Make sure doorbell reg is updated before reading interrupt status */
+@@ -931,6 +977,20 @@ static int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
+ 			if (get_timer(start) > QUERY_REQ_TIMEOUT) {
+ 				dev_err(hba->dev,
+ 					"Timedout waiting for UTP response\n");
++				printf("UFS: IS %08x HCS %08x DBR %08x RSR %x UTRLBA %08x:%08x UECPA %08x UECDL %08x UECN %08x UECT %08x UECDME %08x\n",
++				       intr_status, ufshcd_readl(hba, REG_CONTROLLER_STATUS),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_H),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L),
++				       ufshcd_readl(hba, 0x38), ufshcd_readl(hba, 0x3c),
++				       ufshcd_readl(hba, 0x40), ufshcd_readl(hba, 0x44),
++				       ufshcd_readl(hba, 0x48));
++				printf("UFS: vs FSM %08x DMA0 %08x/%08x DMA1 %08x/%08x DBDBG %08x %08x VS_IS %08x UTRD dw2 %08x\n",
++				       ufshcd_readl(hba, 0x11c0), ufshcd_readl(hba, 0x11c8), ufshcd_readl(hba, 0x11cc),
++				       ufshcd_readl(hba, 0x11d0), ufshcd_readl(hba, 0x11d4), ufshcd_readl(hba, 0x11d8),
++				       ufshcd_readl(hba, 0x11dc), ufshcd_readl(hba, 0x1138),
++				       readl(&hba->utrdl->header.dword_2));
+ 				return -ETIMEDOUT;
+ 			}
+ 		}
+@@ -1639,6 +1699,26 @@ static void prepare_prdt_table(struct ufs_hba *hba, struct scsi_cmd *pccb)
+ 		return;
+ 	}
+ 
++	if (hba->quirks & UFSHCD_QUIRK_HAKIOS_PRDT_4K) {
++		/* HakiOS: entries of at most 4 KB, none crossing a 4 KB boundary */
++		buf = pccb->pdata;
++		for (table_length = 0; datalen; table_length++) {
++			ulong n = min_t(ulong, datalen, SZ_4K - ((uintptr_t)buf & (SZ_4K - 1)));
++
++			if (table_length == MAX_BUFF) {
++				dev_err(hba->dev, "UFS: %lu bytes left over: more than %d PRDT entries\n", datalen, MAX_BUFF);
++				break;
++			}
++			prepare_prdt_desc(hba, &prd_table[table_length], buf, n - 1);
++			buf += n;
++			datalen -= n;
++		}
++		req_desc->prd_table_length = table_length;
++		ufshcd_cache_flush(prd_table, sizeof(*prd_table) * table_length);
++		ufshcd_cache_flush(req_desc, sizeof(*req_desc));
++		return;
++	}
++
+ 	table_length = DIV_ROUND_UP(pccb->datalen, MAX_PRDT_ENTRY);
+ 	buf = pccb->pdata;
+ 	i = table_length;
+@@ -1656,7 +1736,35 @@ static void prepare_prdt_table(struct ufs_hba *hba, struct scsi_cmd *pccb)
+ 	ufshcd_cache_flush(req_desc, sizeof(*req_desc));
+ }
+ 
++static int ufs_scsi_exec_dma(struct udevice *scsi_dev, struct scsi_cmd *pccb);
++
++/* HakiOS: data outside the DMA window goes through the bounce buffer in it */
+ static int ufs_scsi_exec(struct udevice *scsi_dev, struct scsi_cmd *pccb)
++{
++	struct ufs_hba *hba = dev_get_uclass_priv(scsi_dev->parent);
++	uintptr_t data = (uintptr_t)pccb->pdata, win = (uintptr_t)hba->hakios_dma;
++	unsigned char *user = pccb->pdata;
++	int ret;
++
++	if (!hba->hakios_bounce || !pccb->datalen ||
++	    (data >= win && data + pccb->datalen <= win + hba->hakios_dma_size))
++		return ufs_scsi_exec_dma(scsi_dev, pccb);
++	if (pccb->datalen > hba->hakios_bounce_size) {
++		dev_err(hba->dev, "UFS: %lu bytes do not fit the bounce buffer (%lu)\n", pccb->datalen,
++			hba->hakios_bounce_size);
++		return -EINVAL;
++	}
++	if (pccb->dma_dir == DMA_TO_DEVICE)
++		memcpy(hba->hakios_bounce, user, pccb->datalen);
++	pccb->pdata = hba->hakios_bounce;
++	ret = ufs_scsi_exec_dma(scsi_dev, pccb);
++	pccb->pdata = user;
++	if (!ret && pccb->dma_dir == DMA_FROM_DEVICE)
++		memcpy(user, hba->hakios_bounce, pccb->datalen);
++	return ret;
++}
++
++static int ufs_scsi_exec_dma(struct udevice *scsi_dev, struct scsi_cmd *pccb)
+ {
+ 	struct ufs_hba *hba = dev_get_uclass_priv(scsi_dev->parent);
+ 	u32 upiu_flags;
+@@ -2123,12 +2231,100 @@ static void ufshcd_def_desc_sizes(struct ufs_hba *hba)
+ 	hba->desc_size.hlth_desc = QUERY_DESC_HEALTH_DEF_SIZE;
+ }
+ 
++/*
++ * HakiOS (UFSHCD_QUIRK_HAKIOS_KEEP_LINK): is the controller as a bootloader before us left it, enabled with the device
++ * present and every list ready? Then it is taken over as it is.
++ */
++static bool ufshcd_hakios_link_kept(struct ufs_hba *hba)
++{
++	u32 hcs = ufshcd_readl(hba, REG_CONTROLLER_STATUS);
++
++	return (hba->quirks & UFSHCD_QUIRK_HAKIOS_KEEP_LINK) && !dev_read_bool(hba->dev, "hakios,relink") &&
++	       (ufshcd_readl(hba, REG_CONTROLLER_ENABLE) & CONTROLLER_ENABLE) &&
++	       (hcs & DEVICE_PRESENT) && (hcs & UFSHCD_STATUS_READY) == UFSHCD_STATUS_READY;
++}
++
++/* the lists stopped (the bootloader's, still pointing at its memory), then made U-Boot's and started */
++static int ufshcd_hakios_take_over(struct ufs_hba *hba)
++{
++	ulong start;
++	int ret;
++
++	dev_info(hba->dev, "UFS: taking over the link a bootloader left up (HCS %08x, UTRLBA %08x)\n",
++		 ufshcd_readl(hba, REG_CONTROLLER_STATUS),
++		 ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L));
++	{
++		/* HakiOS diagnostics: the vendor HCI block (+0x1100) and the link's state as UniPro reports it */
++		u32 v, i;
++		static const u32 attrs[] = { 0xd083 /* VS_POWERSTATE */, 0x1571 /* PA_PWRMODE */, 0x1568 /* PA_TXGEAR */,
++					     0x1583 /* PA_RXGEAR */, 0x1560 /* PA_ACTIVETXDATALANES */,
++					     0x1580 /* PA_ACTIVERXDATALANES */ };
++
++		for (i = 0; i < 0x100; i += 16)
++			printf("UFS vs+%02x: %08x %08x %08x %08x\n", i, ufshcd_readl(hba, 0x1100 + i),
++			       ufshcd_readl(hba, 0x1104 + i), ufshcd_readl(hba, 0x1108 + i), ufshcd_readl(hba, 0x110c + i));
++		for (i = 0; i < ARRAY_SIZE(attrs); i++) {
++			int r = ufshcd_dme_get(hba, UIC_ARG_MIB(attrs[i]), &v);
++
++			printf("UFS: DME_GET %04x = %x (%d)\n", attrs[i], r ? 0xdead : v, r);
++		}
++	}
++	start = get_timer(0);
++	while (ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL) ||
++	       ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL)) {
++		if (get_timer(start) > 1000) {
++			dev_err(hba->dev, "UFS: the bootloader's requests do not finish (doorbells %08x %08x)\n",
++				ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL),
++				ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL));
++			return -ETIMEDOUT;
++		}
++	}
++	ufshcd_init_pwr_info(hba);
++	/* Exynos vendor: every slot's nexus type as Google's Linux driver sets it (the bootloader left slot 0's clear) */
++	printf("UFS: UTRL_NEXUS_TYPE %08x -> ffffffff, UTMRL_NEXUS_TYPE %08x\n", ufshcd_readl(hba, 0x1140),
++	       ufshcd_readl(hba, 0x1144));
++	ufshcd_writel(hba, 0xffffffff, 0x1140);
++	/* Google's exynos_ufs_config_host(), the rest of it (vendor HCI block at +0x1100) */
++	printf("UFS: before config_host: FORCE_HCS %08x IOP_ACG %08x UFS_ACG %08x AXIDMA %08x REORDER %08x\n",
++	       ufshcd_readl(hba, 0x11b4), ufshcd_readl(hba, 0x1200), ufshcd_readl(hba, 0x11fc),
++	       ufshcd_readl(hba, 0x116c), ufshcd_readl(hba, 0x1160));
++	ufshcd_writel(hba, ufshcd_readl(hba, 0x11b4) & ~BIT(4), 0x11b4);      /* HCI_CORECLK_STOP_EN off */
++	ufshcd_writel(hba, 0xa, 0x1160);                                        /* HCI_DATA_REORDER */
++	ufshcd_writel(hba, BIT(31) | 12, 0x1100);                               /* TXPRDT: prefetch, 4 KB */
++	ufshcd_writel(hba, 12, 0x1104);                                         /* RXPRDT: 4 KB */
++	ufshcd_writel(hba, 0xffffffff, 0x1144);                                 /* UTMRL_NEXUS_TYPE */
++	ufshcd_writel(hba, BIT(31) | (3 << 27) | 3, 0x116c);                    /* AXIDMA: WLU_EN | BURST_LEN(3) */
++	ufshcd_writel(hba, ufshcd_readl(hba, 0x1200) & ~BIT(0), 0x1200);       /* IOP_ACG_DISABLE: HW control */
++	printf("UFS: after config_host: FORCE_HCS %08x IOP_ACG %08x AXIDMA %08x TXPRDT %08x\n",
++	       ufshcd_readl(hba, 0x11b4), ufshcd_readl(hba, 0x1200), ufshcd_readl(hba, 0x116c),
++	       ufshcd_readl(hba, 0x1100));
++	if (ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L) == lower_32_bits((uintptr_t)hba->utrdl) &&
++	    ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_H) == upper_32_bits((uintptr_t)hba->utrdl)) {
++		/* the list is already where ours is (the DMA window starts at the bootloader's): left running as it is */
++		ufshcd_enable_intr(hba, UFSHCD_ENABLE_INTRS);
++		ufshcd_disable_intr_aggr(hba);
++		ret = 0;
++		printf("UFS: the bootloader's request list kept in place, run/stop untouched\n");
++	} else {
++		ufshcd_writel(hba, 0, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP);
++		ufshcd_writel(hba, 0, REG_UTP_TASK_REQ_LIST_RUN_STOP);
++		ret = ufshcd_make_hba_operational(hba);
++	}
++	printf("UFS: lists moved: UTRL %p (UTRLBA %08x:%08x), UTMRL %p, UCD %p; HCS %08x IS %08x RSR %x/%x\n",
++	       hba->utrdl, ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_H),
++	       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L), hba->utmrdl, hba->ucdl,
++	       ufshcd_readl(hba, REG_CONTROLLER_STATUS), ufshcd_readl(hba, REG_INTERRUPT_STATUS),
++	       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP), ufshcd_readl(hba, REG_UTP_TASK_REQ_LIST_RUN_STOP));
++	return ret;
++}
++
+ static int ufs_start(struct ufs_hba *hba)
+ {
+ 	struct ufs_dev_desc card = {0};
++	bool kept = ufshcd_hakios_link_kept(hba);
+ 	int ret;
+ 
+-	ret = ufshcd_link_startup(hba);
++	ret = kept ? ufshcd_hakios_take_over(hba) : ufshcd_link_startup(hba);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2136,6 +2332,18 @@ static int ufs_start(struct ufs_hba *hba)
+ 	if (ret)
+ 		return ret;
+ 
++	if (kept) {
++		/* the device is initialised and in the bootloader's power mode: nothing of it is changed */
++		ufshcd_init_desc_sizes(hba);
++		ret = ufs_get_device_desc(hba, &card);
++		if (ret)
++			dev_err(hba->dev, "%s: Failed getting device info. err = %d\n", __func__, ret);
++		else
++			dev_info(hba->dev, "UFS: device answers (manufacturer %04x), link kept as it was\n",
++				 card.wmanufacturerid);
++		return ret;
++	}
++
+ 	ret = ufshcd_complete_dev_init(hba);
+ 	if (ret)
+ 		return ret;
+@@ -2151,6 +2359,12 @@ static int ufs_start(struct ufs_hba *hba)
+ 		return ret;
+ 	}
+ 
++	if (dev_read_bool(hba->dev, "hakios,pwm-only")) {
++		/* HakiOS: the link as link startup leaves it (PWM-G1): no attribute written to the device, no HS change */
++		printf("UFS: device answers (manufacturer %04x); staying in PWM-G1\n", card.wmanufacturerid);
++		return 0;
++	}
++
+ 	ufshcd_set_dev_ref_clk(hba);
+ 
+ 	if (ufshcd_get_max_pwr_mode(hba)) {
+@@ -2209,6 +2423,8 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ 		dev_err(hba->dev, "Host controller init failed: %i\n", err);
+ 		return err;
+ 	}
++	if (hba->quirks & UFSHCD_QUIRK_HAKIOS_PRDT_4K)
++		scsi_plat->max_bytes_per_req = (MAX_BUFF - 4) * SZ_4K;  /* an unaligned buffer takes one entry more */
+ 
+ 	/* Read capabilities registers */
+ 	hba->capabilities = ufshcd_readl(hba, REG_CONTROLLER_CAPABILITIES);
+@@ -2251,6 +2467,9 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ 
+ 	mb(); /* flush previous writes */
+ 
++	if (ufshcd_hakios_link_kept(hba))
++		return ufs_start(hba);         /* HakiOS: no device or controller reset; the link stays up */
++
+ 	/* Reset the attached device */
+ 	err = ufshcd_vops_device_reset(hba);
+ 	if (err) {
+diff --git a/drivers/ufs/ufs.h b/drivers/ufs/ufs.h
+index 0f6c93fb..e1838d46 100644
+--- a/drivers/ufs/ufs.h
++++ b/drivers/ufs/ufs.h
+@@ -635,6 +635,25 @@ enum ufshcd_quirks {
+ 	 */
+ 	UFSHCD_QUIRK_BROKEN_64BIT_ADDRESS		= 1 << 17,
+ 
++	/*
++	 * HakiOS: a bootloader before U-Boot left the controller enabled and the link up (the Pixel 8a: Google's
++	 * bootloader, which has no way to hand U-Boot a PHY it could bring up again): take it over as it is. No host or
++	 * device reset, no link startup, no power mode change; the request lists are moved to U-Boot's memory.
++	 */
++	UFSHCD_QUIRK_HAKIOS_KEEP_LINK			= 1 << 24,
++
++	/*
++	 * HakiOS: a PRDT entry covers at most 4 KB (Exynos: HCI_TXPRDT_ENTRY_SIZE / RXPRDT = 12, as Google's bootloader
++	 * and its Linux driver set them).
++	 */
++	UFSHCD_QUIRK_HAKIOS_PRDT_4K			= 1 << 25,
++
++	/*
++	 * HakiOS: Exynos' HCI_UTRL_NEXUS_TYPE (vendor HCI + 0x40), one bit a slot: 1 for a SCSI command, 0 for a query or
++	 * a NOP, set before the doorbell (Linux's exynos_ufs_set_nexus_t_xfer_req).
++	 */
++	UFSHCD_QUIRK_HAKIOS_EXYNOS_NEXUS		= 1 << 26,
++
+ 	/*
+ 	 * This quirk needs to be enabled if the host controller has
+ 	 * auto-hibernate capability but it's FASTAUTO only.
+@@ -694,6 +713,14 @@ enum ufshcd_quirks {
+ };
+ 
+ struct ufs_hba {
++	/*
++	 * HakiOS: memory the controller is allowed to reach by DMA (a bootloader's S2MPU lets it reach no other: the Pixel
++	 * 8a). Set by the platform driver's init; the descriptors and a bounce buffer for data elsewhere are taken from it.
++	 */
++	void *hakios_dma;
++	unsigned long hakios_dma_size;
++	void *hakios_bounce;
++	unsigned long hakios_bounce_size;
+ 	struct			udevice *dev;
+ 	void __iomem		*mmio_base;
+ 	struct ufs_hba_ops	*ops;
