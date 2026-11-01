@@ -24,7 +24,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | USB | ✅ | the host side for development (`xl`): 44-46 MB/s uploads, screenshots, logs |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | 🟡 | correct, but set from the computer at each run (`xl`), not read from the phone |
-| Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (12.5 GB) |
+| Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (71 GB; iPhone Storage shows 80 GB) |
 | GPU (Mali-G715) | ❌ | software drawing only |
 | Battery / charging info | ❌ | the battery icon is empty; the phone does not charge while in HakiOS |
 | Audio | ❌ | behind Google's AoC (always-on processor) |
