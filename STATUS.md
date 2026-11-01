@@ -19,7 +19,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | iOS user space | ✅ | Darwin 16.5: launchd, backboardd, SpringBoard to the home screen; apps open |
 | Display | 🟡 | the bootloader's framebuffer, drawn in software: ~10 frames a second |
 | Touch | ✅ | taps, swipes, the app switcher |
-| Buttons (power, volume) | 🟡 | driver found the keys, no false presses; a real press not yet seen |
+| Buttons (power, volume) | ✅ | volume HUD, power locks and wakes (`buttons=1`) |
 | CPU | 🟡 | 8 of 9 cores; no frequency scaling (runs at the bootloader's clocks) |
 | USB | ✅ | the host side for development (`xl`): 44-46 MB/s uploads, screenshots, logs |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
@@ -52,7 +52,7 @@ by U-Boot. Every frame is drawn by the CPU, ~10 a second, so it works but is slo
 the kernel driver sets its clock and reads it.
 
 **Buttons.** Power gpa4-0, volume down gpa4-1, volume up gpa6-2 (`buttons=1`), mapped like the iPhone X's side and
-volume buttons. Read only.
+volume buttons. Read only. In iOS: the volume HUD, power locks and wakes the screen.
 
 **CPU.** 8 cores (4 small, then the middle ones). The 9th, the Cortex-X3, is not used (the kernel's limit is 8).
 No frequency or voltage control: that is ACPM's job (Google's power firmware), and the kernel has no ACPM client yet

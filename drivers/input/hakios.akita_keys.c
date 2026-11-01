@@ -22,7 +22,8 @@
  * A key that reads as held before it has ever been seen released is not believed. The mapping is the iPhone X's: power
  * is the side button (HAKIOS_BUTTON_LOCK).
  *
- * Status: written 2026-11-01 from the tree and U-Boot's view of the registers; not yet run with a person pressing.
+ * Status: written 2026-11-01 from the tree and U-Boot's view of the registers; tried the same evening in Darwin by the
+ * tester: the volume keys show iOS's volume HUD, power locks and wakes the screen; 33 presses, each released once.
  */
 #include <stdint.h>
 #include <kern/clock.h>
