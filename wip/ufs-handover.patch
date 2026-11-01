@@ -1,0 +1,384 @@
+diff --git a/drivers/ufs/Kconfig b/drivers/ufs/Kconfig
+index 49472933..d144724f 100644
+--- a/drivers/ufs/Kconfig
++++ b/drivers/ufs/Kconfig
+@@ -8,6 +8,14 @@ config UFS
+ 	  This selects support for Universal Flash Subsystem (UFS).
+ 	  Say Y here if you want UFS Support.
+ 
++config UFS_HAKIOS_HANDOVER
++	bool "HakiOS: a UFS controller a bootloader left running, taken over as it is"
++	depends on UFS
++	help
++	  For a phone whose bootloader before U-Boot leaves the UFS link up and has no driver of U-Boot's for its PHY (the
++	  Pixel 8a, Google Tensor G3): the controller is not reset, the request lists are moved to U-Boot's memory, and
++	  PRDT entries are kept to 4 KB (compatible "hakios,ufs-handover").
++
+ config UFS_AMD_VERSAL2
+ 	bool "AMD Versal Gen 2 UFS controller platform driver"
+ 	depends on UFS && ZYNQMP_FIRMWARE
+diff --git a/drivers/ufs/Makefile b/drivers/ufs/Makefile
+index e7f3c1d3..c2e0b420 100644
+--- a/drivers/ufs/Makefile
++++ b/drivers/ufs/Makefile
+@@ -4,6 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_UFS) += ufs-uclass.o
++obj-$(CONFIG_UFS_HAKIOS_HANDOVER) += ufs-hakios.o
+ obj-$(CONFIG_UFS_AMD_VERSAL2) += ufs-amd-versal2.o ufshcd-dwc.o
+ obj-$(CONFIG_UFS_CADENCE) += cdns-platform.o
+ obj-$(CONFIG_UFS_MEDIATEK) += ufs-mediatek.o
+diff --git a/drivers/ufs/ufs-hakios.c b/drivers/ufs/ufs-hakios.c
+new file mode 100644
+index 00000000..0bfb95da
+--- /dev/null
++++ b/drivers/ufs/ufs-hakios.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * HakiOS: a UFS host controller that a bootloader before U-Boot left running, taken over as it is (the Pixel 8a,
++ * Google Tensor G3 "zuma": Samsung's UFSHCI 3.0 with the link up in HS gear 4 on two lanes). Nothing of the controller,
++ * its PHY or the device is reset or reconfigured; U-Boot's UFS core moves the request lists to its own memory and goes
++ * on from there (UFSHCD_QUIRK_HAKIOS_KEEP_LINK), with PRDT entries of 4 KB as the Exynos HCI is set up for
++ * (UFSHCD_QUIRK_HAKIOS_PRDT_4K). Found so on the phone: HCE 1, HCS 0x10f, the bootloader's lists running at 0xf8c42000.
++ *
++ * zuma's controller is a standard UFSHCI in what this uses: Android's tree has fixed-prdt-req_list-ocs, with which
++ * Google's driver drops the Exynos quirks (PRDT_BYTE_GRAN and the rest), and the bootloader's own descriptors use
++ * dword offsets and 16-byte PRDT entries (no FMP descriptors).
++ *
++ *	ufs@13200000 { compatible = "hakios,ufs-handover"; reg = <0x0 0x13200000 0x0 0x200>; };
++ */
++#include <dm.h>
++#include <ufs.h>
++#include <dm/device_compat.h>
++#include <linux/arm-smccc.h>
++#include "ufs.h"
++
++/*
++ * The UFS protector's SMU (Samsung's "UFSPR", which decides what memory a UFS transfer may touch) as Google's driver
++ * starts it at every boot, through the secure monitor: SMC_CMD_SMU(SMU_INIT, SMU_EMBEDDED). Not SMC_CMD_FMP_SECURITY
++ * with descriptor type 3: that turns PRDT entries into FMP's 128-byte ones, and the bootloader's are the 16-byte ones.
++ */
++#define SMC_CMD_SMU		0xc2001850
++#define SMU_INIT		0
++#define SMU_EMBEDDED		0
++
++static int ufs_hakios_init(struct ufs_hba *hba)
++{
++	struct arm_smccc_res res;
++	u32 w[4];
++
++	hba->quirks |= UFSHCD_QUIRK_HAKIOS_KEEP_LINK | UFSHCD_QUIRK_HAKIOS_PRDT_4K;
++	if (dev_read_bool(hba->dev, "hakios,smu-init")) {
++		arm_smccc_smc(SMC_CMD_SMU, SMU_INIT, SMU_EMBEDDED, 0, 0, 0, 0, 0, &res);
++		printf("UFS: SMC_CMD_SMU(SMU_INIT): %ld\n", (long)res.a0);
++	}
++	/*
++	 * hakios,dma-window = <base-hi base-lo size-hi size-lo>: the memory the controller may reach. On the Pixel 8a an
++	 * S2MPU in front of HSI2 (s2mpu_s0_hsi2@131f0000, always on) lets it reach what Google's bootloader used for its own
++	 * UFS lists and no more (a request in U-Boot's memory was never fetched: the doorbell stayed set, no completion,
++	 * no error).
++	 */
++	if (!dev_read_u32_array(hba->dev, "hakios,dma-window", w, 4)) {
++		hba->hakios_dma = (void *)(uintptr_t)(((u64)w[0] << 32) | w[1]);
++		hba->hakios_dma_size = ((u64)w[2] << 32) | w[3];
++	}
++	return 0;
++}
++
++static struct ufs_hba_ops ufs_hakios_ops = {
++	.init = ufs_hakios_init,
++};
++
++static int ufs_hakios_probe(struct udevice *dev)
++{
++	int err = ufshcd_probe(dev, &ufs_hakios_ops);
++
++	if (err)
++		dev_err(dev, "the UFS controller could not be taken over: %d\n", err);
++	return err;
++}
++
++static const struct udevice_id ufs_hakios_ids[] = {
++	{ .compatible = "hakios,ufs-handover" },
++	{ }
++};
++
++U_BOOT_DRIVER(ufs_hakios) = {
++	.name		= "ufs-hakios-handover",
++	.id		= UCLASS_UFS,
++	.of_match	= ufs_hakios_ids,
++	.probe		= ufs_hakios_probe,
++};
+diff --git a/drivers/ufs/ufs-uclass.c b/drivers/ufs/ufs-uclass.c
+index 6a51f337..6f966f3c 100644
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -27,6 +27,7 @@
+ #include <linux/bitops.h>
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
++#include <linux/sizes.h>
+ 
+ #include "ufs.h"
+ 
+@@ -687,6 +688,18 @@ static void ufshcd_host_memory_configure(struct ufs_hba *hba)
+  */
+ static int ufshcd_memory_alloc(struct ufs_hba *hba)
+ {
++	if (hba->hakios_dma) {
++		/* HakiOS: in the DMA window: the transfer descriptor, the command descriptor, then the bounce buffer */
++		hba->utrdl = hba->hakios_dma;
++		hba->ucdl = hba->hakios_dma + SZ_4K;
++		hba->hakios_bounce = hba->hakios_dma + 2 * SZ_4K;
++		hba->hakios_bounce_size = hba->hakios_dma_size - 2 * SZ_4K;
++		memset(hba->hakios_dma, 0, 2 * SZ_4K);
++		printf("UFS: DMA window %p, %lu KB for data bounced through it\n", hba->hakios_dma,
++		       hba->hakios_bounce_size / 1024);
++		return 0;
++	}
++
+ 	/* Allocate one Transfer Request Descriptor
+ 	 * Should be aligned to 1k boundary.
+ 	 */
+@@ -931,6 +944,15 @@ static int ufshcd_send_command(struct ufs_hba *hba, unsigned int task_tag)
+ 			if (get_timer(start) > QUERY_REQ_TIMEOUT) {
+ 				dev_err(hba->dev,
+ 					"Timedout waiting for UTP response\n");
++				printf("UFS: IS %08x HCS %08x DBR %08x RSR %x UTRLBA %08x:%08x UECPA %08x UECDL %08x UECN %08x UECT %08x UECDME %08x\n",
++				       intr_status, ufshcd_readl(hba, REG_CONTROLLER_STATUS),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_H),
++				       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L),
++				       ufshcd_readl(hba, 0x38), ufshcd_readl(hba, 0x3c),
++				       ufshcd_readl(hba, 0x40), ufshcd_readl(hba, 0x44),
++				       ufshcd_readl(hba, 0x48));
+ 				return -ETIMEDOUT;
+ 			}
+ 		}
+@@ -1639,6 +1661,26 @@ static void prepare_prdt_table(struct ufs_hba *hba, struct scsi_cmd *pccb)
+ 		return;
+ 	}
+ 
++	if (hba->quirks & UFSHCD_QUIRK_HAKIOS_PRDT_4K) {
++		/* HakiOS: entries of at most 4 KB, none crossing a 4 KB boundary */
++		buf = pccb->pdata;
++		for (table_length = 0; datalen; table_length++) {
++			ulong n = min_t(ulong, datalen, SZ_4K - ((uintptr_t)buf & (SZ_4K - 1)));
++
++			if (table_length == MAX_BUFF) {
++				dev_err(hba->dev, "UFS: %lu bytes left over: more than %d PRDT entries\n", datalen, MAX_BUFF);
++				break;
++			}
++			prepare_prdt_desc(hba, &prd_table[table_length], buf, n - 1);
++			buf += n;
++			datalen -= n;
++		}
++		req_desc->prd_table_length = table_length;
++		ufshcd_cache_flush(prd_table, sizeof(*prd_table) * table_length);
++		ufshcd_cache_flush(req_desc, sizeof(*req_desc));
++		return;
++	}
++
+ 	table_length = DIV_ROUND_UP(pccb->datalen, MAX_PRDT_ENTRY);
+ 	buf = pccb->pdata;
+ 	i = table_length;
+@@ -1656,7 +1698,35 @@ static void prepare_prdt_table(struct ufs_hba *hba, struct scsi_cmd *pccb)
+ 	ufshcd_cache_flush(req_desc, sizeof(*req_desc));
+ }
+ 
++static int ufs_scsi_exec_dma(struct udevice *scsi_dev, struct scsi_cmd *pccb);
++
++/* HakiOS: data outside the DMA window goes through the bounce buffer in it */
+ static int ufs_scsi_exec(struct udevice *scsi_dev, struct scsi_cmd *pccb)
++{
++	struct ufs_hba *hba = dev_get_uclass_priv(scsi_dev->parent);
++	uintptr_t data = (uintptr_t)pccb->pdata, win = (uintptr_t)hba->hakios_dma;
++	unsigned char *user = pccb->pdata;
++	int ret;
++
++	if (!hba->hakios_bounce || !pccb->datalen ||
++	    (data >= win && data + pccb->datalen <= win + hba->hakios_dma_size))
++		return ufs_scsi_exec_dma(scsi_dev, pccb);
++	if (pccb->datalen > hba->hakios_bounce_size) {
++		dev_err(hba->dev, "UFS: %lu bytes do not fit the bounce buffer (%lu)\n", pccb->datalen,
++			hba->hakios_bounce_size);
++		return -EINVAL;
++	}
++	if (pccb->dma_dir == DMA_TO_DEVICE)
++		memcpy(hba->hakios_bounce, user, pccb->datalen);
++	pccb->pdata = hba->hakios_bounce;
++	ret = ufs_scsi_exec_dma(scsi_dev, pccb);
++	pccb->pdata = user;
++	if (!ret && pccb->dma_dir == DMA_FROM_DEVICE)
++		memcpy(user, hba->hakios_bounce, pccb->datalen);
++	return ret;
++}
++
++static int ufs_scsi_exec_dma(struct udevice *scsi_dev, struct scsi_cmd *pccb)
+ {
+ 	struct ufs_hba *hba = dev_get_uclass_priv(scsi_dev->parent);
+ 	u32 upiu_flags;
+@@ -2123,12 +2193,82 @@ static void ufshcd_def_desc_sizes(struct ufs_hba *hba)
+ 	hba->desc_size.hlth_desc = QUERY_DESC_HEALTH_DEF_SIZE;
+ }
+ 
++/*
++ * HakiOS (UFSHCD_QUIRK_HAKIOS_KEEP_LINK): is the controller as a bootloader before us left it, enabled with the device
++ * present and every list ready? Then it is taken over as it is.
++ */
++static bool ufshcd_hakios_link_kept(struct ufs_hba *hba)
++{
++	u32 hcs = ufshcd_readl(hba, REG_CONTROLLER_STATUS);
++
++	return (hba->quirks & UFSHCD_QUIRK_HAKIOS_KEEP_LINK) &&
++	       (ufshcd_readl(hba, REG_CONTROLLER_ENABLE) & CONTROLLER_ENABLE) &&
++	       (hcs & DEVICE_PRESENT) && (hcs & UFSHCD_STATUS_READY) == UFSHCD_STATUS_READY;
++}
++
++/* the lists stopped (the bootloader's, still pointing at its memory), then made U-Boot's and started */
++static int ufshcd_hakios_take_over(struct ufs_hba *hba)
++{
++	ulong start;
++	int ret;
++
++	dev_info(hba->dev, "UFS: taking over the link a bootloader left up (HCS %08x, UTRLBA %08x)\n",
++		 ufshcd_readl(hba, REG_CONTROLLER_STATUS),
++		 ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L));
++	{
++		/* HakiOS diagnostics: the vendor HCI block (+0x1100) and the link's state as UniPro reports it */
++		u32 v, i;
++		static const u32 attrs[] = { 0xd083 /* VS_POWERSTATE */, 0x1571 /* PA_PWRMODE */, 0x1568 /* PA_TXGEAR */,
++					     0x1583 /* PA_RXGEAR */, 0x1560 /* PA_ACTIVETXDATALANES */,
++					     0x1580 /* PA_ACTIVERXDATALANES */ };
++
++		for (i = 0; i < 0x100; i += 16)
++			printf("UFS vs+%02x: %08x %08x %08x %08x\n", i, ufshcd_readl(hba, 0x1100 + i),
++			       ufshcd_readl(hba, 0x1104 + i), ufshcd_readl(hba, 0x1108 + i), ufshcd_readl(hba, 0x110c + i));
++		for (i = 0; i < ARRAY_SIZE(attrs); i++) {
++			int r = ufshcd_dme_get(hba, UIC_ARG_MIB(attrs[i]), &v);
++
++			printf("UFS: DME_GET %04x = %x (%d)\n", attrs[i], r ? 0xdead : v, r);
++		}
++	}
++	start = get_timer(0);
++	while (ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL) ||
++	       ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL)) {
++		if (get_timer(start) > 1000) {
++			dev_err(hba->dev, "UFS: the bootloader's requests do not finish (doorbells %08x %08x)\n",
++				ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL),
++				ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL));
++			return -ETIMEDOUT;
++		}
++	}
++	ufshcd_init_pwr_info(hba);
++	if (ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L) == lower_32_bits((uintptr_t)hba->utrdl) &&
++	    ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_H) == upper_32_bits((uintptr_t)hba->utrdl)) {
++		/* the list is already where ours is (the DMA window starts at the bootloader's): left running as it is */
++		ufshcd_enable_intr(hba, UFSHCD_ENABLE_INTRS);
++		ufshcd_disable_intr_aggr(hba);
++		ret = 0;
++		printf("UFS: the bootloader's request list kept in place, run/stop untouched\n");
++	} else {
++		ufshcd_writel(hba, 0, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP);
++		ufshcd_writel(hba, 0, REG_UTP_TASK_REQ_LIST_RUN_STOP);
++		ret = ufshcd_make_hba_operational(hba);
++	}
++	printf("UFS: lists moved: UTRL %p (UTRLBA %08x:%08x), UTMRL %p, UCD %p; HCS %08x IS %08x RSR %x/%x\n",
++	       hba->utrdl, ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_H),
++	       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_BASE_L), hba->utmrdl, hba->ucdl,
++	       ufshcd_readl(hba, REG_CONTROLLER_STATUS), ufshcd_readl(hba, REG_INTERRUPT_STATUS),
++	       ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP), ufshcd_readl(hba, REG_UTP_TASK_REQ_LIST_RUN_STOP));
++	return ret;
++}
++
+ static int ufs_start(struct ufs_hba *hba)
+ {
+ 	struct ufs_dev_desc card = {0};
++	bool kept = ufshcd_hakios_link_kept(hba);
+ 	int ret;
+ 
+-	ret = ufshcd_link_startup(hba);
++	ret = kept ? ufshcd_hakios_take_over(hba) : ufshcd_link_startup(hba);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2136,6 +2276,18 @@ static int ufs_start(struct ufs_hba *hba)
+ 	if (ret)
+ 		return ret;
+ 
++	if (kept) {
++		/* the device is initialised and in the bootloader's power mode: nothing of it is changed */
++		ufshcd_init_desc_sizes(hba);
++		ret = ufs_get_device_desc(hba, &card);
++		if (ret)
++			dev_err(hba->dev, "%s: Failed getting device info. err = %d\n", __func__, ret);
++		else
++			dev_info(hba->dev, "UFS: device answers (manufacturer %04x), link kept as it was\n",
++				 card.wmanufacturerid);
++		return ret;
++	}
++
+ 	ret = ufshcd_complete_dev_init(hba);
+ 	if (ret)
+ 		return ret;
+@@ -2209,6 +2361,8 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ 		dev_err(hba->dev, "Host controller init failed: %i\n", err);
+ 		return err;
+ 	}
++	if (hba->quirks & UFSHCD_QUIRK_HAKIOS_PRDT_4K)
++		scsi_plat->max_bytes_per_req = (MAX_BUFF - 4) * SZ_4K;  /* an unaligned buffer takes one entry more */
+ 
+ 	/* Read capabilities registers */
+ 	hba->capabilities = ufshcd_readl(hba, REG_CONTROLLER_CAPABILITIES);
+@@ -2251,6 +2405,9 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ 
+ 	mb(); /* flush previous writes */
+ 
++	if (ufshcd_hakios_link_kept(hba))
++		return ufs_start(hba);         /* HakiOS: no device or controller reset; the link stays up */
++
+ 	/* Reset the attached device */
+ 	err = ufshcd_vops_device_reset(hba);
+ 	if (err) {
+diff --git a/drivers/ufs/ufs.h b/drivers/ufs/ufs.h
+index 0f6c93fb..7fdec305 100644
+--- a/drivers/ufs/ufs.h
++++ b/drivers/ufs/ufs.h
+@@ -635,6 +635,19 @@ enum ufshcd_quirks {
+ 	 */
+ 	UFSHCD_QUIRK_BROKEN_64BIT_ADDRESS		= 1 << 17,
+ 
++	/*
++	 * HakiOS: a bootloader before U-Boot left the controller enabled and the link up (the Pixel 8a: Google's
++	 * bootloader, which has no way to hand U-Boot a PHY it could bring up again): take it over as it is. No host or
++	 * device reset, no link startup, no power mode change; the request lists are moved to U-Boot's memory.
++	 */
++	UFSHCD_QUIRK_HAKIOS_KEEP_LINK			= 1 << 24,
++
++	/*
++	 * HakiOS: a PRDT entry covers at most 4 KB (Exynos: HCI_TXPRDT_ENTRY_SIZE / RXPRDT = 12, as Google's bootloader
++	 * and its Linux driver set them).
++	 */
++	UFSHCD_QUIRK_HAKIOS_PRDT_4K			= 1 << 25,
++
+ 	/*
+ 	 * This quirk needs to be enabled if the host controller has
+ 	 * auto-hibernate capability but it's FASTAUTO only.
+@@ -694,6 +707,14 @@ enum ufshcd_quirks {
+ };
+ 
+ struct ufs_hba {
++	/*
++	 * HakiOS: memory the controller is allowed to reach by DMA (a bootloader's S2MPU lets it reach no other: the Pixel
++	 * 8a). Set by the platform driver's init; the descriptors and a bounce buffer for data elsewhere are taken from it.
++	 */
++	void *hakios_dma;
++	unsigned long hakios_dma_size;
++	void *hakios_bounce;
++	unsigned long hakios_bounce_size;
+ 	struct			udevice *dev;
+ 	void __iomem		*mmio_base;
+ 	struct ufs_hba_ops	*ops;

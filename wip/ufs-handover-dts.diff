@@ -1,0 +1,22 @@
+--- devices/akita/u-boot/files/dts/upstream/src/arm64/exynos/google/zuma-akita.dts	2026-11-01 03:03:06.631098254 +0200
++++ u-boot/dts/upstream/src/arm64/exynos/google/zuma-akita.dts	2026-11-01 15:48:55.370658820 +0200
+@@ -99,6 +99,19 @@
+ 	 * Samsung's USI HSI2C, set up as I2C by the bootloader, which uses the repeater for its own fastboot. Its input
+ 	 * clock as Android's kernel log gives it ("IPCLK = 200000000"), as a fixed clock: U-Boot has no zuma clock driver.
+ 	 */
++	/*
++	 * UFS: the controller as Google's bootloader leaves it (enabled, the link up in HS gear 4 on two lanes; Android's tree:
++	 * ufs@13200000, samsung,exynos-ufs, fixed-prdt-req_list-ocs). Only its standard UFSHCI registers are named:
++	 * U-Boot takes it over as it is (drivers/ufs/ufs-hakios.c) and resets nothing.
++	 */
++	ufs@13200000 {
++		compatible = "hakios,ufs-handover";
++		reg = <0x0 0x13200000 0x0 0x200>;
++		/* inside abl@f8800000, where the bootloader kept its own UFS lists (0xf8c40000..): the S2MPU lets UFS reach it */
++		hakios,dma-window = <0x0 0xf8c42000 0x0 0x1fe000>;
++		hakios,smu-init;
++	};
++
+ 	hsi2c_clk: hsi2c-clk {
+ 		compatible = "fixed-clock";
+ 		#clock-cells = <0>;
