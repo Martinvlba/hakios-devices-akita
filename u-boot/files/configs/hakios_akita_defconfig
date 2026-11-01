@@ -94,3 +94,6 @@ CONFIG_CMD_SCSI=y
 CONFIG_CMD_PART=y
 CONFIG_EFI_PARTITION=y
 CONFIG_PARTITION_TYPE_GUID=y
+# U-Boot's block cache: off. Its buffers are not page-aligned, which the Exynos UFS host cannot take (it read them
+# wrong; the UFS core now bounces such transfers, but the cache gains nothing here)
+# CONFIG_BLOCK_CACHE is not set
