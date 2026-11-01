@@ -73,6 +73,8 @@ No USB for iOS itself (no data, no charging).
 
 ## Known oddities
 
+- Shut Down or Restart from iOS never completes: the spinner stays (the port's log 4). Use Power + Volume Down to leave.
+
 - A second kernel run in one loader session dies at once: restart the phone between runs (`./xl reboot`), as on the
   reference phone.
 - `-v` puts the kernel's text over the iOS screen; leave it off for clean screenshots.
