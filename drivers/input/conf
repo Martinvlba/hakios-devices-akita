@@ -3,3 +3,7 @@
 driver AKITA_KEYS
 	file    bsd/dev/hakios.akita_keys.c
 	help    the Pixel 8a's power and volume keys: three pins of zuma's always-on pin controller, read (buttons=1)
+
+driver AKITA_TOUCH
+	file    bsd/dev/hakios.akita_touch.c
+	help    the Pixel 8a's touch screen: a Goodix GT9895 on the SPI controller of zuma's HSI0 USI2, polled (touchscreen=1; U-Boot powers it)
