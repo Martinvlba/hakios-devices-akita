@@ -24,7 +24,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | USB | ✅ | the host side for development (`xl`): 44-46 MB/s uploads, screenshots, logs |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | 🟡 | correct, but set from the computer at each run (`xl`), not read from the phone |
-| Storage (UFS) | 🟡 | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var still in RAM (not kept between starts) |
+| Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (12.5 GB) |
 | GPU (Mali-G715) | ❌ | software drawing only |
 | Battery / charging info | ❌ | the battery icon is empty; the phone does not charge while in HakiOS |
 | Audio | ❌ | behind Google's AoC (always-on processor) |
@@ -62,8 +62,8 @@ No frequency or voltage control: that is ACPM's job (Google's power firmware), a
 No USB for iOS itself (no data, no charging).
 
 **Storage (UFS).** iOS is installed on the flash: a 77 GiB `darwin` partition (taken from userdata; Android keeps
-32 GiB) holds the root volume and cryptexes, and Darwin boots from it (`root_apfs=ufs_darwin ufs=2`, the port's log 4). Writing
-`/private/var` to the flash, and starting without the PC, are next.
+32 GiB) holds the root volume and cryptexes, and Darwin boots from it with `/private/var` kept on the flash between starts
+(the port's log 4). Starting without the PC is next.
 
 **GPU.** Mali-G715 with its CSF firmware: the largest single job.
 
