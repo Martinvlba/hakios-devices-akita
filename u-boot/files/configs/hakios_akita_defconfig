@@ -85,3 +85,12 @@ CONFIG_CMD_I2C=y
 # CONFIG_EFI_CAPSULE_ON_DISK is not set
 # CONFIG_EFI_CAPSULE_FIRMWARE_RAW is not set
 # CONFIG_TOOLS_MKEFICAPSULE is not set
+# UFS: zuma's host brought up as Google's Linux driver does it (drivers/ufs/ufs-exynos-gs.c, HS gear 4), as SCSI disks
+# (one a LUN: sda..sdd under Android) and, through U-Boot's EFI layer, as block devices the loader can read
+CONFIG_SCSI=y
+CONFIG_UFS=y
+CONFIG_UFS_EXYNOS_GS=y
+CONFIG_CMD_SCSI=y
+CONFIG_CMD_PART=y
+CONFIG_EFI_PARTITION=y
+CONFIG_PARTITION_TYPE_GUID=y

@@ -24,7 +24,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | USB | ✅ | the host side for development (`xl`): 44-46 MB/s uploads, screenshots, logs |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | 🟡 | correct, but set from the computer at each run (`xl`), not read from the phone |
-| Storage (UFS) | ❌ | in progress: the controller is found running, but its DMA is blocked (the port's log 4); the system runs from RAM |
+| Storage (UFS) | 🟡 | reads work (U-Boot, HS gear 4, ~800 MB/s; the loader sees every partition); iOS still runs from RAM: a darwin partition is next |
 | GPU (Mali-G715) | ❌ | software drawing only |
 | Battery / charging info | ❌ | the battery icon is empty; the phone does not charge while in HakiOS |
 | Audio | ❌ | behind Google's AoC (always-on processor) |
@@ -61,8 +61,8 @@ No frequency or voltage control: that is ACPM's job (Google's power firmware), a
 **USB.** The development link only: `xl` (enter, run, ramdisk, screenshot, log, reboot) from Windows/WSL with usbipd.
 No USB for iOS itself (no data, no charging).
 
-**Storage (UFS).** Not started. The system runs from RAM, so settings and app data are gone at every restart. Next
-on the plan: zuma's UFS host, read only first.
+**Storage (UFS).** Reads work: U-Boot brings the flash up (power, pins, Samsung's CAL, HS gear 4) and the loader sees
+every partition. iOS still runs from RAM; a `darwin` partition (taken from userdata, which wipes Android's data) is next.
 
 **GPU.** Mali-G715 with its CSF firmware: the largest single job.
 
