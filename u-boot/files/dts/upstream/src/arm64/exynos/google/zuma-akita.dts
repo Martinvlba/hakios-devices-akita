@@ -69,6 +69,52 @@
 		clock-frequency = <24576000>;
 	};
 
+	/*
+	 * USB: the DWC3 at 0x11210000 (Android's tree: usb@11210000, samsung,exynos9-dwusb, with a dwc3 child in peripheral
+	 * mode). Google's bootloader drives it for its own fastboot just before it starts U-Boot, so its clocks, its PHY
+	 * (phy@11100000), the eUSB repeater and its SysMMU (sysmmu@11040000) are as that left them: none of them is named
+	 * here, and U-Boot's Samsung DWC3 glue then only takes the controller. High speed first: the USB 3 PHY would want
+	 * more of what the bootloader may have set up.
+	 */
+	usb@11210000 {
+		compatible = "samsung,exynos850-dwusb3";
+		ranges = <0x0 0x0 0x11210000 0x10000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		usb@0 {
+			compatible = "snps,dwc3";
+			reg = <0x0 0x10000>;
+			dr_mode = "peripheral";
+			maximum-speed = "high-speed";
+			snps,dis_u2_susphy_quirk;
+			snps,dis_enblslpm_quirk;
+			/* as Android's tree has it for this controller */
+			snps,dis-u2-freeclk-exists-quirk;
+		};
+	};
+
+	/*
+	 * The I2C bus of the eUSB repeater (Android's tree: hsi2c@10CB0000, samsung,usi-i2c-v2; eusb-repeater@3E on it).
+	 * Samsung's USI HSI2C, set up as I2C by the bootloader, which uses the repeater for its own fastboot. Its input
+	 * clock as Android's kernel log gives it ("IPCLK = 200000000"), as a fixed clock: U-Boot has no zuma clock driver.
+	 */
+	hsi2c_clk: hsi2c-clk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+	};
+
+	i2c@10cb0000 {
+		compatible = "samsung,exynos7-hsi2c";
+		reg = <0x0 0x10cb0000 0x0 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&hsi2c_clk>;
+		clock-names = "hsi2c";
+		clock-frequency = <400000>;
+	};
+
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <2>;

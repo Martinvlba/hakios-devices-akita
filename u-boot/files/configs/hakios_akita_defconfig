@@ -54,6 +54,29 @@ CONFIG_SYSRESET=y
 CONFIG_ARM_SMCCC=y
 CONFIG_SYSRESET_PSCI=y
 # CONFIG_PSCI_RESET is not set
+# USB as a device, on the DWC3 Google's bootloader used for its own fastboot a moment before: Samsung's glue
+# (samsung,exynos850-dwusb3) with no clocks, resets or PHY in the tree, so that U-Boot takes the controller as it was
+# left (zuma-akita.dts). U-Boot's fastboot (never writing the phone's storage: no FASTBOOT_FLASH) and the loader's own
+# USB device protocol (EFI_QCOM_USB_DEVICE: xl).
+CONFIG_USB=y
+CONFIG_DM_USB_GADGET=y
+CONFIG_USB_GADGET=y
+CONFIG_USB_DWC3=y
+CONFIG_MISC=y
+CONFIG_USB_DWC3_GENERIC=y
+CONFIG_USB_GADGET_MANUFACTURER="Google"
+CONFIG_USB_GADGET_VENDOR_NUM=0x18d1
+CONFIG_USB_GADGET_PRODUCT_NUM=0x4ee0
+CONFIG_USB_FUNCTION_FASTBOOT=y
+CONFIG_FASTBOOT_BUF_ADDR=0x900000000
+CONFIG_FASTBOOT_BUF_SIZE=0x8000000
+# CONFIG_FASTBOOT_FLASH is not set
+CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y
+CONFIG_FASTBOOT_OEM_RUN=y
+CONFIG_EFI_QCOM_USB_DEVICE=y
+# I2C (Samsung's HSI2C) for the eUSB repeater (eusb repeater, cmd/hakios_eusb.c)
+CONFIG_SYS_I2C_S3C24X0=y
+CONFIG_CMD_I2C=y
 # The HakiOS loader keeps U-Boot's boot services while the kernel runs and has a watchdog of its own:
 # a watchdog U-Boot started would bite the phone in the middle of a run.
 # CONFIG_WATCHDOG_AUTOSTART is not set
