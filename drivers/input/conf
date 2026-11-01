@@ -1,0 +1,5 @@
+# devices/akita/drivers/input/conf: the Pixel 8a's own input drivers (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_KEYS
+	file    bsd/dev/hakios.akita_keys.c
+	help    the Pixel 8a's power and volume keys: three pins of zuma's always-on pin controller, read (buttons=1)
