@@ -12,7 +12,13 @@
  *     the host's SYN (seq 0) -> our SYN|ACK (seq 0, ack 1) once 127.0.0.1:port answers, else RST;
  *     data: flags ACK only, acknowledged by us (usbmuxd sends only what our window and acks allow);
  *     RST from either side ends the connection (usbmuxd sends RST when its client goes, we when the port closes).
+ *
+ * Port 1 is the kernel's own: no socket behind it, the console log instead (osfmk/arm64/loader_return.c's, what the
+ * loader gets back from a run: printf, IOLog, and what processes write to /dev/console, a job's StandardErrorPath
+ * among them), from its first character still kept on and then as it grows, for as long as the host keeps it. The log of a run while it runs, with nothing but the USB cable; on the host:
+ * devices/akita/tools/usbmux-log.py (through usbmuxd's socket).
  */
+#include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
@@ -42,7 +48,8 @@ bool akita_usb_send(const void *header, uint32_t header_len, const void *data, u
 #define RX_MAX                  (256 * 1024)
 
 struct mux_conn {
-	bool used, open;
+	bool used, open, klog;
+	uint32_t sending;               /* the poll thread in sock_send on it: the reader waits before it closes */
 	uint16_t host_port, phone_port;
 	uint32_t tx_seq;                /* ours */
 	uint32_t rx_next;               /* the host's next sequence number: our ack */
@@ -129,9 +136,49 @@ conn_thread(void *parameter, __unused wait_result_t result)
 		}
 	}
 	c->open = false;
+	while (c->sending) {
+		lck_mtx_unlock(mux_lock);
+		delay_for_interval(1, NSEC_PER_MSEC);
+		lck_mtx_lock(mux_lock);
+	}
 	lck_mtx_unlock(mux_lock);
 	sock_close(so);
 	lck_mtx_lock(mux_lock);
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
+/* osfmk/arm64/loader_return.c: the console log (printf, IOLog, and what processes write to /dev/console) */
+extern size_t loader_log_copy(uint64_t *cursor, char *out, size_t max);
+
+/* port 1: the console log, from its first character still kept on, then what is added, until the host goes */
+static void
+klog_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+	static char chunk[MAX_DATA];
+	uint64_t cursor = 0;
+
+	while (c->open) {
+		size_t n = loader_log_copy(&cursor, chunk, sizeof(chunk));
+		uint32_t seq;
+
+		if (n == 0) {
+			delay_for_interval(200, NSEC_PER_MSEC);
+			continue;
+		}
+		lck_mtx_lock(mux_lock);
+		seq = c->tx_seq;
+		c->tx_seq += (uint32_t)n;
+		lck_mtx_unlock(mux_lock);
+		if (!send_tcp(c, TH_ACK, seq, c->rx_next, chunk, (uint32_t)n, true)) {
+			break;
+		}
+	}
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_RST, c->tx_seq, c->rx_next, NULL, 0, false);
+	}
 	conn_free(c);
 	lck_mtx_unlock(mux_lock);
 }
@@ -157,6 +204,31 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 	errno_t err;
 
 	to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (phone_port == 1) {
+		lck_mtx_lock(mux_lock);
+		for (unsigned i = 0; i < CONNS && !c; i++) {
+			if (!conns[i].used) {
+				c = &conns[i];
+				bzero(c, sizeof(*c));
+				c->used = c->open = c->klog = true;
+				c->host_port = host_port;
+				c->phone_port = phone_port;
+				c->rx_next = seq + 1;
+				c->tx_seq = 1;
+			}
+		}
+		lck_mtx_unlock(mux_lock);
+		if (!c) {
+			send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
+			return;
+		}
+		printf("akita usbmux: host port %u: the kernel's log\n", host_port);
+		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
+		if (kernel_thread_start(klog_thread, c, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+		return;
+	}
 	lck_mtx_lock(mux_lock);
 	for (unsigned i = 0; i < CONNS && !c; i++) {
 		if (!conns[i].used) {
@@ -229,19 +301,44 @@ tcp_input(const uint8_t *t, uint32_t len)
 		return;
 	}
 	if (flags & (TH_RST | TH_FIN)) {
-		c->open = false;                /* the reader closes it */
+		/* the reader closes it; shut down under the lock, before the reader can see it closed and free the socket */
+		c->open = false;
+		if (c->so) {
+			sock_shutdown(c->so, SHUT_RDWR);
+		}
 		lck_mtx_unlock(mux_lock);
-		sock_shutdown(c->so, SHUT_RDWR);
 		return;
 	}
 	lck_mtx_unlock(mux_lock);
-	if (len > off) {
+	if (len > off && c->klog) {
+		lck_mtx_lock(mux_lock);
+		c->rx_next = seq + (len - off);         /* whatever the host says on the log's port: taken, unread */
+		lck_mtx_unlock(mux_lock);
+		send_tcp(c, TH_ACK, c->tx_seq, c->rx_next, NULL, 0, false);
+	} else if (len > off) {
 		struct iovec iov = { .iov_base = (void *)(uintptr_t)(t + off), .iov_len = len - off };
 		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
 		size_t sent = 0;
+		errno_t err;
 
-		if (sock_send(c->so, &msg, 0, &sent) != 0) {
-			sock_shutdown(c->so, SHUT_RDWR);
+		lck_mtx_lock(mux_lock);
+		if (!c->open) {
+			lck_mtx_unlock(mux_lock);
+			return;
+		}
+		c->sending++;
+		lck_mtx_unlock(mux_lock);
+		err = sock_send(c->so, &msg, 0, &sent);
+		lck_mtx_lock(mux_lock);
+		c->sending--;
+		lck_mtx_unlock(mux_lock);
+		if (err != 0) {
+			lck_mtx_lock(mux_lock);
+			if (c->open) {
+				c->open = false;
+				sock_shutdown(c->so, SHUT_RDWR);
+			}
+			lck_mtx_unlock(mux_lock);
 			return;
 		}
 		lck_mtx_lock(mux_lock);
@@ -315,7 +412,9 @@ akita_usbmux_reset(void)
 	for (unsigned i = 0; i < CONNS; i++) {
 		if (conns[i].used && conns[i].open) {
 			conns[i].open = false;
-			sock_shutdown(conns[i].so, SHUT_RDWR);
+			if (conns[i].so) {
+				sock_shutdown(conns[i].so, SHUT_RDWR);
+			}
 		}
 	}
 	lck_mtx_unlock(mux_lock);

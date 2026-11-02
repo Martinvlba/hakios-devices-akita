@@ -134,6 +134,7 @@ static lck_mtx_t *txq_lock;
 void akita_usbmux_input(const uint8_t *data, uint32_t len);
 void akita_usbmux_reset(void);
 void akita_usbmux_init(void);
+void akita_usbmux_iokit(int connected);  /* hakios.akita_usbmux_iokit.cpp: AppleUSBDeviceMux, for lockdownd */
 
 /* ep0's state: what the next event of it means */
 enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS, EP0_STATUS } static ep0_state;
@@ -141,7 +142,7 @@ static unsigned ep0_status_ep;          /* the physical endpoint the status stag
 static uint32_t ep0_status_type;        /* its TRB: two stages (no data) or three */
 static uint8_t pending_address = 0xff;
 
-static uint32_t seen_setups, seen_bulk_out, bulk_out_bytes;
+static uint32_t seen_setups, seen_bulk_out, bulk_out_bytes, seen_events, start_result = 0xdead;
 static char serial[48] = "0000000000000000000000000000000000000000";
 
 static inline uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(regs + off); }
@@ -273,6 +274,7 @@ bulk_enable(void)
 	bulk_on = true;
 	bulk_start_out();
 	printf("akita usb: configured: the mux interface's bulk endpoints are on\n");
+	akita_usbmux_iokit(1);
 }
 
 static void
@@ -292,6 +294,7 @@ bulk_disable(void)
 	txq_count = 0;
 	lck_mtx_unlock(txq_lock);
 	akita_usbmux_reset();
+	akita_usbmux_iokit(0);
 }
 
 /* a packet for the host: its header and its data, put together in a slot of the queue (wait: for room, up to 5 s) */
@@ -518,6 +521,7 @@ poll_events(void)
 		uint32_t e = *(volatile uint32_t *)(mem + EVT_OFF + evt_pos);
 
 		evt_pos = (evt_pos + 4) % EVT_SIZE;
+		seen_events++;
 		count -= 4;
 		wr(GEVNTCOUNT, 4);
 		if (e & 1) {
@@ -587,11 +591,23 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 	txq_lock = lck_mtx_alloc_init(usb_grp, LCK_ATTR_NULL);
 	akita_usbmux_init();
 	if (!controller_start()) {
+		start_result = 0;
+		for (unsigned i = 0; i < 24; i++) {     /* on the screen (-v) for two minutes: why there is no USB */
+			printf("akita usb: NOT STARTED (GSNPSID %#x DCTL %#x DSTS %#x GCTL %#x)\n", rd(GSNPSID), rd(DCTL),
+			    rd(DSTS), rd(GCTL));
+			delay_for_interval(5000, NSEC_PER_MSEC);
+		}
 		return;
 	}
+	start_result = 1;
 	for (unsigned tick = 0;; tick++) {
 		poll_events();
 		tx_service();
+		if (tick % 5000 == 0 && tick <= 120000) {      /* every 5 s for two minutes: on the screen with -v */
+			printf("akita usb: DCTL %#x DSTS %#x DCFG %#x: %u events, %u setups, %u bulk OUT, %s\n", rd(DCTL),
+			    rd(DSTS), rd(DCFG), seen_events, seen_setups, seen_bulk_out, bulk_on ? "configured" :
+			    "not configured");
+		}
 		if (tick % 60000 == 0 && tick) {
 			printf("akita usb: %u setups, %u bulk OUT transfers (%u bytes)\n", seen_setups, seen_bulk_out,
 			    bulk_out_bytes);

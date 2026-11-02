@@ -3,5 +3,6 @@
 driver AKITA_USB
 	file    bsd/dev/hakios.akita_usb.c
 	file    bsd/dev/hakios.akita_usbmux.c
+	file    iokit/Kernel/hakios.akita_usbmux_iokit.cpp iokitcpp
 	help    the Pixel 8a's USB port as an iPhone's: zuma's DWC3 in device mode, polled, enumerating as 05ac:12a8 with
 	help    the usbmux interface, its connections joined to TCP ports on the phone (usbmux=1; usb_serial= the serial number, the UDID usbmuxd sees)
