@@ -11,9 +11,11 @@
  *
  * The governor, every 100 ms: each processor's busy share since the last look (processor_info's tick counts), the
  * busiest of a cluster's taken, and the lowest step at or above 1.25 times that share of the cluster's top -- at once
- * upwards, downwards only after three looks in a row that want less. Hot: from 90 C on the clusters go no higher than
- * the middle of their steps, from 95 C no higher than the lowest, and that is lifted again below 85 C. BIG's one core
- * is not started by this kernel (cpus=8), so BIG is put at its lowest step and left there.
+ * upwards, downwards only after three looks in a row that want less. Hot (the hottest sensor): from 75 C BIG, the
+ * Cortex-X3, goes no higher than the middle of its steps (as Android holds the X3 back early: BIG's early throttle and
+ * trip points from 70 C; at its top it took the phone from 45 to 81 C in a few minutes of start-up work), from 85 C
+ * every cluster no higher than its middle, from 92 C no higher than its lowest; each lifted 5 degrees lower. A cluster
+ * whose cores this kernel does not start (BIG with cpus=8) is put at its lowest step and left there.
  *
  * kern.hakios.dvfs_mhz ("LITTLE=1328 MID=1065 BIG=500"), kern.hakios.dvfs_changes. dvfs_period_ms= (100).
  */
@@ -68,7 +70,8 @@ static struct cluster clusters[] = {
 static uint32_t period_ms = 100;
 static int dvfs_changes_value;
 static char dvfs_mhz[64] = "";
-static int hot_cap = -1;                /* the highest step allowed while hot, as a fraction: -1 none, 0 lowest, 1 middle */
+static int hot_cap = -1;                /* every cluster's cap while hot: -1 none, 1 the middle step, 0 the lowest */
+static bool big_cap;                    /* BIG's own, earlier: the middle step */
 
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_STRING(_kern_hakios, OID_AUTO, dvfs_mhz, CTLFLAG_RD | CTLFLAG_LOCKED, dvfs_mhz, 0,
@@ -154,7 +157,7 @@ govern(struct cluster *c)
 	}
 	if (hot_cap == 0) {
 		cap = 0;
-	} else if (hot_cap == 1) {
+	} else if (hot_cap == 1 || (big_cap && c->domain == 4)) {
 		cap = (c->nsteps - 1) / 2;
 	}
 	want = want > cap ? cap : want;
@@ -196,13 +199,14 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 		int hot = akita_thermal_hottest_c();
 		uint64_t now;
 
-		if (hot >= 95) {
+		if (hot >= 92) {
 			hot_cap = 0;
-		} else if (hot >= 90 && hot_cap != 0) {
+		} else if (hot >= 85 && hot_cap != 0) {
 			hot_cap = 1;
-		} else if (hot < 85) {
-			hot_cap = -1;
+		} else if ((hot_cap == 0 && hot < 87) || (hot_cap == 1 && hot < 80)) {
+			hot_cap = hot >= 80 ? 1 : -1;
 		}
+		big_cap = hot >= 75 || (big_cap && hot >= 70);
 		for (unsigned i = 0; i < NCLUSTERS; i++) {
 			if (clusters[i].first_cpu < real_ncpus) {
 				govern(&clusters[i]);
@@ -212,7 +216,7 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 		if (now >= next_log) {
 			next_log = now + minute;
 			printf("akita dvfs: %s (%d changes; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d %%\n", dvfs_mhz,
-			    dvfs_changes_value, hot_cap < 0 ? "not held down" : hot_cap ? "held to the middle: hot" :
+			    dvfs_changes_value, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
 			    "held to the lowest: hot", clusters[0].core_share[0], clusters[0].core_share[1],
 			    clusters[0].core_share[2], clusters[0].core_share[3], clusters[1].core_share[0],
 			    clusters[1].core_share[1], clusters[1].core_share[2], clusters[1].core_share[3]);

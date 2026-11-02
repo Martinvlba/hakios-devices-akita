@@ -21,4 +21,4 @@ driver AKITA_DVFS
 	file    bsd/dev/hakios.akita_dvfs.c
 	requires AKITA_ACPM AKITA_THERMAL
 	help    the Pixel 8a's CPU clusters' clocks through ACPM: a governor every 100 ms (the busiest core's share), held
-	help    down from 90 C (dvfs=1; kern.hakios.dvfs_mhz)
+	help    down when hot: BIG from 75 C, all from 85 (dvfs=1; kern.hakios.dvfs_mhz)
