@@ -20,7 +20,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | Display | 🟡 | the bootloader's framebuffer, drawn in software: ~10 frames a second |
 | Touch | ✅ | taps, swipes, the app switcher |
 | Buttons (power, volume) | ✅ | volume HUD, power locks and wakes (`buttons=1`) |
-| CPU | 🟡 | 8 of 9 cores; no frequency scaling (runs at the bootloader's clocks) |
+| CPU | 🟡 | 8 of 9 cores; clocks set by a governor through ACPM (`dvfs=1`): 324-1704 MHz LITTLE, 402-2367 MID; the 9th core (BIG) not used |
 | USB | ✅ | as an iPhone's in iOS (`usbmux=1`): pairs with a computer (Trust This Computer?), ideviceinfo, idevicesyslog, files over AFC (~7 MB/s); and the development link (`xl`) under the loader |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | 🟡 | correct, but set from the computer at each run (`xl`), not read from the phone |
@@ -31,7 +31,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | Wi-Fi / Bluetooth | ❌ | Broadcom on PCIe |
 | Modem / cellular | ❌ | Samsung's modem: last on the list |
 | Camera, haptics, fingerprint, sensors | ❌ | |
-| Thermal | ❌ | no throttling either: keep runs short-ish |
+| Thermal | ✅ | the SoC's 7 sensors read (`thermal=1`), iOS's thermal state from them, clocks held down from 90 C, the phone powered off at 100 C; ~45 C at rest |
 
 ## In more detail
 
