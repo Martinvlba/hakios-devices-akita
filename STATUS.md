@@ -20,7 +20,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | Display | 🟡 | the bootloader's framebuffer, drawn in software: ~10 frames a second |
 | Touch | ✅ | taps, swipes, the app switcher |
 | Buttons (power, volume) | ✅ | volume HUD, power locks and wakes (`buttons=1`) |
-| CPU | 🟡 | 8 of 9 cores; clocks set by a governor through ACPM (`dvfs=1`): 324-1704 MHz LITTLE, 402-2367 MID; the 9th core (BIG) not used |
+| CPU | ✅ | all 9 cores (`cpus=9`: 4 A510, 4 A715, the X3); clocks set by a governor through ACPM (`dvfs=1`), held down when hot (the X3 from 75 C) |
 | USB | ✅ | as an iPhone's in iOS (`usbmux=1`): pairs with a computer (Trust This Computer?), ideviceinfo, idevicesyslog, files over AFC (~7 MB/s); and the development link (`xl`) under the loader |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | 🟡 | correct, but set from the computer at each run (`xl`), not read from the phone |
@@ -54,9 +54,9 @@ the kernel driver sets its clock and reads it.
 **Buttons.** Power gpa4-0, volume down gpa4-1, volume up gpa6-2 (`buttons=1`), mapped like the iPhone X's side and
 volume buttons. Read only. In iOS: the volume HUD, power locks and wakes the screen.
 
-**CPU.** 8 cores (4 small, then the middle ones). The 9th, the Cortex-X3, is not used (the kernel's limit is 8).
-No frequency or voltage control: that is ACPM's job (Google's power firmware), and the kernel has no ACPM client yet
-(U-Boot has one, `acpm`).
+**CPU.** All 9 cores: 4 Cortex-A510, 4 Cortex-A715 and the Cortex-X3 (the kernel's MAX_CPUS is 16 now). Their clocks
+are set through ACPM (Google's power firmware) by the kernel's governor, `dvfs=1`: LITTLE 324-1704 MHz, MID 402-2367, BIG
+500-2914; at rest all near their lowest, about 15 % of one core busy in all and 45 C.
 
 **USB.** In iOS the port is an iPhone's: the kernel drives zuma's DWC3 as a device (05ac:12a8) and speaks the phone's
 side of usbmux, lockdownd runs, and a computer pairs with it ("Trust This Computer?" on the phone) and uses its
