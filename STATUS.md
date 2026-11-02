@@ -21,7 +21,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | Touch | ✅ | taps, swipes, the app switcher |
 | Buttons (power, volume) | ✅ | volume HUD, power locks and wakes (`buttons=1`) |
 | CPU | 🟡 | 8 of 9 cores; no frequency scaling (runs at the bootloader's clocks) |
-| USB | ✅ | the host side for development (`xl`): 44-46 MB/s uploads, screenshots, logs |
+| USB | ✅ | as an iPhone's in iOS (`usbmux=1`): pairs with a computer (Trust This Computer?), ideviceinfo, idevicesyslog, files over AFC (~7 MB/s); and the development link (`xl`) under the loader |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | 🟡 | correct, but set from the computer at each run (`xl`), not read from the phone |
 | Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (71 GB; iPhone Storage shows 80 GB) |
@@ -58,8 +58,12 @@ volume buttons. Read only. In iOS: the volume HUD, power locks and wakes the scr
 No frequency or voltage control: that is ACPM's job (Google's power firmware), and the kernel has no ACPM client yet
 (U-Boot has one, `acpm`).
 
-**USB.** The development link only: `xl` (enter, run, ramdisk, screenshot, log, reboot) from Windows/WSL with usbipd.
-No USB data for iOS itself (charging works: the charger runs on its own).
+**USB.** In iOS the port is an iPhone's: the kernel drives zuma's DWC3 as a device (05ac:12a8) and speaks the phone's
+side of usbmux, lockdownd runs, and a computer pairs with it ("Trust This Computer?" on the phone) and uses its
+services with libimobiledevice (usbmuxd, ideviceinfo, idevicesyslog, afcclient). The pairing and what is written over
+AFC stay on the flash (the data volume is synced every 10 s). Not yet: screenshots, app install, Finder/iTunes on
+Windows (Apple's driver there; usbipd takes the device for WSL). Under the loader the port is `xl`'s (enter, run,
+ramdisk, screenshot, log, reboot). Charging works either way.
 
 **Storage (UFS).** iOS is installed on the flash: a 77 GiB `darwin` partition (taken from userdata; Android keeps
 32 GiB) holds the root volume and cryptexes, and Darwin boots from it with `/private/var` kept on the flash between starts
