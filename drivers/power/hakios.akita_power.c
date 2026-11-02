@@ -1,0 +1,52 @@
+/*
+ * The Pixel 8a's way down: iOS's Shut Down powers the phone off, Restart starts it again, instead of the way back to
+ * the loader -- which on this phone stalls, and left the spinner on the screen for good.
+ *
+ * hakios_platform_halt (osfmk/arm64/machine_routines.c, halt_all_cpus, once the file systems are down): a restart sets
+ * the bootloader's reboot command to a normal start (PMU + 0x810 = 0, through the PMU's secure-register SMC, as
+ * hakios.akita_usbmux.c does for the bootloader) and resets warm (PSCI SYSTEM_RESET2 type 0, then SYSTEM_RESET if that
+ * comes back); a halt is PSCI SYSTEM_OFF. With loader_return_after among the arguments (a run of xl's, from the
+ * computer) it returns, and the loader gets the run and its log back as before.
+ */
+#include <libkern/libkern.h>
+#include <mach/mach_types.h>
+#include <pexpert/pexpert.h>
+#include <sys/systm.h>
+
+#define PMU_REBOOT_CMD          0x15460810UL
+#define TENSOR_SMC_PMU_SEC_REG  0x82000504
+#define PSCI_SYSTEM_OFF         0x84000008
+#define PSCI_SYSTEM_RESET       0x84000009
+#define PSCI_SYSTEM_RESET2      0xc4000012
+
+static uint64_t
+smc(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	register uint64_t x0 __asm__("x0") = function, x1 __asm__("x1") = a1, x2 __asm__("x2") = a2, x3 __asm__("x3") = a3;
+
+	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	return x0;
+}
+
+void hakios_platform_halt(int reboot);
+
+void
+hakios_platform_halt(int reboot)
+{
+	uint32_t after = 0;
+
+	if (PE_parse_boot_argn("loader_return_after", &after, sizeof(after))) {
+		return;                 /* xl's run: the loader takes it back */
+	}
+	if (reboot) {
+		printf("akita: restart: a normal start next (reboot command 0), a warm reset\n");
+		smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 1, 0);
+		smc(PSCI_SYSTEM_RESET2, 0, 0, 0);
+		smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	} else {
+		printf("akita: shut down: the phone powered off (PSCI SYSTEM_OFF)\n");
+		smc(PSCI_SYSTEM_OFF, 0, 0, 0);
+	}
+	printf("akita: PSCI came back: the way back to the loader\n");
+}
