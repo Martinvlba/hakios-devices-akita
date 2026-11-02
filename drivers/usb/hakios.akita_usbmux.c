@@ -17,6 +17,13 @@
  * loader gets back from a run: printf, IOLog, and what processes write to /dev/console, a job's StandardErrorPath
  * among them), from its first character still kept on and then as it grows, for as long as the host keeps it. The log of a run while it runs, with nothing but the USB cable; on the host:
  * devices/akita/tools/usbmux-log.py (through usbmuxd's socket).
+ *
+ * Ports 2 and 3 restart the phone, as `adb reboot bootloader` and `adb reboot` would: the data volume synced first,
+ * then the reboot command Google's bootloader reads at its start (PMU + 0x810, Android's pixel-reboot: 0xfc the
+ * bootloader, 0 a normal start; written through the PMU's secure-register SMC, as upstream Linux writes Tensor's PMU),
+ * then a warm PSCI SYSTEM_RESET2 (a cold SYSTEM_RESET, which port 4 asks for, came back up normally: the command was
+ * not kept), the loader leaving EL2 out of the way: the SMC goes to the firmware. From the host:
+ * devices/akita/tools/usbmux-reboot.py [bootloader].
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -183,6 +190,47 @@ klog_thread(void *parameter, __unused wait_result_t result)
 	lck_mtx_unlock(mux_lock);
 }
 
+#define PMU_REBOOT_CMD          0x15460810UL    /* Android's tree: pixel-reboot, syscon PMU 0x15460000, reboot-cmd-offset 0x810 */
+#define REBOOT_BOOTLOADER       0xfc
+#define TENSOR_SMC_PMU_SEC_REG  0x82000504
+#define PSCI_SYSTEM_RESET       0x84000009
+#define PSCI_SYSTEM_RESET2      0xc4000012      /* reset type 0: a warm reset, as Pixel kernels reboot */
+
+extern int sync_internal(void);
+
+static uint64_t
+smc(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	register uint64_t x0 __asm__("x0") = function, x1 __asm__("x1") = a1, x2 __asm__("x2") = a2, x3 __asm__("x3") = a3;
+
+	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	return x0;
+}
+
+static void
+reboot_now(bool bootloader, bool cold)
+{
+	uint64_t was, now;
+
+	printf("akita usbmux: the host asks for a restart%s: the data volume synced first\n",
+	    bootloader ? " into the bootloader" : "");
+	sync_internal();
+	was = smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 0, 0);
+	smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 1, bootloader ? REBOOT_BOOTLOADER : 0);
+	now = smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 0, 0);
+	printf("akita usbmux: reboot command (PMU + 0x810) %#llx -> %#llx; PSCI %s\n", was, now,
+	    cold ? "SYSTEM_RESET (cold)" : "SYSTEM_RESET2 (warm)");
+	delay_for_interval(500, NSEC_PER_MSEC);         /* for the log to reach the host */
+	if (!cold) {
+		uint64_t r = smc(PSCI_SYSTEM_RESET2, 0, 0, 0);
+
+		printf("akita usbmux: PSCI SYSTEM_RESET2 came back (%lld): a cold SYSTEM_RESET\n", (long long)r);
+	}
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	printf("akita usbmux: PSCI SYSTEM_RESET came back\n");
+}
+
 static struct mux_conn *
 find(uint16_t host_port, uint16_t phone_port)
 {
@@ -204,6 +252,11 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 	errno_t err;
 
 	to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (phone_port == 2 || phone_port == 3 || phone_port == 4) {
+		reboot_now(phone_port != 3, phone_port == 4);
+		send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
+		return;
+	}
 	if (phone_port == 1) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {

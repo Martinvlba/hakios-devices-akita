@@ -331,19 +331,19 @@ akita_usb_send(const void *header, uint32_t header_len, const void *data, uint32
 	return false;
 }
 
-/* the poll thread: the next queued packet onto bulk IN, if it is free */
-static void
+/* the poll thread: the next queued packet onto bulk IN, if it is free; true while there is something to send */
+static bool
 tx_service(void)
 {
 	uint32_t len;
 
 	if (!bulk_on || in_busy) {
-		return;
+		return in_busy;
 	}
 	lck_mtx_lock(txq_lock);
 	if (txq_count == 0) {
 		lck_mtx_unlock(txq_lock);
-		return;
+		return false;
 	}
 	len = txq_len[txq_head];
 	memcpy((void *)(mem + IN_BUF_OFF), txq[txq_head], len);
@@ -351,6 +351,7 @@ tx_service(void)
 	in_busy = true;
 	in_zlp = len % BULK_MPS == 0;           /* a multiple of the packet size ends with an empty packet */
 	start_transfer(BULK_IN, mem_pa + IN_BUF_OFF, len, TRB_NORMAL);
+	return true;
 }
 
 /* a SETUP has come: answer it (data stage started, or the status stage expected) or stall */
@@ -512,10 +513,12 @@ device_event(unsigned type)
 	}
 }
 
-static void
+/* the controller's events, handled; true if there were any */
+static bool
 poll_events(void)
 {
 	uint32_t count = rd(GEVNTCOUNT) & 0xffff;
+	bool any = count >= 4;
 
 	while (count >= 4) {
 		uint32_t e = *(volatile uint32_t *)(mem + EVT_OFF + evt_pos);
@@ -538,6 +541,7 @@ poll_events(void)
 			}
 		}
 	}
+	return any;
 }
 
 static bool
@@ -600,19 +604,43 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 		return;
 	}
 	start_result = 1;
-	for (unsigned tick = 0;; tick++) {
-		poll_events();
-		tx_service();
-		if (tick % 5000 == 0 && tick <= 120000) {      /* every 5 s for two minutes: on the screen with -v */
+	/*
+	 * Polled: while transfers come and go, the controller is looked at again after 20 us (a 16 KB transfer takes about
+	 * 300 us at high speed: the bus stays busy); after 20 ms with nothing, once a millisecond. A millisecond between
+	 * every look held AFC to 6-8 MB/s, one transfer a millisecond.
+	 */
+	uint64_t now, last_busy = 0, next_status = 0, next_summary, busy_window, five_s, ten_min;
+	unsigned statuses = 0;
+
+	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &busy_window);
+	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &five_s);
+	nanoseconds_to_absolutetime(600 * NSEC_PER_SEC, &ten_min);
+	next_summary = mach_absolute_time() + ten_min;
+	for (;;) {
+		bool busy = poll_events();
+
+		busy = tx_service() || busy;
+		now = mach_absolute_time();
+		if (busy) {
+			last_busy = now;
+		}
+		if (now >= next_status && statuses < 24) {      /* every 5 s for two minutes: on the screen with -v */
+			statuses++;
+			next_status = now + five_s;
 			printf("akita usb: DCTL %#x DSTS %#x DCFG %#x: %u events, %u setups, %u bulk OUT, %s\n", rd(DCTL),
 			    rd(DSTS), rd(DCFG), seen_events, seen_setups, seen_bulk_out, bulk_on ? "configured" :
 			    "not configured");
 		}
-		if (tick % 60000 == 0 && tick) {
+		if (now >= next_summary) {                      /* and every ten minutes after */
+			next_summary = now + ten_min;
 			printf("akita usb: %u setups, %u bulk OUT transfers (%u bytes)\n", seen_setups, seen_bulk_out,
 			    bulk_out_bytes);
 		}
-		delay_for_interval(1, NSEC_PER_MSEC);
+		if (now - last_busy < busy_window) {
+			delay(20);
+		} else {
+			delay_for_interval(1, NSEC_PER_MSEC);
+		}
 	}
 }
 
