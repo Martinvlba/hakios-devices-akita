@@ -1,0 +1,6 @@
+# devices/akita/drivers/usb/conf: the Pixel 8a's USB port as a device (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_USB
+	file    bsd/dev/hakios.akita_usb.c
+	help    the Pixel 8a's USB port as an iPhone's: zuma's DWC3 in device mode, polled, enumerating as 05ac:12a8 with
+	help    the usbmux interface (usbmux=1; usb_serial= the serial number, the UDID usbmuxd sees)

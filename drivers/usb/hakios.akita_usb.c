@@ -1,0 +1,553 @@
+/*
+ * The Pixel 8a's USB port as an iPhone's (usbmux=1): zuma's DWC3 (usb@11210000) in device mode, polled, enumerating as
+ * Apple's iPhone (05ac:12a8) with the "Apple Mobile Device" interface a computer's usbmuxd looks for (vendor class
+ * 0xff, subclass 0xfe, protocol 2: two bulk endpoints, the usbmux protocol on them).
+ *
+ * Step 1 of the port's log's USB data work: enumeration and the bulk endpoints. What comes in on bulk OUT is logged (the first
+ * packets) and kept for /dev/hakios-usbmux (step 2: a bridge in user space speaks the mux protocol and joins lockdownd's
+ * port 62078).
+ *
+ * The controller: Google's bootloader drives it for its own fastboot, and U-Boot for its own (xl), so its clocks, the
+ * eUSB2 PHY and the repeater are up when the kernel starts (U-Boot's `eusb init`). Here: the controller stopped and
+ * soft-reset (whatever U-Boot's gadget left), the event buffer, endpoint 0, run. Registers as Linux's drivers/usb/dwc3
+ * (core.h, gadget.h, ep0.c) name them. Polled (the event buffer's interrupt masked) every millisecond from a thread.
+ *
+ * Memory the controller reads and writes (the event buffer, TRBs, buffers): one physically contiguous piece, used through
+ * a non-cacheable mapping of it (ml_io_map_wcomb); its cached mapping is cleaned once first, so that no dirty line of it
+ * is written back over what the controller wrote.
+ */
+#include <kern/clock.h>
+#include <kern/startup.h>
+#include <kern/thread.h>
+#include <kern/thread_call.h>
+#include <libkern/libkern.h>
+#include <mach/mach_types.h>
+#include <pexpert/pexpert.h>
+#include <sys/systm.h>
+#include <vm/vm_kern.h>
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+extern vm_offset_t kvtophys(vm_offset_t va);
+
+#define DWC3_PHYS               0x11210000UL
+#define DWC3_SIZE               0x10000
+
+/* global and device registers */
+#define GCTL                    0xc110
+#define GSNPSID                 0xc120
+#define GUSB2PHYCFG             0xc200
+#define GEVNTADRLO              0xc400
+#define GEVNTADRHI              0xc404
+#define GEVNTSIZ                0xc408
+#define GEVNTCOUNT              0xc40c
+#define DCFG                    0xc700
+#define DCTL                    0xc704
+#define DEVTEN                  0xc708
+#define DSTS                    0xc70c
+#define DALEPENA                0xc720
+#define DEPCMDPAR2(n)           (0xc800 + (n) * 0x10)
+#define DEPCMDPAR1(n)           (0xc804 + (n) * 0x10)
+#define DEPCMDPAR0(n)           (0xc808 + (n) * 0x10)
+#define DEPCMD(n)               (0xc80c + (n) * 0x10)
+
+#define GCTL_PRTCAP_MASK        (3u << 12)
+#define GCTL_PRTCAP_DEVICE      (2u << 12)
+#define GEVNTSIZ_INTMASK        (1u << 31)
+#define DCTL_RUN_STOP           (1u << 31)
+#define DCTL_CSFTRST            (1u << 30)
+#define DSTS_DEVCTRLHLT         (1u << 22)
+#define DSTS_SPEED(s)           ((s) & 7)
+#define DEVTEN_DISCONN          (1u << 0)
+#define DEVTEN_USBRST           (1u << 1)
+#define DEVTEN_CONNDONE         (1u << 2)
+
+#define CMD_SETEPCONFIG         1
+#define CMD_SETTRANSFRESOURCE   2
+#define CMD_SETSTALL            4
+#define CMD_CLEARSTALL          5
+#define CMD_STARTTRANSFER       6
+#define CMD_ENDTRANSFER         8
+#define CMD_DEPSTARTCFG         9
+#define CMD_IOC                 (1u << 8)
+#define CMD_ACT                 (1u << 10)
+#define CMD_FORCERM             (1u << 11)
+#define CMD_PARAM(x)            ((uint32_t)(x) << 16)
+#define CMD_STATUS(c)           (((c) >> 12) & 0xf)
+#define CMD_RESOURCE(c)         (((c) >> 16) & 0x7f)
+
+#define CFG0_TYPE(t)            ((uint32_t)(t) << 1)
+#define CFG0_MPS(m)             ((uint32_t)(m) << 3)
+#define CFG0_FIFO(f)            ((uint32_t)(f) << 17)
+#define CFG0_MODIFY             (2u << 30)
+#define CFG1_XFER_COMPLETE      (1u << 8)
+#define CFG1_XFER_NOT_READY     (1u << 10)
+#define CFG1_EP(n)              ((uint32_t)(n) << 25)
+
+#define TRB_HWO                 (1u << 0)
+#define TRB_LST                 (1u << 1)
+#define TRB_ISP_IMI             (1u << 10)
+#define TRB_IOC                 (1u << 11)
+#define TRB_NORMAL              (1u << 4)
+#define TRB_SETUP               (2u << 4)
+#define TRB_STATUS2             (3u << 4)
+#define TRB_STATUS3             (4u << 4)
+#define TRB_DATA                (5u << 4)
+
+/* physical endpoints: 0 ep0 OUT, 1 ep0 IN, 2 ep1 OUT, 3 ep1 IN */
+#define EP0_OUT                 0
+#define EP0_IN                  1
+#define BULK_OUT                2
+#define BULK_IN                 3
+#define BULK_MPS                512
+#define BULK_BUF                16384
+
+/* the piece of memory the controller uses */
+#define MEM_SIZE                (64 * 1024)
+#define EVT_OFF                 0x0000          /* 4 KiB event buffer */
+#define EVT_SIZE                4096
+#define TRB_OFF                 0x1000          /* a TRB per physical endpoint, 16 bytes each, 64 apart */
+#define SETUP_OFF               0x1400          /* the 8 bytes of a SETUP */
+#define EP0_BUF_OFF             0x1800          /* ep0's data stage, up to 512 bytes */
+#define OUT_BUF_OFF             0x4000
+#define IN_BUF_OFF              0x8000
+
+struct trb {
+	uint32_t bpl, bph, size, ctrl;
+};
+
+static vm_offset_t regs, mem;           /* mem: the non-cacheable mapping */
+static uint64_t mem_pa;
+static uint32_t evt_pos;
+static uint32_t resource[4];
+static bool bulk_on;
+
+/* ep0's state: what the next event of it means */
+enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS, EP0_STATUS } static ep0_state;
+static unsigned ep0_status_ep;          /* the physical endpoint the status stage goes on */
+static uint32_t ep0_status_type;        /* its TRB: two stages (no data) or three */
+static uint8_t pending_address = 0xff;
+
+static uint32_t seen_setups, seen_bulk_out, bulk_out_bytes;
+static char serial[48] = "0000000000000000000000000000000000000000";
+
+static inline uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(regs + off); }
+static inline void wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(regs + off) = v; }
+
+static inline struct trb *
+trb_of(unsigned ep)
+{
+	return (struct trb *)(mem + TRB_OFF + ep * 64);
+}
+
+static uint32_t
+ep_cmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+{
+	__builtin_arm_dsb(0xf);
+	wr(DEPCMDPAR2(ep), p2);
+	wr(DEPCMDPAR1(ep), p1);
+	wr(DEPCMDPAR0(ep), p0);
+	wr(DEPCMD(ep), cmd | CMD_ACT);
+	for (unsigned i = 0; i < 100000; i++) {
+		uint32_t c = rd(DEPCMD(ep));
+
+		if (!(c & CMD_ACT)) {
+			if (CMD_STATUS(c)) {
+				printf("akita usb: endpoint %u command %#x: status %u\n", ep, cmd & 0xf, CMD_STATUS(c));
+			}
+			return c;
+		}
+		delay(1);
+	}
+	printf("akita usb: endpoint %u command %#x did not finish\n", ep, cmd & 0xf);
+	return ~0u;
+}
+
+static void
+start_transfer(unsigned ep, uint64_t buf_pa, uint32_t len, uint32_t type)
+{
+	struct trb *t = trb_of(ep);
+	uint64_t trb_pa = mem_pa + TRB_OFF + ep * 64;
+	uint32_t c;
+
+	t->bpl = (uint32_t)buf_pa;
+	t->bph = (uint32_t)(buf_pa >> 32);
+	t->size = len;
+	t->ctrl = type | TRB_LST | TRB_IOC | TRB_ISP_IMI | TRB_HWO;
+	c = ep_cmd(ep, CMD_STARTTRANSFER, (uint32_t)(trb_pa >> 32), (uint32_t)trb_pa, 0);
+	resource[ep] = CMD_RESOURCE(c);
+}
+
+static void
+ep0_setup_next(void)
+{
+	ep0_state = EP0_SETUP;
+	start_transfer(EP0_OUT, mem_pa + SETUP_OFF, 8, TRB_SETUP);
+}
+
+static void
+ep0_stall(void)
+{
+	ep_cmd(EP0_OUT, CMD_SETSTALL, 0, 0, 0);
+	ep0_setup_next();
+}
+
+static void
+config_ep(unsigned ep, uint32_t type, uint32_t mps, bool modify)
+{
+	uint32_t p0 = CFG0_TYPE(type) | CFG0_MPS(mps) | ((ep & 1) ? CFG0_FIFO(ep >> 1) : 0) | (modify ? CFG0_MODIFY : 0);
+
+	ep_cmd(ep, CMD_SETEPCONFIG, p0, CFG1_XFER_COMPLETE | CFG1_XFER_NOT_READY | CFG1_EP(ep), 0);
+	if (!modify) {
+		ep_cmd(ep, CMD_SETTRANSFRESOURCE, 1, 0, 0);
+	}
+}
+
+/* descriptors */
+static const uint8_t dev_desc[18] = {
+	18, 1, 0x00, 0x02, 0, 0, 0, 64,
+	0xac, 0x05, 0xa8, 0x12,                 /* Apple, iPhone (usbmuxd takes 0x1290..0x12af) */
+	0x01, 0x10,                             /* bcdDevice 0x1001 */
+	1, 2, 3, 1
+};
+static const uint8_t qualifier[10] = { 10, 6, 0x00, 0x02, 0, 0, 0, 64, 1, 0 };
+static const uint8_t cfg_desc[32] = {
+	9, 2, 32, 0, 1, 1, 0, 0xc0, 250,        /* one interface, self-powered, 500 mA */
+	9, 4, 0, 0, 2, 0xff, 0xfe, 2, 4,        /* Apple Mobile Device: usbmux */
+	7, 5, 0x81, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
+	7, 5, 0x01, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
+};
+
+static unsigned
+string_desc(unsigned index, uint8_t *out)
+{
+	static const char *const strings[] = { NULL, "Apple Inc.", "iPhone", serial, "Apple Mobile Device" };
+	const char *s;
+	unsigned n = 2;
+
+	if (index == 0) {
+		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;
+		return 4;
+	}
+	if (index >= sizeof(strings) / sizeof(strings[0])) {
+		return 0;
+	}
+	for (s = strings[index]; *s && n < 254; s++) {
+		out[n++] = (uint8_t)*s;
+		out[n++] = 0;
+	}
+	out[0] = (uint8_t)n;
+	out[1] = 3;
+	return n;
+}
+
+static void
+bulk_start_out(void)
+{
+	start_transfer(BULK_OUT, mem_pa + OUT_BUF_OFF, BULK_BUF, TRB_NORMAL);
+}
+
+static void
+bulk_enable(void)
+{
+	if (bulk_on) {
+		return;
+	}
+	ep_cmd(EP0_OUT, CMD_DEPSTARTCFG | CMD_PARAM(2), 0, 0, 0);
+	config_ep(BULK_OUT, 2, BULK_MPS, false);
+	config_ep(BULK_IN, 2, BULK_MPS, false);
+	wr(DALEPENA, rd(DALEPENA) | (1u << BULK_OUT) | (1u << BULK_IN));
+	bulk_on = true;
+	bulk_start_out();
+	printf("akita usb: configured: the mux interface's bulk endpoints are on\n");
+}
+
+static void
+bulk_disable(void)
+{
+	if (!bulk_on) {
+		return;
+	}
+	ep_cmd(BULK_OUT, CMD_ENDTRANSFER | CMD_FORCERM | CMD_PARAM(resource[BULK_OUT]), 0, 0, 0);
+	wr(DALEPENA, rd(DALEPENA) & ~((1u << BULK_OUT) | (1u << BULK_IN)));
+	bulk_on = false;
+}
+
+/* a SETUP has come: answer it (data stage started, or the status stage expected) or stall */
+static void
+ep0_request(void)
+{
+	const uint8_t *s = (const uint8_t *)(mem + SETUP_OFF);
+	uint8_t *buf = (uint8_t *)(mem + EP0_BUF_OFF);
+	unsigned type = s[0], req = s[1], value = s[2] | s[3] << 8, index = s[4] | s[5] << 8, length = s[6] | s[7] << 8;
+	unsigned n = 0;
+	bool in = (type & 0x80) != 0, ok = true;
+
+	if (seen_setups++ < 40) {
+		printf("akita usb: setup %02x %02x value %#x index %#x length %u\n", type, req, value, index, length);
+	}
+	if ((type & 0x60) != 0) {
+		ok = false;                     /* class or vendor requests: none yet */
+	} else if (req == 6 && in) {            /* GET_DESCRIPTOR */
+		switch (value >> 8) {
+		case 1: memcpy(buf, dev_desc, n = sizeof(dev_desc)); break;
+		case 2: memcpy(buf, cfg_desc, n = sizeof(cfg_desc)); break;
+		case 3: n = string_desc(value & 0xff, buf); ok = n != 0; break;
+		case 6: memcpy(buf, qualifier, n = sizeof(qualifier)); break;
+		default: ok = false;
+		}
+	} else if (req == 5 && !in) {           /* SET_ADDRESS */
+		pending_address = value & 0x7f;
+		wr(DCFG, (rd(DCFG) & ~(0x7fu << 3)) | (pending_address << 3));
+	} else if (req == 9 && !in) {           /* SET_CONFIGURATION */
+		if (value == 1) {
+			bulk_enable();
+		} else {
+			bulk_disable();
+		}
+	} else if (req == 8 && in) {            /* GET_CONFIGURATION */
+		buf[0] = bulk_on ? 1 : 0;
+		n = 1;
+	} else if (req == 0 && in) {            /* GET_STATUS */
+		buf[0] = (type & 0x1f) == 0 ? 1 : 0;    /* the device: self-powered */
+		buf[1] = 0;
+		n = 2;
+	} else if (req == 10 && in) {           /* GET_INTERFACE */
+		buf[0] = 0;
+		n = 1;
+	} else if (req == 11 || req == 1 || req == 3) {   /* SET_INTERFACE 0, CLEAR_FEATURE, SET_FEATURE */
+		;
+	} else {
+		ok = false;
+	}
+	if (!ok) {
+		if (seen_setups < 40) {
+			printf("akita usb: setup %02x %02x: stalled\n", type, req);
+		}
+		ep0_stall();
+		return;
+	}
+	if (length == 0) {
+		ep0_state = EP0_WAIT_STATUS;
+		ep0_status_ep = EP0_IN;         /* two stages: the status goes IN */
+		ep0_status_type = TRB_STATUS2;
+		return;
+	}
+	ep0_status_type = TRB_STATUS3;
+	if (in) {
+		if (n > length) {
+			n = length;
+		}
+		ep0_state = EP0_DATA;
+		start_transfer(EP0_IN, mem_pa + EP0_BUF_OFF, n, TRB_DATA);
+		ep0_status_ep = EP0_OUT;
+	} else {
+		/* OUT data we do not use: taken and dropped */
+		ep0_state = EP0_DATA;
+		start_transfer(EP0_OUT, mem_pa + EP0_BUF_OFF, (length + 63) & ~63u, TRB_DATA);
+		ep0_status_ep = EP0_IN;
+	}
+}
+
+static void
+ep0_event(unsigned ep, unsigned event, unsigned status)
+{
+	if (event == 1) {                       /* XferComplete */
+		switch (ep0_state) {
+		case EP0_SETUP:
+			ep0_request();
+			break;
+		case EP0_DATA:
+			ep0_state = EP0_WAIT_STATUS;
+			break;
+		case EP0_STATUS:
+			ep0_setup_next();
+			break;
+		default:
+			break;
+		}
+	} else if (event == 3 && (status & 3) == 2 && ep0_state == EP0_WAIT_STATUS && ep == ep0_status_ep) {
+		/* XferNotReady, the status stage: the host asks for it now */
+		ep0_state = EP0_STATUS;
+		start_transfer(ep, mem_pa + EP0_BUF_OFF, 0, ep0_status_type);
+	}
+}
+
+static void
+bulk_event(unsigned ep, unsigned event)
+{
+	if (ep == BULK_OUT && event == 1) {
+		struct trb *t = trb_of(BULK_OUT);
+		uint32_t got = BULK_BUF - (t->size & 0xffffff);
+		const uint8_t *d = (const uint8_t *)(mem + OUT_BUF_OFF);
+
+		bulk_out_bytes += got;
+		if (seen_bulk_out++ < 8) {
+			printf("akita usb: bulk OUT %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+			    "%02x %02x %02x %02x\n", got, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10],
+			    d[11], d[12], d[13], d[14], d[15]);
+		}
+		bulk_start_out();
+	}
+}
+
+static void
+device_event(unsigned type)
+{
+	switch (type) {
+	case 0:                                 /* disconnect */
+		printf("akita usb: disconnected\n");
+		bulk_disable();
+		break;
+	case 1:                                 /* USB reset */
+		printf("akita usb: bus reset\n");
+		bulk_disable();
+		wr(DCFG, rd(DCFG) & ~(0x7fu << 3));
+		break;
+	case 2: {                               /* connection done: the speed is known */
+		uint32_t speed = DSTS_SPEED(rd(DSTS));
+
+		printf("akita usb: connected at %s speed\n", speed == 0 ? "high" : speed == 1 || speed == 3 ? "full" :
+		    speed == 4 ? "super" : "some");
+		config_ep(EP0_OUT, 0, 64, true);
+		config_ep(EP0_IN, 0, 64, true);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static void
+poll_events(void)
+{
+	uint32_t count = rd(GEVNTCOUNT) & 0xffff;
+
+	while (count >= 4) {
+		uint32_t e = *(volatile uint32_t *)(mem + EVT_OFF + evt_pos);
+
+		evt_pos = (evt_pos + 4) % EVT_SIZE;
+		count -= 4;
+		wr(GEVNTCOUNT, 4);
+		if (e & 1) {
+			if (((e >> 1) & 0x7f) == 0) {
+				device_event((e >> 8) & 0xf);
+			}
+		} else {
+			unsigned ep = (e >> 1) & 0x1f, event = (e >> 6) & 0xf, status = (e >> 12) & 0xf;
+
+			if (ep <= EP0_IN) {
+				ep0_event(ep, event, status);
+			} else {
+				bulk_event(ep, event);
+			}
+		}
+	}
+}
+
+static bool
+controller_start(void)
+{
+	uint32_t id = rd(GSNPSID);
+
+	printf("akita usb: DWC3 %#x (GSNPSID); DCTL %#x DSTS %#x GCTL %#x GUSB2PHYCFG %#x as found\n", id, rd(DCTL),
+	    rd(DSTS), rd(GCTL), rd(GUSB2PHYCFG));
+	if (id == 0 || id == ~0u) {
+		printf("akita usb: no DWC3 answers (clocks off?): off\n");
+		return false;
+	}
+	/* stop what U-Boot's gadget left running, then the device controller's soft reset */
+	wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
+	for (unsigned i = 0; i < 100000 && !(rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+		delay(1);
+	}
+	wr(DCTL, DCTL_CSFTRST);
+	for (unsigned i = 0; i < 100000 && (rd(DCTL) & DCTL_CSFTRST); i++) {
+		delay(1);
+	}
+	if (rd(DCTL) & DCTL_CSFTRST) {
+		printf("akita usb: the soft reset did not finish\n");
+		return false;
+	}
+	wr(GCTL, (rd(GCTL) & ~GCTL_PRTCAP_MASK) | GCTL_PRTCAP_DEVICE);
+
+	evt_pos = 0;
+	wr(GEVNTADRLO, (uint32_t)(mem_pa + EVT_OFF));
+	wr(GEVNTADRHI, (uint32_t)((mem_pa + EVT_OFF) >> 32));
+	wr(GEVNTSIZ, GEVNTSIZ_INTMASK | EVT_SIZE);
+	wr(GEVNTCOUNT, rd(GEVNTCOUNT) & 0xffff);
+
+	wr(DCFG, rd(DCFG) & ~(0x3ffu));         /* high speed, address 0 */
+	ep_cmd(EP0_OUT, CMD_DEPSTARTCFG, 0, 0, 0);
+	config_ep(EP0_OUT, 0, 64, false);
+	config_ep(EP0_IN, 0, 64, false);
+	wr(DALEPENA, (1u << EP0_OUT) | (1u << EP0_IN));
+	wr(DEVTEN, DEVTEN_DISCONN | DEVTEN_USBRST | DEVTEN_CONNDONE);
+	ep0_setup_next();
+	wr(DCTL, rd(DCTL) | DCTL_RUN_STOP);
+	printf("akita usb: running as Apple iPhone 05ac:12a8, serial %s\n", serial);
+	return true;
+}
+
+static void
+akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	if (!controller_start()) {
+		return;
+	}
+	for (unsigned tick = 0;; tick++) {
+		poll_events();
+		if (tick % 60000 == 0 && tick) {
+			printf("akita usb: %u setups, %u bulk OUT transfers (%u bytes)\n", seen_setups, seen_bulk_out,
+			    bulk_out_bytes);
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+}
+
+static void
+akita_usb_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(akita_usb_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		printf("akita usb: no thread\n");
+	}
+}
+
+__startup_func
+static void
+akita_usb_init(void)
+{
+	uint32_t enabled = 0;
+	uint64_t deadline;
+	vm_offset_t cached = 0;
+	static thread_call_t start;
+
+	if (!PE_parse_boot_argn("usbmux", &enabled, sizeof(enabled)) || !enabled) {
+		return;
+	}
+	PE_parse_boot_argn("usb_serial", serial, sizeof(serial));
+	regs = ml_io_map(DWC3_PHYS, DWC3_SIZE);
+	if (kmem_alloc_contig(kernel_map, &cached, MEM_SIZE, MEM_SIZE - 1, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_PERMANENT,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("akita usb: no memory for the controller; off\n");
+		return;
+	}
+	FlushPoC_DcacheRegion(cached, MEM_SIZE);
+	mem_pa = kvtophys(cached);
+	mem = ml_io_map_wcomb((vm_offset_t)mem_pa, MEM_SIZE);
+	if (!regs || !mem) {
+		printf("akita usb: could not map the controller or its memory; off\n");
+		return;
+	}
+	bzero((void *)mem, MEM_SIZE);
+	/* its own thread once the kernel is up, two seconds from now */
+	start = thread_call_allocate(akita_usb_start, NULL);
+	clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(start, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, akita_usb_init);
