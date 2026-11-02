@@ -3,9 +3,8 @@
  * Apple's iPhone (05ac:12a8) with the "Apple Mobile Device" interface a computer's usbmuxd looks for (vendor class
  * 0xff, subclass 0xfe, protocol 2: two bulk endpoints, the usbmux protocol on them).
  *
- * Step 1 of the port's log's USB data work: enumeration and the bulk endpoints. What comes in on bulk OUT is logged (the first
- * packets) and kept for /dev/hakios-usbmux (step 2: a bridge in user space speaks the mux protocol and joins lockdownd's
- * port 62078).
+ * Enumeration and the bulk endpoints; what comes in on bulk OUT goes to the mux (hakios.akita_usbmux.c), and what it
+ * sends goes out on bulk IN through a queue the poll thread empties, a packet at a time.
  *
  * The controller: Google's bootloader drives it for its own fastboot, and U-Boot for its own (xl), so its clocks, the
  * eUSB2 PHY and the repeater are up when the kernel starts (U-Boot's `eusb init`). Here: the controller stopped and
@@ -17,6 +16,7 @@
  * is written back over what the controller wrote.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/startup.h>
 #include <kern/thread.h>
 #include <kern/thread_call.h>
@@ -122,6 +122,18 @@ static uint64_t mem_pa;
 static uint32_t evt_pos;
 static uint32_t resource[4];
 static bool bulk_on;
+
+/* bulk IN: packets queued by anyone (the mux's connections, the poll thread), sent one at a time by the poll thread */
+#define TXQ                     16
+static uint8_t txq[TXQ][BULK_BUF];
+static uint32_t txq_len[TXQ], txq_head, txq_count;
+static bool in_busy, in_zlp;
+static lck_grp_t *usb_grp;
+static lck_mtx_t *txq_lock;
+
+void akita_usbmux_input(const uint8_t *data, uint32_t len);
+void akita_usbmux_reset(void);
+void akita_usbmux_init(void);
 
 /* ep0's state: what the next event of it means */
 enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS, EP0_STATUS } static ep0_state;
@@ -270,8 +282,72 @@ bulk_disable(void)
 		return;
 	}
 	ep_cmd(BULK_OUT, CMD_ENDTRANSFER | CMD_FORCERM | CMD_PARAM(resource[BULK_OUT]), 0, 0, 0);
+	if (in_busy) {
+		ep_cmd(BULK_IN, CMD_ENDTRANSFER | CMD_FORCERM | CMD_PARAM(resource[BULK_IN]), 0, 0, 0);
+	}
 	wr(DALEPENA, rd(DALEPENA) & ~((1u << BULK_OUT) | (1u << BULK_IN)));
 	bulk_on = false;
+	lck_mtx_lock(txq_lock);
+	in_busy = in_zlp = false;
+	txq_count = 0;
+	lck_mtx_unlock(txq_lock);
+	akita_usbmux_reset();
+}
+
+/* a packet for the host: its header and its data, put together in a slot of the queue (wait: for room, up to 5 s) */
+bool
+akita_usb_send(const void *header, uint32_t header_len, const void *data, uint32_t data_len, bool wait)
+{
+	if (header_len + data_len > BULK_BUF) {
+		return false;
+	}
+	for (unsigned tries = 0; tries < 5000; tries++) {
+		if (!bulk_on) {
+			return false;
+		}
+		lck_mtx_lock(txq_lock);
+		if (txq_count < TXQ) {
+			unsigned slot = (txq_head + txq_count) % TXQ;
+
+			memcpy(txq[slot], header, header_len);
+			if (data_len) {
+				memcpy(txq[slot] + header_len, data, data_len);
+			}
+			txq_len[slot] = header_len + data_len;
+			txq_count++;
+			lck_mtx_unlock(txq_lock);
+			return true;
+		}
+		lck_mtx_unlock(txq_lock);
+		if (!wait) {
+			break;
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	printf("akita usb: bulk IN queue full: a packet dropped\n");
+	return false;
+}
+
+/* the poll thread: the next queued packet onto bulk IN, if it is free */
+static void
+tx_service(void)
+{
+	uint32_t len;
+
+	if (!bulk_on || in_busy) {
+		return;
+	}
+	lck_mtx_lock(txq_lock);
+	if (txq_count == 0) {
+		lck_mtx_unlock(txq_lock);
+		return;
+	}
+	len = txq_len[txq_head];
+	memcpy((void *)(mem + IN_BUF_OFF), txq[txq_head], len);
+	lck_mtx_unlock(txq_lock);
+	in_busy = true;
+	in_zlp = len % BULK_MPS == 0;           /* a multiple of the packet size ends with an empty packet */
+	start_transfer(BULK_IN, mem_pa + IN_BUF_OFF, len, TRB_NORMAL);
 }
 
 /* a SETUP has come: answer it (data stage started, or the status stage expected) or stall */
@@ -388,7 +464,21 @@ bulk_event(unsigned ep, unsigned event)
 			    "%02x %02x %02x %02x\n", got, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10],
 			    d[11], d[12], d[13], d[14], d[15]);
 		}
+		akita_usbmux_input(d, got);
 		bulk_start_out();
+	} else if (ep == BULK_IN && event == 1) {
+		if (in_zlp) {
+			in_zlp = false;
+			start_transfer(BULK_IN, mem_pa + IN_BUF_OFF, 0, TRB_NORMAL);
+			return;
+		}
+		lck_mtx_lock(txq_lock);
+		if (txq_count) {
+			txq_head = (txq_head + 1) % TXQ;
+			txq_count--;
+		}
+		in_busy = false;
+		lck_mtx_unlock(txq_lock);
 	}
 }
 
@@ -493,11 +583,15 @@ controller_start(void)
 static void
 akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 {
+	usb_grp = lck_grp_alloc_init("akita usb", LCK_GRP_ATTR_NULL);
+	txq_lock = lck_mtx_alloc_init(usb_grp, LCK_ATTR_NULL);
+	akita_usbmux_init();
 	if (!controller_start()) {
 		return;
 	}
 	for (unsigned tick = 0;; tick++) {
 		poll_events();
+		tx_service();
 		if (tick % 60000 == 0 && tick) {
 			printf("akita usb: %u setups, %u bulk OUT transfers (%u bytes)\n", seen_setups, seen_bulk_out,
 			    bulk_out_bytes);
