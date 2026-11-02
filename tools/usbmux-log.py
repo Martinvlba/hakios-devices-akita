@@ -3,7 +3,8 @@
 port 1, where the kernel's usbmux (drivers/usb/hakios.akita_usbmux.c) serves its message buffer -- all of it, then
 what is added, until this stops.
 
-usage: usbmux-log.py [OUTPUT]      (stdout, or OUTPUT as well; needs usbmuxd running, and access to its socket)
+usage: usbmux-log.py [-k] [OUTPUT]      (stdout, or OUTPUT as well; needs usbmuxd running, and access to its socket)
+       -k: the kernel message buffer (port 5: printf and IOLog, which without -v are not on the console)
 """
 import plistlib
 import socket
@@ -35,8 +36,11 @@ def mux_connect(port):
     return s
 
 
-out = open(sys.argv[1], 'ab') if len(sys.argv) > 1 else None
-s = mux_connect(1)
+args = sys.argv[1:]
+port = 5 if args[:1] == ['-k'] else 1
+args = args[1:] if port == 5 else args
+out = open(args[0], 'ab') if args else None
+s = mux_connect(port)
 try:
     while data := s.recv(65536):
         sys.stdout.buffer.write(data)

@@ -5,3 +5,14 @@ driver AKITA_BATTERY
 	requires BATTERY
 	help    the Pixel 8a's battery and charger state: the MAX77759's fuel gauge and charger over zuma's hsi2c@10cb0000,
 	help    polled every 5 s and given to HakiosBattery, Darwin's power source (fuelgauge=1); read only
+
+driver AKITA_ACPM
+	file    bsd/dev/hakios.akita_acpm.c
+	help    Google's ACPM (the power firmware on zuma's APM) as a client: requests over its IPC, polled; for the thermal
+	help    sensors, and the PMIC and the processors' clocks to come
+
+driver AKITA_THERMAL
+	file    bsd/dev/hakios.akita_thermal.c
+	requires AKITA_ACPM
+	help    the Pixel 8a's SoC temperatures (BIG, MID, LITTLE, G3D, ISP, TPU, AUR) through ACPM every 2 s: kern.hakios.thermal_*,
+	help    and the phone powered off at thermal_stop= degrees (100) three readings in a row (thermal=1); THERMAL's sysctls, for zuma

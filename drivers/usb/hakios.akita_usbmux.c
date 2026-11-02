@@ -231,6 +231,79 @@ reboot_now(bool bootloader, bool cold)
 	printf("akita usbmux: PSCI SYSTEM_RESET came back\n");
 }
 
+/* bsd/sys/msgbuf.h's (as osfmk/arm64/loader_return.c has it): the kernel message buffer, dmesg's */
+struct msgbuf {
+	int msg_magic, msg_size, msg_bufx, msg_bufr;
+	char *msg_bufc;
+};
+extern struct msgbuf *msgbufp;
+
+/* bytes [from, to) of the message buffer (wrapping) to the host; false when they cannot go */
+static bool
+dmesg_send(struct mux_conn *c, struct msgbuf *mb, int from, int to, char *chunk)
+{
+	while (from != to && c->open) {
+		uint32_t n = 0, seq;
+
+		while (from != to && n < MAX_DATA) {
+			if (mb->msg_bufc[from]) {
+				chunk[n++] = mb->msg_bufc[from];
+			}
+			from = (from + 1) % mb->msg_size;
+		}
+		if (n == 0) {
+			continue;
+		}
+		lck_mtx_lock(mux_lock);
+		seq = c->tx_seq;
+		c->tx_seq += n;
+		lck_mtx_unlock(mux_lock);
+		if (!send_tcp(c, TH_ACK, seq, c->rx_next, chunk, n, true)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * Port 5: the kernel message buffer (what dmesg shows: every printf and IOLog, which without -v go there and not to the
+ * console), what it holds and then what is added, until the host goes. Port 1 is the console (processes' output).
+ */
+static void
+dmesg_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+	static char chunk[MAX_DATA];
+	struct msgbuf *mb = msgbufp;
+	int pos;
+
+	if (mb == NULL || mb->msg_bufc == NULL || mb->msg_size <= 0 || mb->msg_bufx < 0 || mb->msg_bufx >= mb->msg_size) {
+		goto out;
+	}
+	pos = mb->msg_bufx;
+	if ((mb->msg_bufc[mb->msg_size - 1] != 0 && !dmesg_send(c, mb, pos, 0, chunk)) || !dmesg_send(c, mb, 0, pos, chunk)) {
+		goto out;
+	}
+	while (c->open) {
+		int end = mb->msg_bufx;
+
+		if (end >= 0 && end < mb->msg_size && end != pos) {
+			if (!dmesg_send(c, mb, pos, end, chunk)) {
+				break;
+			}
+			pos = end;
+		}
+		delay_for_interval(200, NSEC_PER_MSEC);
+	}
+out:
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_RST, c->tx_seq, c->rx_next, NULL, 0, false);
+	}
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
 static struct mux_conn *
 find(uint16_t host_port, uint16_t phone_port)
 {
@@ -257,7 +330,7 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 		return;
 	}
-	if (phone_port == 1) {
+	if (phone_port == 1 || phone_port == 5) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {
 			if (!conns[i].used) {
@@ -275,9 +348,9 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 			send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 			return;
 		}
-		printf("akita usbmux: host port %u: the kernel's log\n", host_port);
+		printf("akita usbmux: host port %u: the %s\n", host_port, phone_port == 1 ? "console log" : "kernel message buffer");
 		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
-		if (kernel_thread_start(klog_thread, c, &thread) == KERN_SUCCESS) {
+		if (kernel_thread_start(phone_port == 1 ? klog_thread : dmesg_thread, c, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}
 		return;
