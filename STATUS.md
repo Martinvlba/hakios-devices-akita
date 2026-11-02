@@ -15,7 +15,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 
 | Part | State | Notes |
 |---|---|---|
-| Boot (U-Boot → loader → XNU) | ✅ | installed in boot_b (slot b = iOS, slot a = Android), or `fastboot boot` of a RAM image |
+| Boot (U-Boot → loader → XNU) | ✅ | installed in boot_b (slot b = iOS, slot a = Android), or `fastboot boot` of a RAM image; iOS's Shut Down powers off, Restart restarts |
 | iOS user space | ✅ | Darwin 16.5: launchd, backboardd, SpringBoard to the home screen; apps open |
 | Display | 🟡 | the bootloader's framebuffer, drawn in software: ~10 frames a second |
 | Touch | ✅ | taps, swipes, the app switcher |
@@ -81,8 +81,6 @@ charge, though slowly from a computer's port while the screen is on and nothing 
 **Modem, Wi-Fi, Bluetooth, camera.** Not started.
 
 ## Known oddities
-
-- Shut Down or Restart from iOS never completes: the spinner stays (the port's log 4). Use Power + Volume Down to leave.
 
 - A second kernel run in one loader session dies at once: restart the phone between runs (`./xl reboot`), as on the
   reference phone.
