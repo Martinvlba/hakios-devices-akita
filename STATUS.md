@@ -1,7 +1,7 @@
 # Pixel 8a (akita): what works
 
 HakiOS on the Google Pixel 8a (Tensor G3, "zuma"): XNU and the Darwin 16.5 (iOS) user space, started from RAM over
-USB. Nothing is flashed; a restart gives the phone back to Android. Last updated 2026-11-01.
+USB. Nothing is flashed; a restart gives the phone back to Android. Last updated 2026-11-02.
 
 How to run it: `the port's log`. What is next and how: `the port's log`. What was done when: `the port's log`.
 
@@ -26,7 +26,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | Clock (time of day) | 🟡 | correct, but set from the computer at each run (`xl`), not read from the phone |
 | Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (71 GB; iPhone Storage shows 80 GB) |
 | GPU (Mali-G715) | ❌ | software drawing only |
-| Battery / charging info | ❌ | the battery icon is empty; the phone does not charge while in HakiOS |
+| Battery / charging info | ✅ | level, charging or not, in the status bar (`fuelgauge=1`: the MAX77759 read over I2C); the phone charges in iOS (63 → 64 % seen) |
 | Audio | ❌ | behind Google's AoC (always-on processor) |
 | Wi-Fi / Bluetooth | ❌ | Broadcom on PCIe |
 | Modem / cellular | ❌ | Samsung's modem: last on the list |
@@ -59,7 +59,7 @@ No frequency or voltage control: that is ACPM's job (Google's power firmware), a
 (U-Boot has one, `acpm`).
 
 **USB.** The development link only: `xl` (enter, run, ramdisk, screenshot, log, reboot) from Windows/WSL with usbipd.
-No USB for iOS itself (no data, no charging).
+No USB data for iOS itself (charging works: the charger runs on its own).
 
 **Storage (UFS).** iOS is installed on the flash: a 77 GiB `darwin` partition (taken from userdata; Android keeps
 32 GiB) holds the root volume and cryptexes, and Darwin boots from it with `/private/var` kept on the flash between starts
@@ -67,7 +67,12 @@ No USB for iOS itself (no data, no charging).
 
 **GPU.** Mali-G715 with its CSF firmware: the largest single job.
 
-**Battery, audio.** Both go through Google's AoC and power firmware, not plain registers.
+**Battery.** The MAX77759's fuel gauge (0x36) and charger (0x69) on zuma's hsi2c@10cb0000, read every 5 s by
+`drivers/power/hakios.akita_battery.c` and given to Darwin's power source (HakiosBattery): the status bar's level and
+bolt, "Charging" on the lock screen. Read only: the charger runs as the bootloader left it (charging on), and it does
+charge, though slowly from a computer's port while the screen is on and nothing throttles.
+
+**Audio.** Through Google's AoC firmware, not plain registers.
 
 **Modem, Wi-Fi, Bluetooth, camera.** Not started.
 
@@ -78,4 +83,5 @@ No USB for iOS itself (no data, no charging).
 - A second kernel run in one loader session dies at once: restart the phone between runs (`./xl reboot`), as on the
   reference phone.
 - `-v` puts the kernel's text over the iOS screen; leave it off for clean screenshots.
-- The phone does not charge while in the loader or in HakiOS: send it back to Android between sessions.
+- On a computer's USB port the phone charges in iOS only slowly; left on overnight with the screen on, the battery once
+  ran flat. Keep it in Android between sessions, or on a wall charger.

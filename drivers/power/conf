@@ -1,0 +1,7 @@
+# devices/akita/drivers/power/conf: the Pixel 8a's own power drivers (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_BATTERY
+	file    bsd/dev/hakios.akita_battery.c
+	requires BATTERY
+	help    the Pixel 8a's battery and charger state: the MAX77759's fuel gauge and charger over zuma's hsi2c@10cb0000,
+	help    polled every 5 s and given to HakiosBattery, Darwin's power source (fuelgauge=1); read only
