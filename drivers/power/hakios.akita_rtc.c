@@ -12,8 +12,15 @@
  * (a bit), 0x0a day, 0x0b month (1-12), 0x0c year since 2000, all binary. The time registers are a buffer: they held the
  * time last written until the running time was latched into them by RUDR (UPDATE bit 0), which is done before each
  * read. UTC: Android keeps it so (hwclock -u).
+ *
+ * Written back when the time is set (GenericARMPE's setGMTTimeOfDay -> hakios_rtc_set: settimeofday, Settings, network
+ * time, idevicedate), from a thread call so that the caller does not wait on ACPM: the seven registers, then the write
+ * update bit in UPDATE, which the PMIC clears once it has taken them (Linux's rtc-s5m.c). Which bit that is differs in
+ * the family (bit 1 as on the S2MPS15, bit 4 as on the older S2MPS): bit 1 is tried, the running time read back, and
+ * bit 4 tried if it did not take; the one that worked is kept.
  */
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <sys/systm.h>
@@ -23,6 +30,7 @@ extern int akita_acpm_xfer(unsigned channel, uint32_t cmd[4]);
 #define PMIC_CHANNEL            2
 #define RTC_TYPE                2
 #define PMIC_READ               0
+#define PMIC_WRITE              1
 #define PMIC_UPDATE             2
 #define RTC_UPDATE              0x01
 #define RTC_RUDR                0x01
@@ -87,4 +95,104 @@ hakios_rtc_epoch(void)
 	}
 	printf("akita rtc: %04u-%02u-%02u %02u:%02u:%02u UTC from the PMIC's clock\n", year, mon, day, hour, min, sec);
 	return (uint64_t)(days_from_civil(year, mon, day) * 86400 + hour * 3600 + min * 60 + sec);
+}
+
+/* the date of a time in seconds since 1970 (UTC): the reverse of days_from_civil */
+static void
+civil_from_days(int64_t z, unsigned *y, unsigned *m, unsigned *d)
+{
+	z += 719468;
+	int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+	unsigned doe = (unsigned)(z - era * 146097);
+	unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	unsigned mp = (5 * doy + 2) / 153;
+
+	*d = doy - (153 * mp + 2) / 5 + 1;
+	*m = mp < 10 ? mp + 3 : mp - 9;
+	*y = (unsigned)(yoe + era * 400 + (*m <= 2));
+}
+
+static uint64_t pending_epoch;
+static unsigned write_bit;              /* 0 until a write has been seen to take */
+static thread_call_t write_call;
+
+static bool
+rtc_write_with(uint64_t epoch, unsigned bit)
+{
+	int64_t days = (int64_t)(epoch / 86400);
+	unsigned rest = (unsigned)(epoch % 86400), y, m, d;
+	uint8_t t[7];
+
+	civil_from_days(days, &y, &m, &d);
+	t[0] = (uint8_t)(rest % 60);
+	t[1] = (uint8_t)(rest / 60 % 60);
+	t[2] = (uint8_t)(rest / 3600) | 0x40;                   /* 24-hour mode's flag, as the RTC keeps it */
+	t[3] = (uint8_t)(1u << ((days + 4) % 7));               /* the weekday, a bit: 1970-01-01 was a Thursday */
+	t[4] = (uint8_t)d;
+	t[5] = (uint8_t)m;
+	t[6] = (uint8_t)(y - 2000);
+	for (unsigned i = 0; i < 7; i++) {
+		if (!rtc_access(PMIC_WRITE, RTC_SEC + i, t[i], 0xff, NULL)) {
+			return false;
+		}
+	}
+	if (!rtc_access(PMIC_UPDATE, RTC_UPDATE, bit, bit, NULL)) {
+		return false;
+	}
+	for (unsigned waited = 0; waited < 100; waited++) {     /* the PMIC clears the bit when it has the time */
+		uint8_t u;
+
+		if (rtc_access(PMIC_READ, RTC_UPDATE, 0, 0, &u) && !(u & bit)) {
+			break;
+		}
+		delay(1000);
+	}
+	return true;
+}
+
+static void
+rtc_write(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t epoch = pending_epoch, now;
+	const unsigned bits[2] = { 0x02, 0x10 };
+
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned bit = write_bit ? write_bit : bits[i];
+
+		if (!rtc_write_with(epoch, bit)) {
+			printf("akita rtc: writing the time failed (ACPM)\n");
+			return;
+		}
+		now = hakios_rtc_epoch();
+		if (now >= epoch && now <= epoch + 5) {
+			if (!write_bit) {
+				printf("akita rtc: the time is written back to the PMIC's clock (write update bit %#x)\n", bit);
+			}
+			write_bit = bit;
+			return;
+		}
+		if (write_bit) {
+			break;
+		}
+	}
+	printf("akita rtc: the PMIC's clock did not take the time written (it reads %llu, %llu written)\n", now, epoch);
+}
+
+/* the time of day was set: the RTC follows, soon, from a thread call */
+void hakios_rtc_set(uint64_t epoch);
+
+void
+hakios_rtc_set(uint64_t epoch)
+{
+	if (epoch < 1577836800ULL) {                            /* before 2020: not a time to keep */
+		return;
+	}
+	pending_epoch = epoch;
+	if (write_call == NULL) {
+		write_call = thread_call_allocate(rtc_write, NULL);
+	}
+	if (write_call != NULL) {
+		thread_call_enter(write_call);
+	}
 }

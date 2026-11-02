@@ -23,7 +23,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | CPU | ✅ | all 9 cores (`cpus=9`: 4 A510, 4 A715, the X3); clocks set by a governor through ACPM (`dvfs=1`), held down when hot (the X3 from 75 C) |
 | USB | ✅ | as an iPhone's in iOS (`usbmux=1`): pairs with a computer (Trust This Computer?), ideviceinfo, idevicesyslog, files over AFC (~7 MB/s); and the development link (`xl`) under the loader |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
-| Clock (time of day) | ✅ | read from the PMIC's real-time clock at each start (through ACPM): within 2 s of the computer's; not written back yet when iOS changes the time |
+| Clock (time of day) | ✅ | the PMIC's real-time clock (through ACPM): read at each start, written back when iOS sets the time; within 1-2 s of the computer's |
 | Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (71 GB; iPhone Storage shows 80 GB) |
 | GPU (Mali-G715) | ❌ | software drawing only |
 | Battery / charging info | ✅ | level, charging or not, in the status bar (`fuelgauge=1`: the MAX77759 read over I2C); the phone charges in iOS (63 → 64 % seen) |
