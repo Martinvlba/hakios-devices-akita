@@ -16,3 +16,9 @@ driver AKITA_THERMAL
 	requires AKITA_ACPM
 	help    the Pixel 8a's SoC temperatures (BIG, MID, LITTLE, G3D, ISP, TPU, AUR) through ACPM every 2 s: kern.hakios.thermal_*,
 	help    and the phone powered off at thermal_stop= degrees (100) three readings in a row (thermal=1); THERMAL's sysctls, for zuma
+
+driver AKITA_DVFS
+	file    bsd/dev/hakios.akita_dvfs.c
+	requires AKITA_ACPM AKITA_THERMAL
+	help    the Pixel 8a's CPU clusters' clocks through ACPM: a governor every 100 ms (the busiest core's share), held
+	help    down from 90 C (dvfs=1; kern.hakios.dvfs_mhz)

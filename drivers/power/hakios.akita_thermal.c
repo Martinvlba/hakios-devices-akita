@@ -56,6 +56,15 @@ SYSCTL_STRING(_kern_hakios, OID_AUTO, thermal_sensors, CTLFLAG_RD | CTLFLAG_LOCK
 SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_reads_value, 0,
     "how many times the sensors were read");
 
+/* for the processors' clocks (hakios.akita_dvfs.c): the hottest sensor in degrees, or -273 before the first reading */
+int akita_thermal_hottest_c(void);
+
+int
+akita_thermal_hottest_c(void)
+{
+	return thermal_max_mc / 1000;
+}
+
 static uint64_t
 smc(uint64_t function)
 {
