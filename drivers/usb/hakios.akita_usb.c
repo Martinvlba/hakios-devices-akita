@@ -259,6 +259,11 @@ static const uint8_t dev_desc[18] = {
 	1, 2, 3, 1
 };
 static const uint8_t qualifier[10] = { 10, 6, 0x00, 0x02, 0, 0, 0, 64, 1, 0 };
+/*
+ * The BOS: a header and a USB 2.0 Extension with nothing in it (no link power management). Windows' Apple driver asks for
+ * it after the charging request (GET_DESCRIPTOR 0x0f00) and, refused, sent nothing more: the device was given up.
+ */
+static const uint8_t bos_desc[12] = { 5, 0x0f, 12, 0, 1, 7, 0x10, 0x02, 0, 0, 0, 0 };
 static const uint8_t cfg_desc[62] = {
 	9, 2, 62, 0, 2, 1, 0, 0xc0, 250,        /* two interfaces, self-powered, 500 mA */
 	9, 4, 0, 0, 3, 0x06, 0x01, 0x01, 5,     /* PTP (Still Image Capture), as an iPhone's interface 0: the photos */
@@ -466,7 +471,7 @@ ep0_request(void)
 	unsigned n = 0;
 	bool in = (type & 0x80) != 0, ok = true;
 
-	if (seen_setups++ < 40) {
+	if (seen_setups++ < 300) {
 		printf("akita usb: setup %02x %02x value %#x index %#x length %u\n", type, req, value, index, length);
 	}
 	if (type == 0x40 && req == 0x40 && length == 0) {
@@ -488,6 +493,7 @@ ep0_request(void)
 		case 2: memcpy(buf, cfg_desc, n = sizeof(cfg_desc)); break;
 		case 3: n = string_desc(value & 0xff, buf); ok = n != 0; break;
 		case 6: memcpy(buf, qualifier, n = sizeof(qualifier)); break;
+		case 15: memcpy(buf, bos_desc, n = sizeof(bos_desc)); break;
 		default: ok = false;
 		}
 	} else if (req == 5 && !in) {           /* SET_ADDRESS */
@@ -515,7 +521,7 @@ ep0_request(void)
 		ok = false;
 	}
 	if (!ok) {
-		if (seen_setups < 40) {
+		if (seen_setups < 300) {
 			printf("akita usb: setup %02x %02x: stalled\n", type, req);
 		}
 		ep0_stall();
@@ -765,6 +771,21 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 			next_summary = now + ten_min;
 			printf("akita usb: %u setups, %u bulk OUT transfers (%u bytes)\n", seen_setups, seen_bulk_out,
 			    bulk_out_bytes);
+		}
+		/* a trace of what a host does, for a host the USB link does not survive: usb_trace_panic=SECONDS after the start,
+		 * a panic on purpose, and the whole log in pstore (the loader's way out of a panic) */
+		{
+			static uint32_t trace_s = ~0u;
+			static uint64_t trace_at;
+
+			if (trace_s == ~0u) {
+				trace_s = 0;
+				PE_parse_boot_argn("usb_trace_panic", &trace_s, sizeof(trace_s));
+				nanoseconds_to_absolutetime((uint64_t)trace_s * NSEC_PER_SEC, &trace_at);
+			}
+			if (trace_s && now >= trace_at) {
+				panic("akita usb: usb_trace_panic=%u: the trace's time is up (%u setups seen)", trace_s, seen_setups);
+			}
 		}
 		if (now - last_busy < busy_window) {
 			delay(20);
