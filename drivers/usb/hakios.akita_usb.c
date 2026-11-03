@@ -469,8 +469,19 @@ ep0_request(void)
 	if (seen_setups++ < 40) {
 		printf("akita usb: setup %02x %02x value %#x index %#x length %u\n", type, req, value, index, length);
 	}
-	if ((type & 0x60) != 0) {
-		ok = false;                     /* class or vendor requests: none yet */
+	if (type == 0x40 && req == 0x40 && length == 0) {
+		/*
+		 * Apple's vendor request for the charging current (Windows' Apple driver and Linux's apple-mfi-fastcharge send
+		 * it; wValue the current asked for). An iPhone takes it; refused, Windows' driver asked it again twice a second
+		 * and went no further: no phone in Explorer, no Trust prompt. Taken, and the charger left as it is.
+		 */
+		static unsigned said;
+
+		if (said++ < 3) {
+			printf("akita usb: the host's charging request (vendor 0x40, value %#x): taken\n", value);
+		}
+	} else if ((type & 0x60) != 0) {
+		ok = false;                     /* class or other vendor requests: none yet */
 	} else if (req == 6 && in) {            /* GET_DESCRIPTOR */
 		switch (value >> 8) {
 		case 1: memcpy(buf, dev_desc, n = sizeof(dev_desc)); break;
