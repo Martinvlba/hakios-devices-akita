@@ -1,0 +1,6 @@
+# devices/akita/drivers/gpu/conf: the Pixel 8a's GPU (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_MALI
+	file    bsd/dev/hakios.akita_mali.c
+	help    zuma's Mali-G715 woken step by step (mali=N): its identity, a reset, the L2's power, the CSF firmware
+	help    (fw/mali_csffw-r54p2.bin, the phone's own, from fw-gpu/) loaded behind page tables, and the MCU started

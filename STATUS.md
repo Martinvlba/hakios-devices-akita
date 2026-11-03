@@ -25,7 +25,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | ✅ | the PMIC's real-time clock (through ACPM): read at each start, written back when iOS sets the time; within 1-2 s of the computer's |
 | Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (71 GB; iPhone Storage shows 80 GB) |
-| GPU (Mali-G715) | ❌ | software drawing only |
+| GPU (Mali-G715) | 🟡 | its firmware runs (mali=5: MCU started, global interface 2.8.0); nothing drawn by it yet: software drawing |
 | Battery / charging info | ✅ | level, charging or not, in the status bar (`fuelgauge=1`: the MAX77759 read over I2C); the charger's type and watts (USB-C 1.5/3 A, a computer's port) from the TCPC; the phone charges in iOS |
 | Audio | ❌ | behind Google's AoC (always-on processor) |
 | Wi-Fi / Bluetooth | ❌ | Broadcom on PCIe |
