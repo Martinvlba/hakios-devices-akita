@@ -16,7 +16,11 @@
  *   4  writes  the firmware's sections into memory of ours, with page tables for them, and address space 0 (the
  *              MCU's) pointed at those tables
  *   5  writes  the MCU started; its state, the firmware's first words in the shared interface (GLB_VERSION ...), and
- *              any fault, are read; then the MCU is stopped again and the GPU reset: nothing outlives the run
+ *              any fault, are read
+ *   6  talks   to the firmware's global interface: a ping, the shader cores allowed
+ *   7  writes  a command stream group (slot 0) with one queue, in address space 1 (the same tables), started
+ *   8  runs    the first job: four command-stream instructions storing two words into a page of ours, checked
+ * After the last step the MCU is stopped again and the GPU reset: nothing outlives the run.
  *
  * What the hardware is, and where each value comes from: Google's Android kernel for this phone (google-modules/gpu,
  * android-gs-akita-android16: kbase r54p2; google-modules/soc/gs: the PMU's sequences), read for how the hardware
@@ -211,9 +215,10 @@ static void
 faults(const char *when)
 {
 	printf("mali: %u: %s: GPU_STATUS 0x%x, GPU_IRQ_RAWSTAT 0x%x, GPU_FAULTSTATUS 0x%x at 0x%llx, MMU_IRQ_RAWSTAT 0x%x, "
-	    "AS0 status 0x%x, fault 0x%x at 0x%llx, JOB_IRQ_RAWSTAT 0x%x, MCU_STATUS 0x%x\n", step, when, rd(GPU_STATUS),
-	    rd(GPU_IRQ_RAWSTAT), rd(GPU_FAULTSTATUS), rd64(GPU_FAULTADDRESS), rd(MMU_IRQ_RAWSTAT), rd(AS0 + AS_STATUS),
-	    rd(AS0 + AS_FAULTSTATUS), rd64(AS0 + AS_FAULTADDRESS), rd(JOB_IRQ_RAWSTAT), rd(MCU_STATUS));
+	    "AS0 status 0x%x, fault 0x%x at 0x%llx, AS1 fault 0x%x at 0x%llx, JOB_IRQ_RAWSTAT 0x%x, MCU_STATUS 0x%x\n", step,
+	    when, rd(GPU_STATUS), rd(GPU_IRQ_RAWSTAT), rd(GPU_FAULTSTATUS), rd64(GPU_FAULTADDRESS), rd(MMU_IRQ_RAWSTAT),
+	    rd(AS0 + AS_STATUS), rd(AS0 + AS_FAULTSTATUS), rd64(AS0 + AS_FAULTADDRESS), rd(AS0 + 0x40 + AS_FAULTSTATUS),
+	    rd64(AS0 + 0x40 + AS_FAULTADDRESS), rd(JOB_IRQ_RAWSTAT), rd(MCU_STATUS));
 }
 
 /* ---- memory for the GPU: allocated in the kernel's pages (16 KiB), handed to the GPU in its own (4 KiB) ---- */
@@ -308,6 +313,232 @@ clean_tables(void)
 
 static vm_offset_t shared_iface;        /* the kernel's address of the firmware's shared interface, 0x04000000 */
 static unsigned int section_count;
+/* every region mapped for the GPU: its GPU address, size and where the kernel sees it (the MCU's addresses in the
+ * firmware's interface blocks are looked up here) */
+static struct { uint64_t va; vm_size_t size; vm_offset_t kva; } regions[16];
+static unsigned int region_count;
+
+static void
+remember(uint64_t va, vm_size_t size, vm_offset_t kva)
+{
+	if (region_count < 16) {
+		regions[region_count].va = va;
+		regions[region_count].size = size;
+		regions[region_count].kva = kva;
+		region_count++;
+	}
+}
+
+static void *
+kernel_address(uint64_t va)
+{
+	for (unsigned int i = 0; i < region_count; i++) {
+		if (va >= regions[i].va && va - regions[i].va < regions[i].size) {
+			return (void *)(regions[i].kva + (va - regions[i].va));
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The firmware's interface (steps 6 to 8), as Arm's CSF defines it and Google's driver uses it: blocks in memory the
+ * MCU and we share -- the global control block at 0x04000000 names its input (ours to write) and output (the
+ * firmware's) blocks and the groups'; a request is a bit of an input word toggled against the same bit of the output
+ * word, followed by a doorbell, and done when the firmware has toggled the output bit to match.
+ */
+#define DOORBELL_PHYS           (GPU_PHYS + 0x80000)    /* doorbell n at + n * 0x10000; 0 is the kernel's */
+#define USER_DOORBELL           1
+/* global control */
+#define GLB_VERSION_W           0
+#define GLB_INPUT_VA_W          2
+#define GLB_OUTPUT_VA_W         3
+#define GLB_GROUP_NUM_W         4
+#define GLB_GROUP_STRIDE_W      5
+#define GROUP_CONTROL_0         0x1000
+/* global input / output */
+#define GLB_REQ                 0x00
+#define GLB_ACK_IRQ_MASK        0x04
+#define GLB_DB_REQ              0x08
+#define GLB_ALLOC_EN_LO         0x18
+#define GLB_ALLOC_EN_HI         0x1c
+#define GLB_ACK                 0x00
+#define GLB_DB_ACK              0x08
+#define GLB_FATAL_STATUS        0x10
+#define GLB_REQ_CFG_ALLOC_EN    (1u << 2)
+#define GLB_REQ_PING            (1u << 8)
+/* group control, input, output */
+#define GROUP_FEATURES          0x00
+#define GROUP_INPUT_VA          0x04
+#define GROUP_OUTPUT_VA         0x08
+#define GROUP_SUSPEND_SIZE      0x0c
+#define GROUP_STREAM_NUM        0x14
+#define GROUP_STREAM_STRIDE     0x18
+#define STREAM_CONTROL_0        0x40
+#define CSG_REQ                 0x00
+#define CSG_ACK_IRQ_MASK        0x04
+#define CSG_DB_REQ              0x08
+#define CSG_ALLOW_COMPUTE_LO    0x20
+#define CSG_ALLOW_COMPUTE_HI    0x24
+#define CSG_ALLOW_FRAGMENT_LO   0x28
+#define CSG_ALLOW_FRAGMENT_HI   0x2c
+#define CSG_ALLOW_OTHER         0x30
+#define CSG_EP_REQ_LO           0x34
+#define CSG_EP_REQ_HI           0x38
+#define CSG_SUSPEND_BUF_LO      0x40
+#define CSG_SUSPEND_BUF_HI      0x44
+#define CSG_CONFIG              0x50
+#define CSG_ACK                 0x00
+#define CSG_DB_ACK              0x08
+#define CSG_STATE_START         1
+/* stream control, input, output */
+#define STREAM_FEATURES         0x00
+#define STREAM_INPUT_VA         0x04
+#define STREAM_OUTPUT_VA        0x08
+#define CS_REQ                  0x00
+#define CS_CONFIG               0x04
+#define CS_ACK_IRQ_MASK         0x0c
+#define CS_BASE_LO              0x10
+#define CS_BASE_HI              0x14
+#define CS_SIZE                 0x18
+#define CS_USER_INPUT_LO        0x30
+#define CS_USER_INPUT_HI        0x34
+#define CS_USER_OUTPUT_LO       0x38
+#define CS_USER_OUTPUT_HI       0x3c
+#define CS_ACK                  0x00
+#define CS_STATUS_CMD_PTR_LO    0x40
+#define CS_STATUS_WAIT          0x48
+#define CS_STATUS_BLOCKED       0x60
+#define CS_FAULT                0x80
+#define CS_FATAL                0x84
+#define CS_STATE_START          1
+#define CS_REQ_IDLE_BITS        ((1u << 8) | (1u << 10) | (1u << 12))
+/* the queue's user pages: input (CS_INSERT, CS_EXTRACT_INIT), output (CS_EXTRACT, CS_ACTIVE) */
+#define CS_INSERT               0x00
+#define CS_EXTRACT              0x00
+#define CS_ACTIVE               0x08
+/*
+ * Our own region of the GPU's address space, above the firmware's sections and within the MCU's: it is a 32-bit
+ * processor, and the queue's user pages, the suspend buffer and the log are reached by it (Google's driver keeps
+ * them in a zone from 0x04000000). At 0x1_0000_0000 the log's address reached the firmware cut to 32 bits and it
+ * died at boot; the group's start had ended in an AS1 bus error and the MCU fatal there too.
+ */
+#define OURS_VA                 0x05000000ULL   /* and within the MCU's 28 bits: at 0x10000000 the log's address
+                                                 * reached it as 0x00220000 (an AS0 translation fault there) */
+#define RING_VA                 (OURS_VA + 0x00000)
+#define TARGET_VA               (OURS_VA + 0x10000)
+#define USER_IO_VA              (OURS_VA + 0x20000)     /* input page, then output page */
+#define SUSPEND_VA              (OURS_VA + 0x100000)
+#define SUSPEND_SIZE            0x10000u                /* group 0 asked for 26368 bytes */
+#define FWLOG_VA                (OURS_VA + 0x200000)    /* the firmware's log: its text */
+#define FWLOG_SIZE              0x10000u
+#define FWLOG_PTRS_VA           (OURS_VA + 0x220000)    /* its insert (the firmware's) and extract (ours) words */
+
+static volatile uint32_t *glb_in, *glb_out, *csg_in, *csg_out, *cs_in, *cs_out, *user_in, *user_out;
+static uint32_t *glb_ctl;
+static uint32_t *ring, *target;
+static volatile uint8_t *doorbells;
+static void fwlog_dump(const char *when);
+static char *fwlog;                     /* the firmware's log text, and its two pointers */
+static volatile uint32_t *fwlog_insert, *fwlog_extract;
+
+/* the processors' caches against memory the MCU reads or writes without them */
+/* (whole cache lines from the first to the last byte: no further, a region may end at a guard page) */
+static void
+to_gpu(volatile void *p, unsigned int len)
+{
+	vm_offset_t start = (vm_offset_t)p & ~63UL, end = ((vm_offset_t)p + len + 63) & ~63UL;
+
+	clean_dcache(start, (unsigned)(end - start), FALSE);
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+from_gpu(volatile void *p, unsigned int len)
+{
+	vm_offset_t start = (vm_offset_t)p & ~63UL, end = ((vm_offset_t)p + len + 63) & ~63UL;
+
+	__asm__ volatile ("dsb sy" ::: "memory");
+	flush_dcache(start, (unsigned)(end - start), FALSE);
+}
+
+static void
+ring_doorbell(unsigned int n)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(doorbells + n * 0x10000) = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* the GPU's L2 and load/store caches cleaned and invalidated, waited for */
+#define CMD_FLUSH_L2_LSC        0x3304          /* code 4 (flush caches), L2 and LSC clean+invalidate */
+#define IRQ_CLEAN_CACHES_DONE   (1u << 17)
+static void
+flush_gpu(void)
+{
+	wr(GPU_IRQ_CLEAR, IRQ_CLEAN_CACHES_DONE);
+	wr(GPU_COMMAND, CMD_FLUSH_L2_LSC);
+	if (!wait_for(GPU_IRQ_RAWSTAT, IRQ_CLEAN_CACHES_DONE, IRQ_CLEAN_CACHES_DONE, 100000)) {
+		printf("mali: %u: the GPU's cache flush did not complete\n", step);
+	}
+	wr(GPU_IRQ_CLEAR, IRQ_CLEAN_CACHES_DONE);
+}
+
+/* a region of ours mapped for the GPU as the firmware's own sections are (index 0, the GPU's cache policy: index 5,
+ * non-cacheable, and 6, shared, both ended the first group's start in an AS1 bus error and the MCU fatal); what the
+ * GPU writes is read after its caches are flushed (flush_gpu); the kernel's address */
+static vm_offset_t
+map_region(uint64_t va, vm_size_t size)
+{
+	vm_offset_t memory = gpu_memory(size);
+
+	if (memory == 0) {
+		return 0;
+	}
+	clean_dcache(memory, (unsigned)round_page(size), FALSE);
+	for (vm_size_t off = 0; off < size; off += GPU_PAGE) {
+		if (!map_page(va + off, kvtophys(memory + off), PTE_RW | PTE_NX | (uint64_t)ATTR_CACHED << 2)) {
+			return 0;
+		}
+	}
+	remember(va, size, memory);
+	return memory;
+}
+
+/* waits for the output word's bits under mask to equal the input word's: the firmware has done what was asked */
+static bool
+acked(volatile uint32_t *in, volatile uint32_t *out, uint32_t mask, unsigned int max_ms)
+{
+	for (unsigned int t = 0; t <= max_ms; t++) {
+		from_gpu(out, 4);
+		if ((*out & mask) == (*in & mask)) {
+			return true;
+		}
+		delay(1000);
+	}
+	return false;
+}
+
+static void
+fw_state(const char *when)
+{
+	from_gpu(glb_out, 64);
+	printf("mali: %u: %s: GLB_REQ 0x%x ACK 0x%x DB_REQ 0x%x DB_ACK 0x%x FATAL 0x%x", step, when, glb_in[0], glb_out[0],
+	    glb_in[GLB_DB_REQ / 4], glb_out[GLB_DB_ACK / 4], glb_out[GLB_FATAL_STATUS / 4]);
+	if (csg_out != NULL) {
+		from_gpu(csg_out, 64);
+		printf("; CSG_REQ 0x%x ACK 0x%x DB_REQ 0x%x DB_ACK 0x%x", csg_in[0], csg_out[0], csg_in[CSG_DB_REQ / 4],
+		    csg_out[CSG_DB_ACK / 4]);
+	}
+	if (cs_out != NULL) {
+		from_gpu(cs_out, 256);
+		printf("; CS_REQ 0x%x ACK 0x%x cmd at 0x%x wait 0x%x blocked 0x%x fault 0x%x fatal 0x%x", cs_in[0], cs_out[0],
+		    cs_out[CS_STATUS_CMD_PTR_LO / 4], cs_out[CS_STATUS_WAIT / 4], cs_out[CS_STATUS_BLOCKED / 4],
+		    cs_out[CS_FAULT / 4], cs_out[CS_FATAL / 4]);
+	}
+	printf("\n");
+	faults(when);
+	fwlog_dump(when);
+}
 
 static bool
 load_section(const uint8_t *fw, uint64_t fw_size, const uint32_t *w)
@@ -352,6 +583,7 @@ load_section(const uint8_t *fw, uint64_t fw_size, const uint32_t *w)
 			return false;
 		}
 	}
+	remember(va, size, memory);
 	if (va == SHARED_IFACE_VA) {
 		shared_iface = memory;
 	}
@@ -360,6 +592,106 @@ load_section(const uint8_t *fw, uint64_t fw_size, const uint32_t *w)
 	    flags & IF_READ ? 'r' : '-', flags & IF_WRITE ? 'w' : '-', flags & IF_EXECUTE ? 'x' : '-', cache,
 	    flags & IF_SHARED ? " shared" : "", flags & IF_ZERO ? " zeroed" : "", data_end - data, kvtophys(memory));
 	return true;
+}
+
+/*
+ * The firmware's log ("fwlog", a trace buffer entry of the image: Google's driver, mali_kbase_csf_trace_buffer.c):
+ * the entry names five words in the firmware's own data where the host puts, before the MCU starts, the buffer's
+ * size, the addresses of the insert word (the firmware's) and of the extract word (ours), of the text, and the
+ * enable bits (Pixel's driver turns all on); the "Log verbosity" configuration entry is set to its maximum.
+ */
+static void
+fw_poke(uint32_t mcu_va, uint32_t value)
+{
+	uint32_t *p = kernel_address(mcu_va);
+
+	if (p != NULL) {
+		*p = value;
+		clean_dcache((vm_offset_t)p & ~63UL, 64, FALSE);
+	}
+}
+
+static void
+fwlog_setup(const uint8_t *fw, uint32_t end)
+{
+	for (uint32_t off = 0x14; off < end;) {
+		uint32_t header, w[8], size;
+
+		memcpy(&header, fw + off, 4);
+		size = (header >> 8) & 0xff;
+		if (size < 4) {
+			break;
+		}
+		memset(w, 0, sizeof(w));
+		memcpy(w, fw + off + 4, MIN(size - 4, sizeof(w)));
+		if ((header & 0xff) == 3 && size >= 4 + 7 * 4 && strncmp((const char *)fw + off + 4 + 7 * 4, "fwlog", 5) == 0) {
+			vm_offset_t text = map_region(FWLOG_VA, FWLOG_SIZE);
+			vm_offset_t ptrs = map_region(FWLOG_PTRS_VA, 0x2000);
+
+			if (text != 0 && ptrs != 0) {
+				fwlog = (char *)text;
+				fwlog_insert = (volatile uint32_t *)ptrs;
+				fwlog_extract = (volatile uint32_t *)(ptrs + GPU_PAGE);
+				fw_poke(w[1], FWLOG_SIZE);
+				fw_poke(w[2], (uint32_t)FWLOG_PTRS_VA);                 /* insert: the firmware writes it */
+				fw_poke(w[3], (uint32_t)(FWLOG_PTRS_VA + GPU_PAGE));    /* extract: ours */
+				fw_poke(w[4], (uint32_t)FWLOG_VA);
+				for (uint32_t i = 0; i < (w[6] + 31) / 32; i++) {
+					fw_poke(w[5] + 4 * i, 0xffffffff);
+				}
+				printf("mali: %u: the firmware's log: %u bytes at 0x%llx (%u enable bits)\n", step, FWLOG_SIZE,
+				    FWLOG_VA, w[6]);
+			}
+		}
+		if ((header & 0xff) == 1 && size >= 4 + 3 * 4 && strncmp((const char *)fw + off + 4 + 3 * 4, "Log verbosity", 13) == 0) {
+			fw_poke(w[0], w[2]);
+			printf("mali: %u: log verbosity %u (of %u..%u)\n", step, w[2], w[1], w[2]);
+		}
+		off += size;
+	}
+}
+
+/* what the firmware logged since the last look, line by line */
+static void
+fwlog_dump(const char *when)
+{
+	uint32_t insert, extract, n = 0;
+	char line[160];
+	unsigned int len = 0;
+
+	if (fwlog == NULL) {
+		return;
+	}
+	flush_gpu();
+	from_gpu(fwlog_insert, 8);
+	from_gpu(fwlog_extract, 8);
+	insert = *fwlog_insert;
+	extract = *fwlog_extract;
+	printf("mali: fwlog (%s): insert 0x%x, extract 0x%x\n", when, insert, extract);
+	from_gpu(fwlog, FWLOG_SIZE);
+	while (extract != insert && n++ < 8192) {
+		char c = fwlog[extract % FWLOG_SIZE];
+
+		extract = (extract + 1) % FWLOG_SIZE;
+		if (c == '\n' || len == sizeof(line) - 1) {
+			line[len] = 0;
+			printf("mali: fw| %s\n", line);
+			len = 0;
+		} else if (c >= 32 && c < 127) {
+			line[len++] = c;
+		} else if (c != '\r' && c != 0) {
+			len += snprintf(line + len, sizeof(line) - len, "\\x%02x", (uint8_t)c) > 0 ? 4 : 0;
+			if (len >= sizeof(line) - 5) {
+				len = sizeof(line) - 1;
+			}
+		}
+	}
+	if (len) {
+		line[len] = 0;
+		printf("mali: fw| %s\n", line);
+	}
+	*fwlog_extract = extract;
+	to_gpu(fwlog_extract, 8);
 }
 
 static bool
@@ -414,6 +746,16 @@ load_firmware(void)
 	}
 	if (shared_iface == 0) {
 		printf("mali: %u: no section at 0x%08x, the shared interface\n", step, SHARED_IFACE_VA);
+		return false;
+	}
+	fwlog_setup(fw, end);
+	/* our own regions too, before the MCU walks these tables: a table changed under it may stay stale in the L2 */
+	ring = (uint32_t *)map_region(RING_VA, 0x10000);
+	target = (uint32_t *)map_region(TARGET_VA, 0x1000);
+	user_in = (volatile uint32_t *)map_region(USER_IO_VA, 0x2000);
+	user_out = user_in ? user_in + GPU_PAGE / 4 : NULL;
+	if (ring == NULL || target == NULL || user_in == NULL || map_region(SUSPEND_VA, SUSPEND_SIZE) == 0) {
+		printf("mali: %u: no memory for the queue's regions\n", step);
 		return false;
 	}
 	clean_tables();
@@ -551,6 +893,172 @@ s2mpu(unsigned int level)
 	delay(100);
 	printf("mali: s2mpu: done; FAULT_STATUS 0x%x\n", S2(S2MPU_FAULT_STATUS));
 #undef S2
+}
+
+static bool
+global_setup(void)
+{
+	uint32_t *g = (uint32_t *)shared_iface;
+
+	glb_ctl = g;
+	from_gpu(g, GPU_PAGE);
+	glb_in = kernel_address(g[GLB_INPUT_VA_W]);
+	glb_out = kernel_address(g[GLB_OUTPUT_VA_W]);
+	doorbells = (volatile uint8_t *)ml_io_map(DOORBELL_PHYS, 0x20000);
+	if (glb_in == NULL || glb_out == NULL) {
+		printf("mali: 6: the global input/output blocks (0x%x, 0x%x) are in no section of ours\n", g[GLB_INPUT_VA_W],
+		    g[GLB_OUTPUT_VA_W]);
+		return false;
+	}
+	from_gpu(glb_in, GPU_PAGE);
+	printf("mali: 6: version 0x%x, %u groups every 0x%x bytes; input 0x%x, output 0x%x; GLB_REQ 0x%x, GLB_ACK 0x%x\n",
+	    g[GLB_VERSION_W], g[GLB_GROUP_NUM_W], g[GLB_GROUP_STRIDE_W], g[GLB_INPUT_VA_W], g[GLB_OUTPUT_VA_W], glb_in[0],
+	    glb_out[0]);
+	glb_in[GLB_ACK_IRQ_MASK / 4] = 0xffffffff;
+	glb_in[GLB_REQ / 4] ^= GLB_REQ_PING;
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&glb_in[GLB_REQ / 4], &glb_out[GLB_ACK / 4], GLB_REQ_PING, 100)) {
+		fw_state("NO ANSWER to the ping");
+		return false;
+	}
+	printf("mali: 6: the firmware answered the ping\n");
+	glb_in[GLB_ALLOC_EN_LO / 4] = (uint32_t)rd64(SHADER_PRESENT);
+	glb_in[GLB_ALLOC_EN_HI / 4] = (uint32_t)(rd64(SHADER_PRESENT) >> 32);
+	glb_in[GLB_REQ / 4] ^= GLB_REQ_CFG_ALLOC_EN;
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&glb_in[GLB_REQ / 4], &glb_out[GLB_ACK / 4], GLB_REQ_CFG_ALLOC_EN, 100)) {
+		fw_state("the shader cores' allocation not acknowledged");
+		return false;
+	}
+	printf("mali: 6: shader cores 0x%llx allowed\n", rd64(SHADER_PRESENT));
+	return true;
+}
+
+static bool
+group_start(void)
+{
+	uint32_t *gc = glb_ctl + (GROUP_CONTROL_0 + 0 * glb_ctl[GLB_GROUP_STRIDE_W]) / 4;     /* group 0 */
+	uint32_t *sc;
+	uint32_t suspend_size, stream_stride, compute = 0;
+	uint64_t shaders = rd64(SHADER_PRESENT);
+
+	from_gpu((void *)shared_iface, 0x10000);       /* every control block, not only the first page's */
+	csg_in = kernel_address(gc[GROUP_INPUT_VA / 4]);
+	csg_out = kernel_address(gc[GROUP_OUTPUT_VA / 4]);
+	suspend_size = gc[GROUP_SUSPEND_SIZE / 4];
+	stream_stride = gc[GROUP_STREAM_STRIDE / 4];
+	sc = gc + (STREAM_CONTROL_0 + 0 * stream_stride) / 4;                                /* stream 0 */
+	cs_in = kernel_address(sc[STREAM_INPUT_VA / 4]);
+	cs_out = kernel_address(sc[STREAM_OUTPUT_VA / 4]);
+	printf("mali: 7: group 0: features 0x%x, %u streams every %u bytes, suspend buffer %u bytes; stream 0: features "
+	    "0x%x\n", gc[GROUP_FEATURES / 4], gc[GROUP_STREAM_NUM / 4], stream_stride, suspend_size, sc[STREAM_FEATURES / 4]);
+	if (csg_in == NULL || csg_out == NULL || cs_in == NULL || cs_out == NULL) {
+		printf("mali: 7: a block outside our sections (group 0x%x/0x%x, stream 0x%x/0x%x)\n", gc[GROUP_INPUT_VA / 4],
+		    gc[GROUP_OUTPUT_VA / 4], sc[STREAM_INPUT_VA / 4], sc[STREAM_OUTPUT_VA / 4]);
+		return false;
+	}
+	if (suspend_size > SUSPEND_SIZE) {
+		printf("mali: 7: the suspend buffer wants %u bytes, %u are mapped\n", suspend_size, SUSPEND_SIZE);
+		return false;
+	}
+	/* address space 1: the same tables (the group's memory and the MCU's in one space, for now) */
+	if (!wait_for(0x2440 + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000)) {
+		return false;
+	}
+	wr64(0x2440 + AS_TRANSCFG, TRANSCFG_VALUE);
+	wr64(0x2440 + AS_TRANSTAB, kvtophys((vm_offset_t)level0));
+	wr64(0x2440 + AS_MEMATTR, MEMATTR_TABLE);
+	wr(0x2440 + AS_COMMAND, AS_CMD_UPDATE);
+	if (!wait_for(0x2440 + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000)) {
+		faults("address space 1");
+		return false;
+	}
+	/* the queue: ring, user pages, doorbell, started (Google's program_cs) */
+	from_gpu(cs_in, 128);
+	from_gpu(cs_out, 128);
+	cs_in[CS_BASE_LO / 4] = (uint32_t)RING_VA;
+	cs_in[CS_BASE_HI / 4] = (uint32_t)(RING_VA >> 32);
+	cs_in[CS_SIZE / 4] = 0x10000;
+	cs_in[CS_USER_INPUT_LO / 4] = (uint32_t)USER_IO_VA;
+	cs_in[CS_USER_INPUT_HI / 4] = (uint32_t)(USER_IO_VA >> 32);
+	cs_in[CS_USER_OUTPUT_LO / 4] = (uint32_t)(USER_IO_VA + GPU_PAGE);
+	cs_in[CS_USER_OUTPUT_HI / 4] = (uint32_t)((USER_IO_VA + GPU_PAGE) >> 32);
+	cs_in[CS_CONFIG / 4] = USER_DOORBELL << 8 | 1;          /* doorbell 1, priority 1 */
+	cs_in[CS_ACK_IRQ_MASK / 4] = 0xffffffff;
+	cs_in[CS_REQ / 4] = (cs_out[CS_ACK / 4] & 0xc0000000u) | CS_REQ_IDLE_BITS | CS_STATE_START;
+	to_gpu(cs_in, 128);
+	from_gpu(csg_out, 64);
+	csg_in[CSG_DB_REQ / 4] = csg_out[CSG_DB_ACK / 4] ^ 1u;  /* stream 0's kernel doorbell */
+	/* the group: endpoints, address space, suspend buffer, started (Google's program_csg_slot) */
+	for (uint64_t m = shaders; m; m &= m - 1) {
+		compute++;
+	}
+	csg_in[CSG_ALLOW_COMPUTE_LO / 4] = (uint32_t)shaders;
+	csg_in[CSG_ALLOW_COMPUTE_HI / 4] = (uint32_t)(shaders >> 32);
+	csg_in[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
+	csg_in[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
+	csg_in[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
+	csg_in[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | 8u << 28;      /* priority 8 */
+	csg_in[CSG_EP_REQ_HI / 4] = 0;
+	csg_in[CSG_CONFIG / 4] = 1;                             /* address space 1 */
+	csg_in[CSG_SUSPEND_BUF_LO / 4] = (uint32_t)SUSPEND_VA;
+	csg_in[CSG_SUSPEND_BUF_HI / 4] = (uint32_t)(SUSPEND_VA >> 32);
+	csg_in[CSG_ACK_IRQ_MASK / 4] = 0xffffffff;
+	csg_in[CSG_REQ / 4] = (csg_in[CSG_REQ / 4] & ~7u) | CSG_STATE_START;
+	to_gpu(csg_in, 128);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ 1u;  /* group 0's doorbell */
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&csg_in[CSG_REQ / 4], &csg_out[CSG_ACK / 4], 7, 200)) {
+		fw_state("the group did not start");
+		return false;
+	}
+	if (!acked(&cs_in[CS_REQ / 4], &cs_out[CS_ACK / 4], 7, 200)) {
+		fw_state("the queue did not start");
+		return false;
+	}
+	fw_state("group 0 and its queue started");
+	return true;
+}
+
+static void
+first_job(void)
+{
+	unsigned int n = 0;
+	uint64_t *cmd = (uint64_t *)ring;
+
+	target[0] = 0x11111111;
+	target[1] = 0x22222222;
+	to_gpu(target, 16);
+	/* MOVE48 r0 <- the target; MOVE32 r4, r5 <- two words; STORE_MULTIPLE r4..r5 -> [r0 + 0] (Mesa's v10/v12 genxml) */
+	cmd[n++] = 1ULL << 56 | 0ULL << 48 | (TARGET_VA & 0xffffffffffffULL);
+	cmd[n++] = 2ULL << 56 | 4ULL << 48 | 0xc0ffee11ULL;
+	cmd[n++] = 2ULL << 56 | 5ULL << 48 | 0x5a5a1234ULL;
+	cmd[n++] = 21ULL << 56 | 4ULL << 48 | 0ULL << 40 | 0x3ULL << 16 | 0;
+	to_gpu(ring, n * 8);
+	user_in[CS_INSERT / 4] = n * 8;
+	user_in[CS_INSERT / 4 + 1] = 0;
+	to_gpu(user_in, 16);
+	printf("mali: 8: %u instructions in the ring; the queue's doorbell rung\n", n);
+	ring_doorbell(USER_DOORBELL);
+	for (int t = 0; t < 200; t++) {
+		flush_gpu();
+		from_gpu(user_out, 16);
+		from_gpu(target, 16);
+		if (user_out[CS_EXTRACT / 4] >= n * 8 && target[0] != 0x11111111) {
+			break;
+		}
+		delay(1000);
+	}
+	printf("mali: 8: the queue read to 0x%x (of 0x%x), active %u; the target holds 0x%08x 0x%08x\n",
+	    user_out[CS_EXTRACT / 4], n * 8, user_out[CS_ACTIVE / 4], target[0], target[1]);
+	printf("mali: 8: %s\n", target[0] == 0xc0ffee11 && target[1] == 0x5a5a1234 ?
+	    "THE GPU RAN OUR COMMANDS: both words are what the instructions stored" :
+	    "the target was not written as asked");
+	fw_state("after the job");
 }
 
 /* ---- the steps ---- */
@@ -693,6 +1201,23 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	}
 	faults("after the start");
 	printf("mali: 5: shaders ready 0x%llx, tiler ready 0x%llx\n", rd64(SHADER_READY), rd64(TILER_READY));
+
+	if (!announce(6, "the firmware's global interface: a ping, the shader cores allowed, what it offers")) {
+		goto out;
+	}
+	if (!global_setup()) {
+		goto out;
+	}
+	if (!announce(7, "a command stream group (slot 0) with one queue, in address space 1")) {
+		goto out;
+	}
+	if (!group_start()) {
+		goto out;
+	}
+	if (!announce(8, "the first job: four instructions that store two words into a page of ours")) {
+		goto out;
+	}
+	first_job();
 
 out:
 	if (step >= 2) {
