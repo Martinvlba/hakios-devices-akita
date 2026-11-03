@@ -4,7 +4,9 @@
  * 0xff, subclass 0xfe, protocol 2: two bulk endpoints, the usbmux protocol on them).
  *
  * Enumeration and the bulk endpoints; what comes in on bulk OUT goes to the mux (hakios.akita_usbmux.c), and what it
- * sends goes out on bulk IN through a queue the poll thread empties, a packet at a time.
+ * sends goes out on bulk IN through a queue the poll thread empties, a packet at a time. Interface 0 is PTP, as on an
+ * iPhone (the photos, read with a camera's protocol): its endpoints go to /dev/hakios-ptp (hakios.akita_ptp.c), where
+ * a program of the user space answers (userland/src/ptp_responder.c).
  *
  * The controller: Google's bootloader drives it for its own fastboot, and U-Boot for its own (xl), so its clocks, the
  * eUSB2 PHY and the repeater are up when the kernel starts (U-Boot's `eusb init`). Here: the controller stopped and
@@ -102,9 +104,13 @@ extern vm_offset_t kvtophys(vm_offset_t va);
 #define BULK_IN                 3
 #define BULK_MPS                512
 #define BULK_BUF                16384
+/* PTP (interface 0, as on an iPhone): bulk OUT ep3 (physical 6), bulk IN ep3 (7), interrupt IN ep4 (9) */
+#define PTP_OUT                 6
+#define PTP_IN                  7
+#define PTP_INT                 9
 
 /* the piece of memory the controller uses */
-#define MEM_SIZE                (64 * 1024)
+#define MEM_SIZE                (128 * 1024)
 #define EVT_OFF                 0x0000          /* 4 KiB event buffer */
 #define EVT_SIZE                4096
 #define TRB_OFF                 0x1000          /* a TRB per physical endpoint, 16 bytes each, 64 apart */
@@ -112,6 +118,8 @@ extern vm_offset_t kvtophys(vm_offset_t va);
 #define EP0_BUF_OFF             0x1800          /* ep0's data stage, up to 512 bytes */
 #define OUT_BUF_OFF             0x4000
 #define IN_BUF_OFF              0x8000
+#define PTP_OUT_BUF_OFF         0x10000
+#define PTP_IN_BUF_OFF          0x14000
 
 struct trb {
 	uint32_t bpl, bph, size, ctrl;
@@ -143,6 +151,7 @@ static lck_mtx_t *txq_lock;
 void akita_usbmux_input(const uint8_t *data, uint32_t len);
 void akita_usbmux_reset(void);
 void akita_usbmux_init(void);
+void akita_ptp_init(void);              /* hakios.akita_ptp.c: /dev/hakios-ptp */
 void akita_usbmux_iokit(int connected);  /* hakios.akita_usbmux_iokit.cpp: AppleUSBDeviceMux, for lockdownd */
 
 /* ep0's state: what the next event of it means */
@@ -175,7 +184,9 @@ ep_cmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 		uint32_t c = rd(DEPCMD(ep));
 
 		if (!(c & CMD_ACT)) {
-			if (CMD_STATUS(c)) {
+			static unsigned failures;
+
+			if (CMD_STATUS(c) && failures++ < 20) {
 				printf("akita usb: endpoint %u command %#x: status %u\n", ep, cmd & 0xf, CMD_STATUS(c));
 			}
 			return c;
@@ -186,7 +197,7 @@ ep_cmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 	return ~0u;
 }
 
-static void
+static bool
 start_transfer(unsigned ep, uint64_t buf_pa, uint32_t len, uint32_t type)
 {
 	struct trb *t = trb_of(ep);
@@ -199,6 +210,11 @@ start_transfer(unsigned ep, uint64_t buf_pa, uint32_t len, uint32_t type)
 	t->ctrl = type | TRB_LST | TRB_IOC | TRB_ISP_IMI | TRB_HWO;
 	c = ep_cmd(ep, CMD_STARTTRANSFER, (uint32_t)(trb_pa >> 32), (uint32_t)trb_pa, 0);
 	resource[ep] = CMD_RESOURCE(c);
+	if (c == ~0u || CMD_STATUS(c)) {
+		t->ctrl &= ~TRB_HWO;            /* not the controller's after all */
+		return false;
+	}
+	return true;
 }
 
 static void
@@ -226,6 +242,15 @@ config_ep(unsigned ep, uint32_t type, uint32_t mps, bool modify)
 	}
 }
 
+/* an endpoint's configuration (action: initialize) when its transfer resource was given already */
+static void
+config_ep_only(unsigned ep, uint32_t type, uint32_t mps)
+{
+	uint32_t p0 = CFG0_TYPE(type) | CFG0_MPS(mps) | ((ep & 1) ? CFG0_FIFO(ep >> 1) : 0);
+
+	ep_cmd(ep, CMD_SETEPCONFIG, p0, CFG1_XFER_COMPLETE | CFG1_XFER_NOT_READY | CFG1_EP(ep), 0);
+}
+
 /* descriptors */
 static const uint8_t dev_desc[18] = {
 	18, 1, 0x00, 0x02, 0, 0, 0, 64,
@@ -234,9 +259,13 @@ static const uint8_t dev_desc[18] = {
 	1, 2, 3, 1
 };
 static const uint8_t qualifier[10] = { 10, 6, 0x00, 0x02, 0, 0, 0, 64, 1, 0 };
-static const uint8_t cfg_desc[32] = {
-	9, 2, 32, 0, 1, 1, 0, 0xc0, 250,        /* one interface, self-powered, 500 mA */
-	9, 4, 0, 0, 2, 0xff, 0xfe, 2, 4,        /* Apple Mobile Device: usbmux */
+static const uint8_t cfg_desc[62] = {
+	9, 2, 62, 0, 2, 1, 0, 0xc0, 250,        /* two interfaces, self-powered, 500 mA */
+	9, 4, 0, 0, 3, 0x06, 0x01, 0x01, 5,     /* PTP (Still Image Capture), as an iPhone's interface 0: the photos */
+	7, 5, 0x83, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
+	7, 5, 0x03, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
+	7, 5, 0x84, 3, 64, 0, 8,                /* its events: never sent */
+	9, 4, 1, 0, 2, 0xff, 0xfe, 2, 4,        /* Apple Mobile Device: usbmux */
 	7, 5, 0x81, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
 	7, 5, 0x01, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
 };
@@ -244,7 +273,7 @@ static const uint8_t cfg_desc[32] = {
 static unsigned
 string_desc(unsigned index, uint8_t *out)
 {
-	static const char *const strings[] = { NULL, "Apple Inc.", "iPhone", serial, "Apple Mobile Device" };
+	static const char *const strings[] = { NULL, "Apple Inc.", "iPhone", serial, "Apple Mobile Device", "PTP" };
 	const char *s;
 	unsigned n = 2;
 
@@ -264,6 +293,47 @@ string_desc(unsigned index, uint8_t *out)
 	return n;
 }
 
+/*
+ * PTP's endpoints (hakios.akita_ptp.c has the device node and its buffers): the poll thread starts every transfer, as
+ * for the mux. OUT is started again whenever the node has room for a whole transfer; IN takes what a writer left.
+ */
+void akita_ptp_link(int up);                                    /* the host configured (1) or went (0) */
+void akita_ptp_out(const uint8_t *data, uint32_t len);          /* what came in */
+bool akita_ptp_out_room(void);                                  /* room for BULK_BUF more */
+bool akita_ptp_in_take(uint8_t *buf, uint32_t max, uint32_t *len); /* the next IN transfer, if a writer left one */
+void akita_ptp_in_done(void);                                   /* ... and it is out */
+static bool ptp_out_running, ptp_in_busy, ptp_failed;     /* failed: a start was refused; not again until configured */
+
+static bool
+ptp_service(void)
+{
+	uint32_t len;
+
+	if (!bulk_on || ptp_failed) {
+		return false;
+	}
+	if (!ptp_out_running && akita_ptp_out_room()) {
+		ptp_out_running = true;
+		if (!start_transfer(PTP_OUT, mem_pa + PTP_OUT_BUF_OFF, BULK_BUF, TRB_NORMAL)) {
+			printf("akita usb: PTP's OUT endpoint refused a transfer: PTP off until the host configures again\n");
+			ptp_failed = true;
+			return false;
+		}
+	}
+	if (!ptp_in_busy && akita_ptp_in_take((uint8_t *)(mem + PTP_IN_BUF_OFF), BULK_BUF, &len)) {
+		ptp_in_busy = true;
+		if (!start_transfer(PTP_IN, mem_pa + PTP_IN_BUF_OFF, len, TRB_NORMAL)) {
+			printf("akita usb: PTP's IN endpoint refused a transfer: PTP off until the host configures again\n");
+			ptp_failed = true;
+			ptp_in_busy = false;
+			akita_ptp_in_done();
+			return false;
+		}
+		return true;
+	}
+	return ptp_in_busy;
+}
+
 static void
 bulk_start_out(void)
 {
@@ -276,12 +346,27 @@ bulk_enable(void)
 	if (bulk_on) {
 		return;
 	}
+	/*
+	 * Transfer resources after DEPSTARTCFG from resource 2: every physical endpoint's in order, used or not; then each
+	 * used one configured. (Physical endpoint 4, EP2 OUT, refused every Start Transfer on this phone -- "no resource",
+	 * status 1 -- however it was given its resource and wherever its buffer was; PTP is on EP3, which works.)
+	 */
 	ep_cmd(EP0_OUT, CMD_DEPSTARTCFG | CMD_PARAM(2), 0, 0, 0);
-	config_ep(BULK_OUT, 2, BULK_MPS, false);
-	config_ep(BULK_IN, 2, BULK_MPS, false);
-	wr(DALEPENA, rd(DALEPENA) | (1u << BULK_OUT) | (1u << BULK_IN));
+	for (unsigned ep = 2; ep < 10; ep++) {
+		ep_cmd(ep, CMD_SETTRANSFRESOURCE, 1, 0, 0);
+	}
+	config_ep_only(BULK_OUT, 2, BULK_MPS);
+	config_ep_only(BULK_IN, 2, BULK_MPS);
+	config_ep_only(PTP_OUT, 2, BULK_MPS);
+	config_ep_only(PTP_IN, 2, BULK_MPS);
+	wr(DALEPENA, rd(DALEPENA) | (1u << BULK_OUT) | (1u << BULK_IN) | (1u << PTP_OUT) | (1u << PTP_IN));
 	bulk_on = true;
 	bulk_start_out();
+	ptp_out_running = false;
+	ptp_in_busy = false;
+	ptp_failed = false;
+	ptp_service();                          /* PTP's OUT started too */
+	akita_ptp_link(1);
 	printf("akita usb: configured: the mux interface's bulk endpoints are on\n");
 	akita_usbmux_iokit(1);
 }
@@ -296,7 +381,15 @@ bulk_disable(void)
 	if (in_busy) {
 		ep_cmd(BULK_IN, CMD_ENDTRANSFER | CMD_FORCERM | CMD_PARAM(resource[BULK_IN]), 0, 0, 0);
 	}
-	wr(DALEPENA, rd(DALEPENA) & ~((1u << BULK_OUT) | (1u << BULK_IN)));
+	if (ptp_out_running) {
+		ep_cmd(PTP_OUT, CMD_ENDTRANSFER | CMD_FORCERM | CMD_PARAM(resource[PTP_OUT]), 0, 0, 0);
+	}
+	if (ptp_in_busy) {
+		ep_cmd(PTP_IN, CMD_ENDTRANSFER | CMD_FORCERM | CMD_PARAM(resource[PTP_IN]), 0, 0, 0);
+	}
+	ptp_out_running = ptp_in_busy = false;
+	akita_ptp_link(0);
+	wr(DALEPENA, rd(DALEPENA) & ~((1u << BULK_OUT) | (1u << BULK_IN) | (1u << PTP_OUT) | (1u << PTP_IN)));
 	bulk_on = false;
 	lck_mtx_lock(txq_lock);
 	in_busy = in_zlp = false;
@@ -466,6 +559,19 @@ ep0_event(unsigned ep, unsigned event, unsigned status)
 static void
 bulk_event(unsigned ep, unsigned event)
 {
+	if (ep == PTP_OUT && event == 1) {
+		struct trb *t = trb_of(PTP_OUT);
+		ptp_out_running = false;
+		akita_ptp_out((const uint8_t *)(mem + PTP_OUT_BUF_OFF), BULK_BUF - (t->size & 0xffffff));
+		ptp_service();
+		return;
+	}
+	if (ep == PTP_IN && event == 1) {
+		ptp_in_busy = false;
+		akita_ptp_in_done();
+		ptp_service();
+		return;
+	}
 	if (ep == BULK_OUT && event == 1) {
 		struct trb *t = trb_of(BULK_OUT);
 		uint32_t got = BULK_BUF - (t->size & 0xffffff);
@@ -560,6 +666,8 @@ controller_start(void)
 
 	printf("akita usb: DWC3 %#x (GSNPSID); DCTL %#x DSTS %#x GCTL %#x GUSB2PHYCFG %#x as found\n", id, rd(DCTL),
 	    rd(DSTS), rd(GCTL), rd(GUSB2PHYCFG));
+	printf("akita usb: TX FIFOs (GTXFIFOSIZ0-3): %#x %#x %#x %#x; RX %#x; GHWPARAMS3 %#x\n", rd(0xc300), rd(0xc304),
+	    rd(0xc308), rd(0xc30c), rd(0xc380), rd(0xc14c));
 	if (id == 0 || id == ~0u) {
 		printf("akita usb: no DWC3 answers (clocks off?): off\n");
 		return false;
@@ -603,6 +711,7 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 	usb_grp = lck_grp_alloc_init("akita usb", LCK_GRP_ATTR_NULL);
 	txq_lock = lck_mtx_alloc_init(usb_grp, LCK_ATTR_NULL);
 	akita_usbmux_init();
+	akita_ptp_init();
 	if (!controller_start()) {
 		start_result = 0;
 		for (unsigned i = 0; i < 24; i++) {     /* on the screen (-v) for two minutes: why there is no USB */
@@ -629,6 +738,7 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 		bool busy = poll_events();
 
 		busy = tx_service() || busy;
+		busy = ptp_service() || busy;
 		now = mach_absolute_time();
 		if (busy) {
 			last_busy = now;
@@ -636,9 +746,9 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 		if (now >= next_status && statuses < 24) {      /* every 5 s for two minutes: on the screen with -v */
 			statuses++;
 			next_status = now + five_s;
-			printf("akita usb: DCTL %#x DSTS %#x DCFG %#x: %u events, %u setups, %u bulk OUT, %s\n", rd(DCTL),
+			printf("akita usb: DCTL %#x DSTS %#x DCFG %#x: %u events, %u setups, %u bulk OUT, %s%s\n", rd(DCTL),
 			    rd(DSTS), rd(DCFG), seen_events, seen_setups, seen_bulk_out, bulk_on ? "configured" :
-			    "not configured");
+			    "not configured", ptp_failed ? "; PTP off" : "");
 		}
 		if (now >= next_summary) {                      /* and every ten minutes after */
 			next_summary = now + ten_min;

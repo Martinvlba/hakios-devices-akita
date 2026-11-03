@@ -21,7 +21,7 @@ How to run it: `the port's log`. What is next and how: `the port's log`. What wa
 | Touch | ✅ | taps, swipes, the app switcher |
 | Buttons (power, volume) | ✅ | volume HUD, power locks and wakes (`buttons=1`) |
 | CPU | ✅ | all 9 cores (`cpus=9`: 4 A510, 4 A715, the X3); clocks set by a governor through ACPM (`dvfs=1`), held down when hot (the X3 from 75 C) |
-| USB | ✅ | as an iPhone's in iOS (`usbmux=1`): pairs with a computer (Trust This Computer?), ideviceinfo, idevicesyslog, files over AFC (~7 MB/s); and the development link (`xl`) under the loader |
+| USB | ✅ | as an iPhone's in iOS (`usbmux=1`): pairs with a computer (Trust This Computer?), ideviceinfo, idevicesyslog, files over AFC (~20 MB/s), and the photos as PTP "Internal Storage" for a trusted computer; and the development link (`xl`) under the loader |
 | Watchdog | ✅ | fed by the kernel; a hung phone restarts itself in ~2.5 min |
 | Clock (time of day) | ✅ | the PMIC's real-time clock (through ACPM): read at each start, written back when iOS sets the time; within 1-2 s of the computer's |
 | Storage (UFS) | ✅ | iOS runs from the phone's own flash (a 77 GiB darwin partition); /private/var kept between starts (71 GB; iPhone Storage shows 80 GB) |
