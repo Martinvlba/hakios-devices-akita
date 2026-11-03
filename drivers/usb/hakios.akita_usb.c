@@ -123,6 +123,15 @@ static uint32_t evt_pos;
 static uint32_t resource[4];
 static bool bulk_on;
 
+/* for the battery's charger details (hakios.akita_battery.c): a computer has configured the mux interface */
+bool akita_usb_host_configured(void);
+
+bool
+akita_usb_host_configured(void)
+{
+	return bulk_on;
+}
+
 /* bulk IN: packets queued by anyone (the mux's connections, the poll thread), sent one at a time by the poll thread */
 #define TXQ                     16
 static uint8_t txq[TXQ][BULK_BUF];

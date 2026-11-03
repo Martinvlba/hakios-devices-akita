@@ -17,6 +17,8 @@
  *   gauge 0x36: 0x00 Status (bit 3: no battery), 0x05 RepCap and 0x10 FullCapRep and 0x18 DesignCap in 2 mAh,
  *               0x06 RepSOC in 1/256 %, 0x08 Temp in 1/256 C, 0x09 VCell in 78.125 uV, 0x0a Current in 312.5 uA
  *               (signed, more than 0 while charging), 0x17 Cycles in 1/100 of a cycle
+ *   TCPC 0x25 (the USB-C port controller, TCPCI): 0x1d CC_STATUS (bit 4 the phone the sink; bits 1:0 / 3:2 CC1 / CC2:
+ *               what the source advertises, 1 default, 2 1.5 A, 3 3.0 A), 0x1e POWER_STATUS: the charger's type and current
  *   charger 0x69: 0xb4 CHG_INT_OK (bit 6 CHGIN_OK: a source on the USB port), 0xb6 CHG_DETAILS_01 (bits 3:0 CHG_DTLS:
  *               0 precharge, 1 constant current, 2 constant voltage, 3 top-off, 4 done, others not charging)
  */
@@ -71,6 +73,15 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 #define GAUGE                   0x36
 #define CHARGER                 0x69
+#define TCPC                    0x25            /* the MAX77759's USB-C port controller (TCPCI) */
+#define TCPC_CC_STATUS          0x1d
+#define TCPC_POWER_STATUS       0x1e
+
+#if defined(HAKIOS_AKITA_USB)
+extern bool akita_usb_host_configured(void);    /* drivers/usb/hakios.akita_usb.c */
+#else
+static bool akita_usb_host_configured(void) { return false; }
+#endif
 
 static vm_offset_t i2c;
 static uint32_t errors;
@@ -214,7 +225,30 @@ battery_read(struct hakios_battery_state *s)
 	s->full_uah = full * 2000;
 	s->design_uah = design * 2000;
 	s->cycles = cycles / 100;
-	s->usb_type = 0;                                        /* not known here: Darwin's "USB, unknown" */
+	/*
+	 * What is on the cable (the TCPC, TCPCI's standard registers): CC_STATUS says, when the phone is the sink (bit 4),
+	 * what the other end advertises on the CC line that is connected -- 1 USB's default current, 2 1.5 A, 3 3.0 A
+	 * (Android's current_max agreed: 3.0 A from a computer's USB-C port, CC_STATUS 0x13). Advertising 1.5 or 3 A makes
+	 * it a USB-C source; else a computer that configured the phone's USB is a computer's port (Android's "SDP"); else
+	 * not known. 5 V either way: nothing here asks for Power Delivery.
+	 */
+	{
+		uint8_t cc = 0, power = 0;
+
+		s->usb_type = 0;                                /* Darwin's "USB, unknown" */
+		if (s->external && read_regs(TCPC, TCPC_CC_STATUS, &cc, 1) && read_regs(TCPC, TCPC_POWER_STATUS, &power, 1) &&
+		    (cc & 0x10)) {
+			unsigned level = (cc & 0x03) ? (cc & 0x03) : ((cc >> 2) & 0x03);
+
+			s->usb_voltage_uv = 5000000;
+			s->usb_current_ua = level == 3 ? 3000000 : level == 2 ? 1500000 : 500000;
+			if (level >= 2) {
+				s->usb_type = 5;                /* USB-C: kIOPSFamilyCodeUSBCTypeC */
+			} else if (akita_usb_host_configured()) {
+				s->usb_type = 1;                /* SDP, a computer's port: kIOPSFamilyCodeUSBHost */
+			}
+		}
+	}
 	return true;
 }
 
