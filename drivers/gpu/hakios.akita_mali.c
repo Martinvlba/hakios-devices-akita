@@ -971,6 +971,24 @@ global_setup(void)
 	 * timer disabled, then SHADER_PWRON): left to the firmware without its whole global setup they stayed off, and
 	 * the first compute job waited at RUN_COMPUTE for cores that never came.
 	 */
+	{
+		unsigned int hctl = 1;          /* mali_hctl=0: the firmware powers the cores (Android's default policy) */
+
+		PE_parse_boot_argn("mali_hctl", &hctl, sizeof(hctl));
+		if (!hctl) {
+			/* a power-off timer of ~800 us in system timestamp ticks (24.576 MHz), source "timestamp" (bit 31 0) */
+			glb_in[GLB_PWROFF_TIMER / 4] = 20000;
+			glb_in[GLB_REQ / 4] ^= GLB_REQ_CFG_PWROFF_TIMER;
+			to_gpu(glb_in, 64);
+			ring_doorbell(0);
+			if (!acked(&glb_in[GLB_REQ / 4], &glb_out[GLB_ACK / 4], GLB_REQ_CFG_PWROFF_TIMER, 100)) {
+				fw_state("the power-off timer not acknowledged");
+				return false;
+			}
+			printf("mali: 6: the shader cores left to the firmware (power-off timer 20000 ticks)\n");
+			return true;
+		}
+	}
 	glb_in[GLB_PWROFF_TIMER / 4] = 0;
 	glb_in[GLB_REQ / 4] ^= GLB_REQ_CFG_PWROFF_TIMER;
 	to_gpu(glb_in, 64);
@@ -1174,6 +1192,20 @@ compute_job(void)
 
 	cmd[n++] = 34ULL << 56 | 1;                                     /* REQ_RESOURCE compute (without it the stream
 	                                                                 * stopped at RUN_COMPUTE, waiting for nothing said) */
+	/*
+	 * v11's scoreboard state, as panvk sets it up for a queue (panvk_vX_gpu_queue.c, PAN_ARCH >= 11; Google's own
+	 * streams on Android start the same way): SET_STATE_IMM32 (opcode 28, the state in bits 39:32) -- the entry that
+	 * tracks endpoint tasks (3), the entries WAIT waits on (0x8), the load/store one (0), the deferred one (1), and the
+	 * entries the stream may use (0xf0). Without it RUN_COMPUTE waited for ever, saying nothing (v10's way,
+	 * SET_SB_ENTRY, is not what this GPU has).
+	 */
+	cmd[n++] = 28ULL << 56 | 0ULL << 32 | 3;                        /* SB_SEL_ENDPOINT 3 */
+	cmd[n++] = 28ULL << 56 | 9ULL << 32 | 0x8;                      /* SB_MASK_WAIT 0x8 */
+	cmd[n++] = 28ULL << 56 | 1ULL << 32 | 0;                        /* SB_SEL_OTHER 0 */
+	cmd[n++] = 28ULL << 56 | 2ULL << 32 | 1;                        /* SB_SEL_DEFERRED 1 */
+	cmd[n++] = 28ULL << 56 | 8ULL << 32 | 0xf0;                     /* SB_MASK_STREAM 0xf0 */
+	cmd[n++] = 2ULL << 56 | 62ULL << 48 | 0;                        /* iteration trace ids, as Google's streams */
+	cmd[n++] = 2ULL << 56 | 63ULL << 48 | 0;
 	cmd[n++] = 1ULL << 56 | 16ULL << 48 | spd;                      /* MOVE48 r16:r17 <- the shader program */
 	cmd[n++] = 1ULL << 56 | 24ULL << 48 | tsd;                      /* MOVE48 r24:r25 <- the local storage */
 	cmd[n++] = 1ULL << 56 | 8ULL << 48 | fau;                       /* MOVE48 r8:r9 <- the push constants ... */
@@ -1414,7 +1446,19 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	if (!announce(8, "the first job: four instructions that store two words into a page of ours")) {
 		goto out;
 	}
-	first_job();
+	{
+		/*
+		 * The compute job runs as the queue's first work (mali_skipfirst=0 puts step 8's store job before it): after
+		 * one job the group goes idle, and the way back from idle is not right yet -- with the store job first, the
+		 * compute job's stream waited at RUN_COMPUTE with no endpoints granted; as the first work it ran.
+		 */
+		unsigned int skip = 1;
+
+		PE_parse_boot_argn("mali_skipfirst", &skip, sizeof(skip));
+		if (!skip) {
+			first_job();
+		}
+	}
 	if (!announce(9, "the first compute job: a shader of four instructions on the shader cores")) {
 		goto out;
 	}
