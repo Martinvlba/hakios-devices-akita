@@ -452,6 +452,9 @@ static uint32_t *ring, *target, *code, *desc;
 static unsigned int ring_used;     /* bytes of the ring the jobs so far took */
 static volatile uint8_t *doorbells;
 static void fwlog_dump(const char *when);
+#define MCU_ZONE_BASE           0x05400000u             /* the MCU's: groups' user pages and suspend buffers */
+#define MCU_POOL_SIZE           0xc0000u                /* 8 groups x (64 KiB + 4 queues x 8 KiB) */
+static vm_offset_t mcu_pool;
 static char *fwlog;                     /* the firmware's log text, and its two pointers */
 static volatile uint32_t *fwlog_insert, *fwlog_extract;
 
@@ -484,7 +487,10 @@ ring_doorbell(unsigned int n)
 }
 
 /* the GPU's L2 and load/store caches cleaned and invalidated, waited for */
-#define CMD_FLUSH_L2_LSC        0x3304          /* code 4 (flush caches), L2 and LSC clean+invalidate */
+#define CMD_FLUSH_L2_LSC        0x23304         /* code 4 (flush caches): L2 and LSC clean+invalidate, and the "other"
+                                                 * caches invalidated -- among them the command stream's own fetches:
+                                                 * without it a submission's first instructions, written into a ring
+                                                 * line the stream had already fetched (as empty ones), were lost */
 #define IRQ_CLEAN_CACHES_DONE   (1u << 17)
 static void
 flush_gpu(void)
@@ -770,6 +776,13 @@ load_firmware(void)
 		return false;
 	}
 	fwlog_setup(fw, end);
+	/* the MCU's zone for groups (suspend buffers, queues' user pages): mapped now, before the MCU walks these tables --
+	 * changing the MCU's own address space under it (as_update(0)) left a group unstarted */
+	mcu_pool = map_region(MCU_ZONE_BASE, MCU_POOL_SIZE);
+	if (mcu_pool == 0) {
+		printf("mali: %u: no memory for the MCU's zone\n", step);
+		return false;
+	}
 	/* our own regions too, before the MCU walks these tables: a table changed under it may stay stale in the L2 */
 	ring = (uint32_t *)map_region(RING_VA, 0x10000);
 	target = (uint32_t *)map_region(TARGET_VA, 0x1000);
@@ -1307,6 +1320,550 @@ compute_job(void)
 	fw_state("after the compute job");
 }
 
+/*
+ * ---- The GPU kept on (mali_keep=1): what the service HakiosGPU (hakios.akita_gpu.cpp) gives programs ----
+ *
+ * Steps 1 to 6 bring the GPU up and the firmware's global interface; then the GPU stays on, and HakiosGPU speaks
+ * Linux's panthor interface (the one Mesa's panfrost and panvk know) over these functions. Every one of them is called
+ * with the service's lock held: nothing here locks.
+ *
+ *   address spaces  one per program VM, slots 1..7 of the GPU's MMU (0 is the MCU's), each with its own tables; the
+ *                   upper half of its 48 bits is the kernel's (Mesa's split): rings and sequence pages go there
+ *   groups          command stream groups 0..7, each with queues (its streams); a queue's ring and its user pages
+ *                   are the kernel's, its doorbell is 1 + the group's slot
+ *   submissions     into a queue's ring: CALL the program's stream, WAIT every scoreboard, then store the queue's
+ *                   new sequence number into its sequence page (r92..r95, the registers Mesa leaves the kernel); done
+ *                   is that number having reached the page
+ *
+ * The stream holds REQ_RESOURCE compute from the start of its life (a request made only after the group had been
+ * idle never took effect, step 9's lesson); the scoreboards each program sets up itself (panvk does).
+ */
+#define KVM_BASE                0x800000000000ULL       /* the kernel's half of a program's address space */
+#define MAX_VMS                 8
+#define MAX_GROUPS              8
+#define MAX_QUEUES              4
+
+struct mali_queue {
+	vm_offset_t ring;               /* the kernel's address */
+	uint64_t ring_va;               /* the group's address (the kernel's half of its VM) */
+	uint32_t ring_size;
+	uint64_t insert;                /* bytes written, ever */
+	volatile uint32_t *user_in, *user_out;
+	volatile uint64_t *seqno;       /* the sequence page: the last number the queue reached */
+	uint64_t seqno_va, submitted;
+};
+
+static struct mali_vm {
+	bool used;
+	uint64_t *root;
+	uint64_t kernel_next;           /* the next free address of the kernel's half */
+} vms[MAX_VMS];
+
+static struct mali_group {
+	bool used;
+	unsigned int vm, queues;
+	struct mali_queue q[MAX_QUEUES];
+} groups[MAX_GROUPS];
+
+static uint32_t mcu_next = MCU_ZONE_BASE;
+static bool kept;
+
+bool akita_mali_ready(void);
+bool
+akita_mali_ready(void)
+{
+	return kept && rd(MCU_STATUS) == MCU_ENABLED;
+}
+
+/* a page into a table tree, every entry written cleaned to memory for the GPU's walk */
+static bool
+map_page_in(uint64_t *root, uint64_t va, uint64_t phys, uint64_t attributes)
+{
+	uint64_t *table = root;
+
+	for (int level = 0; level < 3; level++) {
+		uint64_t *entry = &table[(va >> (39 - 9 * level)) & 511];
+
+		if ((*entry & 3) == 0) {
+			uint64_t *next = new_table();
+
+			if (next == NULL) {
+				return false;
+			}
+			clean_dcache((vm_offset_t)next, GPU_PAGE, FALSE);
+			*entry = kvtophys((vm_offset_t)next) | PTE_VALID_TABLE;
+			clean_dcache((vm_offset_t)entry & ~63UL, 64, FALSE);
+		}
+		table = (uint64_t *)phystokv(*entry & PTE_ADDR);
+	}
+	table[(va >> 12) & 511] = (phys & PTE_ADDR) | attributes | PTE_AF | PTE_VALID_TABLE;
+	clean_dcache((vm_offset_t)&table[(va >> 12) & 511] & ~63UL, 64, FALSE);
+	return true;
+}
+
+static void
+unmap_page_in(uint64_t *root, uint64_t va)
+{
+	uint64_t *table = root;
+
+	for (int level = 0; level < 3; level++) {
+		uint64_t entry = table[(va >> (39 - 9 * level)) & 511];
+
+		if ((entry & 3) == 0) {
+			return;
+		}
+		table = (uint64_t *)phystokv(entry & PTE_ADDR);
+	}
+	table[(va >> 12) & 511] = 0;
+	clean_dcache((vm_offset_t)&table[(va >> 12) & 511] & ~63UL, 64, FALSE);
+}
+
+/* an address space's registers pointed at its tables again: the TLB and the walk's caches see what was written */
+static void
+as_update(unsigned int as)
+{
+	uint32_t base = AS0 + as * 0x40;
+
+	flush_gpu();
+	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+	wr64(base + AS_TRANSCFG, TRANSCFG_VALUE);
+	wr64(base + AS_TRANSTAB, kvtophys((vm_offset_t)(as == 0 ? level0 : vms[as].root)));
+	wr64(base + AS_MEMATTR, MEMATTR_TABLE);
+	wr(base + AS_COMMAND, AS_CMD_UPDATE);
+	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+}
+
+int akita_mali_vm_new(void);
+int
+akita_mali_vm_new(void)
+{
+	for (unsigned int i = 1; i < MAX_VMS; i++) {
+		if (!vms[i].used) {
+			vms[i].root = new_table();
+			if (vms[i].root == NULL) {
+				return -1;
+			}
+			clean_dcache((vm_offset_t)vms[i].root, GPU_PAGE, FALSE);
+			vms[i].used = true;
+			vms[i].kernel_next = KVM_BASE;
+			as_update(i);
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+void akita_mali_vm_free(int vm);
+void
+akita_mali_vm_free(int vm)
+{
+	if (vm > 0 && vm < MAX_VMS) {
+		vms[vm].used = false;   /* (its tables stay in the pool: given again with the next VM's) */
+	}
+}
+
+/* flags: 1 read only, 2 not executable, 4 uncached (panthor's DRM_PANTHOR_VM_BIND_OP_MAP_*) */
+bool akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags);
+bool
+akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags)
+{
+	uint64_t attributes = (flags & 1) ? PTE_RO : PTE_RW;
+
+	if (vm <= 0 || vm >= MAX_VMS || !vms[vm].used || (va & (GPU_PAGE - 1)) || va >= KVM_BASE) {
+		return false;
+	}
+	if (flags & 2) {
+		attributes |= PTE_NX;
+	}
+	attributes |= (uint64_t)((flags & 4) ? ATTR_NON_CACHEABLE : ATTR_CACHED) << 2;
+	return map_page_in(vms[vm].root, va, phys, attributes);
+}
+
+void akita_mali_vm_unmap(int vm, uint64_t va, uint64_t size);
+void
+akita_mali_vm_unmap(int vm, uint64_t va, uint64_t size)
+{
+	if (vm <= 0 || vm >= MAX_VMS || !vms[vm].used) {
+		return;
+	}
+	for (uint64_t off = 0; off < size; off += GPU_PAGE) {
+		unmap_page_in(vms[vm].root, va + off);
+	}
+}
+
+void akita_mali_vm_flush(int vm);
+void
+akita_mali_vm_flush(int vm)
+{
+	if (vm > 0 && vm < MAX_VMS && vms[vm].used) {
+		as_update((unsigned int)vm);
+	}
+}
+
+/* memory of the kernel's in a VM's kernel half (rings, sequence pages); its kernel address */
+static vm_offset_t
+vm_kernel_region(unsigned int vm, vm_size_t size, uint64_t *va, bool exec)
+{
+	vm_offset_t memory = gpu_memory(size);
+
+	if (memory == 0) {
+		return 0;
+	}
+	clean_dcache(memory, (unsigned)round_page(size), FALSE);
+	*va = vms[vm].kernel_next;
+	for (vm_size_t off = 0; off < size; off += GPU_PAGE) {
+		if (!map_page_in(vms[vm].root, *va + off, kvtophys(memory + off), (exec ? PTE_RO : PTE_RW | PTE_NX) |
+		    (uint64_t)ATTR_CACHED << 2)) {
+			return 0;
+		}
+	}
+	vms[vm].kernel_next += round_page(size) + PAGE_SIZE;   /* a page between them */
+	return memory;
+}
+
+/* memory the MCU reaches (in its 28 bits): queues' user pages, suspend buffers */
+static vm_offset_t
+mcu_region(vm_size_t size, uint32_t *va)
+{
+	vm_offset_t memory;
+
+	size = round_page(size);
+	if (mcu_pool == 0 || mcu_next + size > MCU_ZONE_BASE + MCU_POOL_SIZE) {
+		return 0;
+	}
+	memory = mcu_pool + (mcu_next - MCU_ZONE_BASE);
+	bzero((void *)memory, size);
+	clean_dcache(memory, (unsigned)size, FALSE);
+	*va = mcu_next;
+	mcu_next += size;
+	return memory;
+}
+
+static void
+group_blocks(unsigned int g, volatile uint32_t **in, volatile uint32_t **out, uint32_t **control)
+{
+	uint32_t *gc = glb_ctl + (GROUP_CONTROL_0 + g * glb_ctl[GLB_GROUP_STRIDE_W]) / 4;
+
+	*control = gc;
+	*in = kernel_address(gc[GROUP_INPUT_VA / 4]);
+	*out = kernel_address(gc[GROUP_OUTPUT_VA / 4]);
+}
+
+static void
+stream_blocks(uint32_t *gc, unsigned int q, volatile uint32_t **in, volatile uint32_t **out)
+{
+	uint32_t *sc = gc + (STREAM_CONTROL_0 + q * gc[GROUP_STREAM_STRIDE / 4]) / 4;
+
+	*in = kernel_address(sc[STREAM_INPUT_VA / 4]);
+	*out = kernel_address(sc[STREAM_OUTPUT_VA / 4]);
+}
+
+/* ring sizes in bytes (powers of two, 4 KiB to 1 MiB); the group's slot or -1 */
+int akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority);
+int
+akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority)
+{
+	volatile uint32_t *gin, *gout, *sin, *sout;
+	uint32_t *gc, suspend_va, mcu_va;
+	uint64_t shaders = rd64(SHADER_PRESENT);
+	unsigned int compute = 0, g;
+	struct mali_group *grp;
+
+	if (vm <= 0 || vm >= MAX_VMS || !vms[vm].used || nqueues == 0 || nqueues > MAX_QUEUES) {
+		return -1;
+	}
+	for (g = 0; g < MAX_GROUPS && groups[g].used; g++) {
+	}
+	if (g == MAX_GROUPS) {
+		return -1;
+	}
+	grp = &groups[g];
+	bzero(grp, sizeof(*grp));
+	from_gpu((void *)shared_iface, 0x10000);
+	group_blocks(g, &gin, &gout, &gc);
+	if (gin == NULL || gout == NULL || nqueues > gc[GROUP_STREAM_NUM / 4] || gc[GROUP_SUSPEND_SIZE / 4] > 0x40000) {
+		return -1;
+	}
+	if (mcu_region(gc[GROUP_SUSPEND_SIZE / 4], &suspend_va) == 0) {
+		return -1;
+	}
+	for (unsigned int q = 0; q < nqueues; q++) {
+		struct mali_queue *mq = &grp->q[q];
+		uint32_t size = ring_sizes[q];
+		vm_offset_t user;
+
+		if (size < 0x1000 || size > 0x100000 || (size & (size - 1))) {
+			return -1;
+		}
+		mq->ring = vm_kernel_region((unsigned)vm, size, &mq->ring_va, false);
+		mq->seqno = (volatile uint64_t *)vm_kernel_region((unsigned)vm, GPU_PAGE, &mq->seqno_va, false);
+		user = mcu_region(2 * GPU_PAGE, &mcu_va);
+		if (mq->ring == 0 || mq->seqno == NULL || user == 0) {
+			return -1;
+		}
+		mq->ring_size = size;
+		mq->user_in = (volatile uint32_t *)user;
+		mq->user_out = (volatile uint32_t *)(user + GPU_PAGE);
+		/* the stream's first words: REQ_RESOURCE compute, held from its start; and 0xaaaa stored into the sequence
+		 * page's second word (a check that the group's writes arrive: akita_mali_debug prints it) */
+		{
+			uint64_t *r = (uint64_t *)mq->ring;
+
+			r[0] = 34ULL << 56 | 1;
+			r[1] = 1ULL << 56 | 92ULL << 48 | (mq->seqno_va + 8);
+			r[2] = 2ULL << 56 | 94ULL << 48 | 0xaaaa;
+			r[3] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;
+			mq->insert = 64;                /* (the rest of the line NOPs: zero) */
+			to_gpu((void *)mq->ring, 64);
+		}
+		mq->user_in[CS_INSERT / 4] = (uint32_t)mq->insert;
+		to_gpu(mq->user_in, 16);
+		stream_blocks(gc, q, &sin, &sout);
+		if (sin == NULL || sout == NULL) {
+			return -1;
+		}
+		from_gpu(sin, 128);
+		from_gpu(sout, 128);
+		sin[CS_BASE_LO / 4] = (uint32_t)mq->ring_va;
+		sin[CS_BASE_HI / 4] = (uint32_t)(mq->ring_va >> 32);
+		sin[CS_SIZE / 4] = size;
+		sin[CS_USER_INPUT_LO / 4] = mcu_va;
+		sin[CS_USER_INPUT_HI / 4] = 0;
+		sin[CS_USER_OUTPUT_LO / 4] = mcu_va + GPU_PAGE;
+		sin[CS_USER_OUTPUT_HI / 4] = 0;
+		sin[CS_CONFIG / 4] = (1 + g) << 8 | 1;
+		sin[CS_ACK_IRQ_MASK / 4] = 0xffffffff;
+		sin[CS_REQ / 4] = (sout[CS_ACK / 4] & 0xc0000000u) | CS_REQ_IDLE_BITS | CS_STATE_START;
+		to_gpu(sin, 128);
+	}
+	as_update((unsigned int)vm);            /* the rings and pages just mapped into it */
+	for (uint64_t m = shaders; m; m &= m - 1) {
+		compute++;
+	}
+	from_gpu(gout, 64);
+	gin[CSG_DB_REQ / 4] = gout[CSG_DB_ACK / 4] ^ ((1u << nqueues) - 1);
+	gin[CSG_ALLOW_COMPUTE_LO / 4] = (uint32_t)shaders;
+	gin[CSG_ALLOW_COMPUTE_HI / 4] = (uint32_t)(shaders >> 32);
+	gin[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
+	gin[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
+	gin[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
+	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(priority & 15) << 28;
+	gin[CSG_EP_REQ_HI / 4] = 0;
+	gin[CSG_CONFIG / 4] = (uint32_t)vm;     /* the group's address space is its VM's slot */
+	gin[CSG_SUSPEND_BUF_LO / 4] = suspend_va;
+	gin[CSG_SUSPEND_BUF_HI / 4] = 0;
+	gin[CSG_ACK_IRQ_MASK / 4] = 0xffffffff;
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u) | CSG_STATE_START;
+	to_gpu(gin, 128);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
+		printf("mali: group %u did not start (CSG_REQ 0x%x, ACK 0x%x)\n", g, gin[CSG_REQ / 4], gout[CSG_ACK / 4]);
+		faults("a group's start");
+		return -1;
+	}
+	grp->used = true;
+	grp->vm = (unsigned)vm;
+	grp->queues = nqueues;
+	printf("mali: group %u started in address space %d, %u queue(s)\n", g, vm, nqueues);
+	return (int)g;
+}
+
+void akita_mali_group_free(int g);
+void
+akita_mali_group_free(int g)
+{
+	volatile uint32_t *gin, *gout;
+	uint32_t *gc;
+
+	if (g < 0 || g >= MAX_GROUPS || !groups[g].used) {
+		return;
+	}
+	group_blocks((unsigned)g, &gin, &gout, &gc);
+	from_gpu(gout, 64);
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u);            /* TERMINATE */
+	to_gpu(gin, 64);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200);
+	groups[g].used = false;         /* (its memory stays: given again with the next group's) */
+}
+
+/*
+ * A program's stream into a queue: the ring's instructions (CALL it; WAIT; store the new sequence number), then the
+ * group woken as step 9 found it must be. The sequence number (1, 2, ...) or 0 if there is no room or no queue.
+ */
+uint64_t akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size);
+uint64_t
+akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
+{
+	struct mali_queue *mq;
+	volatile uint32_t *gin, *gout;
+	uint32_t *gc;
+	uint64_t cmd[24];
+	unsigned int n = 0;
+
+	if (g < 0 || g >= MAX_GROUPS || !groups[g].used || q >= groups[g].queues || (size & 7) || size == 0) {
+		return 0;
+	}
+	mq = &groups[g].q[q];
+	from_gpu(mq->user_out, 16);
+	if (mq->insert + sizeof(cmd) - *(volatile uint64_t *)mq->user_out > mq->ring_size) {
+		return 0;                       /* the ring is full: the GPU is that far behind */
+	}
+	mq->submitted++;
+	{
+		unsigned int calltest = 0;      /* mali_calltest=1: the ring stores 0xbbbb at stream - 0x800 + 0x130 first */
+
+		PE_parse_boot_argn("mali_calltest", &calltest, sizeof(calltest));
+		if (calltest) {
+			cmd[n++] = 1ULL << 56 | 92ULL << 48 | ((stream - 0x800 + 0x130) & 0xffffffffffffULL);
+			cmd[n++] = 2ULL << 56 | 94ULL << 48 | 0xbbbb;
+			cmd[n++] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;
+		}
+	}
+	cmd[n++] = 1ULL << 56 | 92ULL << 48 | (stream & 0xffffffffffffULL);     /* MOVE48 r92:r93 <- the stream */
+	cmd[n++] = 2ULL << 56 | 94ULL << 48 | size;                             /* MOVE32 r94 <- its length */
+	cmd[n++] = 32ULL << 56 | 92ULL << 40 | 94ULL << 32;                     /* CALL [r92], r94 */
+	cmd[n++] = 3ULL << 56 | 0xffffULL << 16;                                /* WAIT on every scoreboard */
+	cmd[n++] = 1ULL << 56 | 92ULL << 48 | mq->seqno_va;                     /* MOVE48 r92 <- the sequence page */
+	cmd[n++] = 1ULL << 56 | 94ULL << 48 | (mq->submitted & 0xffffffffffffULL);     /* MOVE48 r94:r95 <- the number */
+	cmd[n++] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x3ULL << 16;      /* STORE_MULTIPLE r94..r95 -> [r92] */
+	cmd[n++] = 0;                                                           /* NOP */
+	while ((mq->insert + n * 8) & 63) {
+		cmd[n++] = 0;                   /* NOPs to the end of the line: each submission in whole lines of the ring */
+	}
+	for (unsigned int i = 0; i < n; i++) {
+		*(uint64_t *)(mq->ring + ((mq->insert + i * 8) & (mq->ring_size - 1))) = cmd[i];
+	}
+	to_gpu((void *)mq->ring, mq->ring_size);
+	mq->insert += n * 8;
+	*(volatile uint64_t *)mq->user_in = mq->insert;
+	to_gpu(mq->user_in, 16);
+	/* the wake (step 9): caches, the group's idle event acked and its endpoints asked for again, the doorbells */
+	flush_gpu();
+	group_blocks((unsigned)g, &gin, &gout, &gc);
+	from_gpu(gout, 64);
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~CSG_REQ_IDLE) | (gout[CSG_ACK / 4] & CSG_REQ_IDLE);
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~CSG_REQ_EP_CFG) | ((gout[CSG_ACK / 4] ^ CSG_REQ_EP_CFG) & CSG_REQ_EP_CFG);
+	gin[CSG_IRQ_ACK / 4] = gout[CSG_IRQ_REQ / 4];
+	gin[CSG_DB_REQ / 4] = (gin[CSG_DB_REQ / 4] & ~(1u << q)) | ((gout[CSG_DB_ACK / 4] ^ (1u << q)) & (1u << q));
+	to_gpu(gin, 64);
+	wr(JOB_IRQ_CLEAR, 0xffffffff);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << g)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << g)) & (1u << g));
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	ring_doorbell(1 + (unsigned)g);
+	return mq->submitted;
+}
+
+/* the last sequence number the queue reached (what the GPU wrote is read after its caches are flushed) */
+uint64_t akita_mali_reached(int g, unsigned int q);
+uint64_t
+akita_mali_reached(int g, unsigned int q)
+{
+	if (g < 0 || g >= MAX_GROUPS || !groups[g].used || q >= groups[g].queues) {
+		return 0;
+	}
+	flush_gpu();
+	from_gpu(groups[g].q[q].seqno, 8);
+	return *groups[g].q[q].seqno;
+}
+
+/* every group's queues as the firmware sees them (a wait that timed out asks for this) */
+void akita_mali_debug(void);
+void
+akita_mali_debug(void)
+{
+	for (unsigned int g = 0; g < MAX_GROUPS; g++) {
+		volatile uint32_t *gin, *gout, *sin, *sout;
+		uint32_t *gc;
+
+		if (!groups[g].used) {
+			continue;
+		}
+		group_blocks(g, &gin, &gout, &gc);
+		from_gpu(gout, 64);
+		gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~(1u << 5)) | ((gout[CSG_ACK / 4] ^ (1u << 5)) & (1u << 5));
+		to_gpu(gin, 64);
+		from_gpu(glb_out, 64);
+		glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << g)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << g)) & (1u << g));
+		to_gpu(glb_in, 64);
+		ring_doorbell(0);
+		acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 1u << 5, 100);
+		flush_gpu();
+		from_gpu(gout, 64);
+		printf("mali: group %u: CSG_REQ 0x%x ACK 0x%x, DB_REQ 0x%x ACK 0x%x, endpoints 0x%x of 0x%x\n", g,
+		    gin[CSG_REQ / 4], gout[CSG_ACK / 4], gin[CSG_DB_REQ / 4], gout[CSG_DB_ACK / 4], gout[0x10 / 4], gout[0x14 / 4]);
+		for (unsigned int q = 0; q < groups[g].queues; q++) {
+			struct mali_queue *mq = &groups[g].q[q];
+
+			stream_blocks(gc, q, &sin, &sout);
+			from_gpu(sout, 256);
+			from_gpu(mq->user_out, 16);
+			from_gpu(mq->seqno, 8);
+			printf("mali: group %u queue %u: insert 0x%llx, extract 0x%llx, active %u; cmd at 0x%x%08x, CS_REQ 0x%x ACK "
+			    "0x%x, wait 0x%x, blocked 0x%x, requested 0x%x, fault 0x%x fatal 0x%x (info 0x%x%08x); seqno %llu of %llu, "
+			    "the start's check word 0x%llx\n",
+			    g, q, mq->insert, *(volatile uint64_t *)mq->user_out, mq->user_out[CS_ACTIVE / 4], sout[0x44 / 4],
+			    sout[0x40 / 4], sin[CS_REQ / 4], sout[CS_ACK / 4], sout[0x48 / 4], sout[0x60 / 4], sout[0x4c / 4],
+			    sout[CS_FAULT / 4], sout[CS_FATAL / 4], sout[0x8c / 4], sout[0x88 / 4], *mq->seqno, mq->submitted,
+			    mq->seqno[1]);
+		}
+	}
+	faults("the service asked");
+	fwlog_dump("the service asked");
+	{
+		volatile uint8_t *m = (volatile uint8_t *)ml_io_map(S2MPU_G3D_PHYS, 0x10000);
+		uint32_t st = *(volatile uint32_t *)(m + S2MPU_FAULT_STATUS);
+
+		printf("mali: S2MPU fault status 0x%x\n", st);
+		for (unsigned int vid = 0; vid < 8; vid++) {
+			if (st & (1u << vid)) {
+				printf("mali: S2MPU vid %u: fault at 0x%x%08x, info 0x%x\n", vid, *(volatile uint32_t *)(m + 0x2008 + vid * 0x20),
+				    *(volatile uint32_t *)(m + 0x2004 + vid * 0x20), *(volatile uint32_t *)(m + 0x2010 + vid * 0x20));
+			}
+		}
+	}
+}
+
+/* the GPU's caches flushed: what it wrote into programs' buffers is in memory for the processors */
+void akita_mali_flush(void);
+void
+akita_mali_flush(void)
+{
+	flush_gpu();
+}
+
+/* what DRM_PANTHOR_DEV_QUERY tells: register values, and the command stream interface's sizes */
+void akita_mali_info(uint32_t *regs, uint32_t *csif);
+void
+akita_mali_info(uint32_t *regs, uint32_t *csif)
+{
+	uint32_t *gc = glb_ctl + GROUP_CONTROL_0 / 4;
+	uint32_t *sc = gc + STREAM_CONTROL_0 / 4;
+	uint32_t features;
+
+	for (unsigned int i = 0; i < 0x130 / 4; i++) {          /* regs: 256 words; only registers there are read */
+		regs[i] = rd(i * 4);
+	}
+	regs[COHERENCY_FEATURES / 4] = rd(COHERENCY_FEATURES);
+	from_gpu((void *)shared_iface, 0x10000);
+	features = sc[STREAM_FEATURES / 4];
+	csif[0] = glb_ctl[GLB_GROUP_NUM_W];             /* csg_slot_count */
+	csif[1] = gc[GROUP_STREAM_NUM / 4];             /* cs_slot_count */
+	csif[2] = (features & 0xff) + 1;                /* cs_reg_count: CS_FEATURES work registers */
+	csif[3] = (features >> 8) & 0xff;               /* scoreboard_slot_count */
+	csif[4] = 4;                                    /* unpreserved_cs_reg_count: r92..r95 are the kernel's */
+}
+
+void akita_gpu_start(void);     /* hakios.akita_gpu.cpp: the service */
+
 /* ---- the steps ---- */
 
 static void
@@ -1390,6 +1947,22 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		if (PE_parse_boot_argn("mali_s2mpu", &open_s2mpu, sizeof(open_s2mpu)) && open_s2mpu > 0) {
 			s2mpu(open_s2mpu);
 		}
+		unsigned int probe_regions = 0;
+
+		/* mali_probe=1: can the GPU read each of the phone's four RAM regions (Android's tree: 0x8000_0000,
+		 * 0x8_8000_0000, 0x9_0000_0000, 0x9_8000_0000, 2 GiB each)? -- buffers from 0x9_9eaa_4000 read as nothing */
+		if (PE_parse_boot_argn("mali_probe", &probe_regions, sizeof(probe_regions)) && probe_regions) {
+			static const uint64_t at[] = { 0x80000000ULL, 0xc0000000ULL, 0xfff00000ULL, 0x880000000ULL, 0x8f0000000ULL,
+			    0x8fff00000ULL, 0x900000000ULL, 0x940000000ULL, 0x980000000ULL, 0x99eaa4000ULL, 0x9fff00000ULL };
+
+			for (unsigned int i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
+				int r = probe_page(at[i]);
+
+				printf("mali: probe: 0x%llx: %s\n", at[i], r == 0 ? "REFUSED (a bus fault)" : r == 1 ?
+				    "read (an invalid entry)" : r == 2 ? "read (something walked)" : "no answer");
+			}
+			goto out;
+		}
 		if (PE_parse_boot_argn("mali_scan", &scan_pages, sizeof(scan_pages)) && scan_pages > 0) {
 			scan(scan_pages > 256 ? 256 : scan_pages);
 			goto out;
@@ -1454,6 +2027,17 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	if (!global_setup()) {
 		goto out;
 	}
+	{
+		unsigned int keep = 0;
+
+		PE_parse_boot_argn("mali_keep", &keep, sizeof(keep));
+		if (keep) {
+			kept = true;
+			printf("mali: the GPU kept on: HakiosGPU (panthor's interface) for programs\n");
+			akita_gpu_start();
+			return;
+		}
+	}
 	if (!announce(7, "a command stream group (slot 0) with one queue, in address space 1")) {
 		goto out;
 	}
@@ -1501,7 +2085,12 @@ akita_mali_init(void)
 	uint64_t deadline;
 
 	if (!PE_parse_boot_argn("mali", &steps, sizeof(steps)) || steps == 0) {
-		return;
+		uint32_t keep = 0;
+
+		if (!PE_parse_boot_argn("mali_keep", &keep, sizeof(keep)) || keep == 0) {
+			return;
+		}
+		steps = 6;              /* mali_keep=1 alone: up to the global interface, then kept */
 	}
 	PE_parse_boot_argn("mali_delay", &delay_s, sizeof(delay_s));
 	printf("mali: steps 1 to %u in %u s\n", steps, delay_s);
