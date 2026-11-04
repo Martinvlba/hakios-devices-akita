@@ -398,6 +398,7 @@ kernel_address(uint64_t va)
 #define CSG_IRQ_REQ             0x0c    /* (output) */
 #define CSG_IRQ_ACK             0x0c    /* (input) */
 #define CSG_REQ_IDLE            (1u << 29)
+#define CSG_REQ_EP_CFG          (1u << 4)
 #define CSG_DB_ACK              0x08
 #define CSG_STATE_START         1
 /* stream control, input, output */
@@ -1123,6 +1124,19 @@ first_job(void)
 	target[1] = 0x22222222;
 	to_gpu(target, 16);
 	/* MOVE48 r0 <- the target; MOVE32 r4, r5 <- two words; STORE_MULTIPLE r4..r5 -> [r0 + 0] (Mesa's v10/v12 genxml) */
+	{
+		/*
+		 * The stream holds its compute request from its very start (as Google's and panvk's streams do): a request
+		 * made only after the group had gone idle once never took effect (the stream's requested resources stayed 0,
+		 * no endpoints, the next job waiting at RUN_COMPUTE). mali_firstreq=0 leaves it out, to see that again.
+		 */
+		unsigned int req = 1;
+
+		PE_parse_boot_argn("mali_firstreq", &req, sizeof(req));
+		if (req) {
+			cmd[n++] = 34ULL << 56 | 1;
+		}
+	}
 	cmd[n++] = 1ULL << 56 | 0ULL << 48 | (TARGET_VA & 0xffffffffffffULL);
 	cmd[n++] = 2ULL << 56 | 4ULL << 48 | 0xc0ffee11ULL;
 	cmd[n++] = 2ULL << 56 | 5ULL << 48 | 0x5a5a1234ULL;
@@ -1245,6 +1259,9 @@ compute_job(void)
 	 * kicks a queue again -- through the group's kernel doorbell bit for the stream and doorbell 0 -- and so does this */
 	from_gpu(csg_out, 64);
 	csg_in[CSG_REQ / 4] = (csg_in[CSG_REQ / 4] & ~CSG_REQ_IDLE) | (csg_out[CSG_ACK / 4] & CSG_REQ_IDLE);
+	/* and its endpoints asked for again (CSG_REQ EP_CFG toggled): an idle group's are taken back, and were not given
+	 * again for the next job without it */
+	csg_in[CSG_REQ / 4] = (csg_in[CSG_REQ / 4] & ~CSG_REQ_EP_CFG) | ((csg_out[CSG_ACK / 4] ^ CSG_REQ_EP_CFG) & CSG_REQ_EP_CFG);
 	csg_in[CSG_IRQ_ACK / 4] = csg_out[CSG_IRQ_REQ / 4];
 	csg_in[CSG_DB_REQ / 4] = csg_out[CSG_DB_ACK / 4] ^ 1u;
 	to_gpu(csg_in, 64);
@@ -1448,11 +1465,9 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	}
 	{
 		/*
-		 * The compute job runs as the queue's first work (mali_skipfirst=0 puts step 8's store job before it): after
-		 * one job the group goes idle, and the way back from idle is not right yet -- with the store job first, the
-		 * compute job's stream waited at RUN_COMPUTE with no endpoints granted; as the first work it ran.
+		 * mali_skipfirst=1: the compute job as the queue's first work (without step 8's store job before it).
 		 */
-		unsigned int skip = 1;
+		unsigned int skip = 0;
 
 		PE_parse_boot_argn("mali_skipfirst", &skip, sizeof(skip));
 		if (!skip) {
@@ -1462,7 +1477,14 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	if (!announce(9, "the first compute job: a shader of four instructions on the shader cores")) {
 		goto out;
 	}
-	compute_job();
+	{
+		unsigned int repeat = 1;        /* mali_repeat=N: the compute job N times, the group idle in between */
+
+		PE_parse_boot_argn("mali_repeat", &repeat, sizeof(repeat));
+		for (unsigned int i = 0; i < repeat && i < 16; i++) {
+			compute_job();
+		}
+	}
 
 out:
 	if (step >= 2) {
