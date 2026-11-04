@@ -20,6 +20,7 @@
  *   6  talks   to the firmware's global interface: a ping, the shader cores allowed
  *   7  writes  a command stream group (slot 0) with one queue, in address space 1 (the same tables), started
  *   8  runs    the first job: four command-stream instructions storing two words into a page of ours, checked
+ *   9  runs    the first compute job: a four-instruction shader (assembled by Mesa) storing a word, then a marker
  * After the last step the MCU is stopped again and the GPU reset: nothing outlives the run.
  *
  * What the hardware is, and where each value comes from: Google's Android kernel for this phone (google-modules/gpu,
@@ -73,6 +74,8 @@ extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint6
 #define SHADER_READY            0x140
 #define TILER_READY             0x150
 #define L2_READY                0x160
+#define SHADER_PWRON            0x180
+#define TILER_PWRON             0x190
 #define L2_PWRON                0x1a0
 #define L2_PWRTRANS             0x220
 #define ASN_HASH(n)             (0x2c0 + 4 * (n))   /* the L2's slice hash, v11's name */
@@ -365,6 +368,10 @@ kernel_address(uint64_t va)
 #define GLB_DB_ACK              0x08
 #define GLB_FATAL_STATUS        0x10
 #define GLB_REQ_CFG_ALLOC_EN    (1u << 2)
+#define GLB_REQ_CFG_PWROFF_TIMER (1u << 3)
+#define GLB_REQ_CFG_PROGRESS_TIMER (1u << 1)
+#define GLB_PROGRESS_TIMER      0x10
+#define GLB_PWROFF_TIMER        0x14
 #define GLB_REQ_PING            (1u << 8)
 /* group control, input, output */
 #define GROUP_FEATURES          0x00
@@ -388,6 +395,9 @@ kernel_address(uint64_t va)
 #define CSG_SUSPEND_BUF_HI      0x44
 #define CSG_CONFIG              0x50
 #define CSG_ACK                 0x00
+#define CSG_IRQ_REQ             0x0c    /* (output) */
+#define CSG_IRQ_ACK             0x0c    /* (input) */
+#define CSG_REQ_IDLE            (1u << 29)
 #define CSG_DB_ACK              0x08
 #define CSG_STATE_START         1
 /* stream control, input, output */
@@ -429,13 +439,16 @@ kernel_address(uint64_t va)
 #define USER_IO_VA              (OURS_VA + 0x20000)     /* input page, then output page */
 #define SUSPEND_VA              (OURS_VA + 0x100000)
 #define SUSPEND_SIZE            0x10000u                /* group 0 asked for 26368 bytes */
+#define CODE_VA                 (OURS_VA + 0x30000)     /* shaders: executable, read only for the GPU */
+#define DESC_VA                 (OURS_VA + 0x40000)     /* a compute job's descriptors and push constants */
 #define FWLOG_VA                (OURS_VA + 0x200000)    /* the firmware's log: its text */
 #define FWLOG_SIZE              0x10000u
 #define FWLOG_PTRS_VA           (OURS_VA + 0x220000)    /* its insert (the firmware's) and extract (ours) words */
 
 static volatile uint32_t *glb_in, *glb_out, *csg_in, *csg_out, *cs_in, *cs_out, *user_in, *user_out;
 static uint32_t *glb_ctl;
-static uint32_t *ring, *target;
+static uint32_t *ring, *target, *code, *desc;
+static unsigned int ring_used;     /* bytes of the ring the jobs so far took */
 static volatile uint8_t *doorbells;
 static void fwlog_dump(const char *when);
 static char *fwlog;                     /* the firmware's log text, and its two pointers */
@@ -487,7 +500,7 @@ flush_gpu(void)
  * non-cacheable, and 6, shared, both ended the first group's start in an AS1 bus error and the MCU fatal); what the
  * GPU writes is read after its caches are flushed (flush_gpu); the kernel's address */
 static vm_offset_t
-map_region(uint64_t va, vm_size_t size)
+map_region_x(uint64_t va, vm_size_t size, bool exec)
 {
 	vm_offset_t memory = gpu_memory(size);
 
@@ -496,12 +509,19 @@ map_region(uint64_t va, vm_size_t size)
 	}
 	clean_dcache(memory, (unsigned)round_page(size), FALSE);
 	for (vm_size_t off = 0; off < size; off += GPU_PAGE) {
-		if (!map_page(va + off, kvtophys(memory + off), PTE_RW | PTE_NX | (uint64_t)ATTR_CACHED << 2)) {
+		if (!map_page(va + off, kvtophys(memory + off), (exec ? PTE_RO : PTE_RW | PTE_NX) |
+		    (uint64_t)ATTR_CACHED << 2)) {
 			return 0;
 		}
 	}
 	remember(va, size, memory);
 	return memory;
+}
+
+static vm_offset_t
+map_region(uint64_t va, vm_size_t size)
+{
+	return map_region_x(va, size, false);
 }
 
 /* waits for the output word's bits under mask to equal the input word's: the firmware has done what was asked */
@@ -754,7 +774,10 @@ load_firmware(void)
 	target = (uint32_t *)map_region(TARGET_VA, 0x1000);
 	user_in = (volatile uint32_t *)map_region(USER_IO_VA, 0x2000);
 	user_out = user_in ? user_in + GPU_PAGE / 4 : NULL;
-	if (ring == NULL || target == NULL || user_in == NULL || map_region(SUSPEND_VA, SUSPEND_SIZE) == 0) {
+	code = (uint32_t *)map_region_x(CODE_VA, 0x1000, true);
+	desc = (uint32_t *)map_region(DESC_VA, 0x1000);
+	if (ring == NULL || target == NULL || user_in == NULL || code == NULL || desc == NULL ||
+	    map_region(SUSPEND_VA, SUSPEND_SIZE) == 0) {
 		printf("mali: %u: no memory for the queue's regions\n", step);
 		return false;
 	}
@@ -933,6 +956,49 @@ global_setup(void)
 		return false;
 	}
 	printf("mali: 6: shader cores 0x%llx allowed\n", rd64(SHADER_PRESENT));
+	/* the progress timer, the firmware's watchdog for work that stops moving (Google's set_timeout_global: its
+	 * default 2.5e9 cycles, in units of 1024) -- left at 0 it may be "no time at all" for the firmware's scheduler */
+	glb_in[GLB_PROGRESS_TIMER / 4] = (uint32_t)(2500000000ULL / 1024);
+	glb_in[GLB_REQ / 4] ^= GLB_REQ_CFG_PROGRESS_TIMER;
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&glb_in[GLB_REQ / 4], &glb_out[GLB_ACK / 4], GLB_REQ_CFG_PROGRESS_TIMER, 100)) {
+		fw_state("the progress timer not acknowledged");
+		return false;
+	}
+	/*
+	 * The shader cores' power, by the host (Google's driver with firmware_hctl_core_pwr: the firmware's power-off
+	 * timer disabled, then SHADER_PWRON): left to the firmware without its whole global setup they stayed off, and
+	 * the first compute job waited at RUN_COMPUTE for cores that never came.
+	 */
+	glb_in[GLB_PWROFF_TIMER / 4] = 0;
+	glb_in[GLB_REQ / 4] ^= GLB_REQ_CFG_PWROFF_TIMER;
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&glb_in[GLB_REQ / 4], &glb_out[GLB_ACK / 4], GLB_REQ_CFG_PWROFF_TIMER, 100)) {
+		fw_state("the power-off timer not acknowledged");
+		return false;
+	}
+	wr64(TILER_PWRON, rd64(TILER_PRESENT));        /* the tiler too: it stayed off (tiler ready 0) */
+	wr64(SHADER_PWRON, rd64(SHADER_PRESENT));
+	if (!wait_for(SHADER_READY, (uint32_t)rd64(SHADER_PRESENT), (uint32_t)rd64(SHADER_PRESENT), 100000)) {
+		printf("mali: 6: shader cores not ready: 0x%llx, in transition 0x%llx\n", rd64(SHADER_READY), rd64(0x200));
+		return false;
+	}
+	/* and the firmware told the stable mask again, now that the cores are on (Google's KBASE_MCU_HCTL_SHADERS_PEND_ON:
+	 * "notify MCU the stable mask"): without it the group asked for endpoints (0x70707) and got none */
+	glb_in[GLB_ALLOC_EN_LO / 4] = (uint32_t)rd64(SHADER_READY);
+	glb_in[GLB_ALLOC_EN_HI / 4] = (uint32_t)(rd64(SHADER_READY) >> 32);
+	glb_in[GLB_REQ / 4] ^= GLB_REQ_CFG_ALLOC_EN;
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&glb_in[GLB_REQ / 4], &glb_out[GLB_ACK / 4], GLB_REQ_CFG_ALLOC_EN, 100)) {
+		fw_state("the stable core mask not acknowledged");
+		return false;
+	}
+	wait_for(TILER_READY, 1, 1, 100000);
+	printf("mali: 6: shader cores powered: ready 0x%llx, told to the firmware; tiler ready 0x%llx\n", rd64(SHADER_READY),
+	    rd64(TILER_READY));
 	return true;
 }
 
@@ -1000,7 +1066,12 @@ group_start(void)
 	csg_in[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
 	csg_in[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
 	csg_in[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
-	csg_in[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | 8u << 28;      /* priority 8 */
+	{
+		unsigned int ep = 0;            /* mali_ep=1: compute endpoints only (all a compute job needs) */
+
+		PE_parse_boot_argn("mali_ep", &ep, sizeof(ep));
+		csg_in[CSG_EP_REQ_LO / 4] = ep == 1 ? compute | 8u << 28 : compute | compute << 8 | 1u << 16 | 8u << 28;
+	}
 	csg_in[CSG_EP_REQ_HI / 4] = 0;
 	csg_in[CSG_CONFIG / 4] = 1;                             /* address space 1 */
 	csg_in[CSG_SUSPEND_BUF_LO / 4] = (uint32_t)SUSPEND_VA;
@@ -1039,6 +1110,7 @@ first_job(void)
 	cmd[n++] = 2ULL << 56 | 5ULL << 48 | 0x5a5a1234ULL;
 	cmd[n++] = 21ULL << 56 | 4ULL << 48 | 0ULL << 40 | 0x3ULL << 16 | 0;
 	to_gpu(ring, n * 8);
+	ring_used = n * 8;
 	user_in[CS_INSERT / 4] = n * 8;
 	user_in[CS_INSERT / 4 + 1] = 0;
 	to_gpu(user_in, 16);
@@ -1059,6 +1131,131 @@ first_job(void)
 	    "THE GPU RAN OUR COMMANDS: both words are what the instructions stored" :
 	    "the target was not written as asked");
 	fw_state("after the job");
+}
+
+/*
+ * Step 9: the first compute job -- a shader on the shader cores. Its four instructions, Valhall assembly put
+ * together with Mesa's own assembler (src/panfrost/compiler/bifrost/valhall/asm.py, 26.2.5; only instructions from
+ * its test cases, none of those v11 removed):
+ *     MOV.i32 r2, u0.w0                           the target's address, from push constant 0
+ *     MOV.i32 r3, u0.w1
+ *     IADD_IMM.i32 r0, 0x0, #0x600DF00D           the value
+ *     STORE.i32.slot0.end @r0, [r2^:r3^], offset:0
+ * The descriptors as Mesa's v10 genxml has them (v12 only adds fields, left zero here): the shader program
+ * (type 8, stage 1 compute, the binary's address), the local storage (no thread or workgroup memory); the command
+ * stream's compute resource requested (REQ_RESOURCE), its compute registers (COMPUTE SR: FAU r8, SPD r16, TSD r24,
+ * WG_SIZE r33, JOB_SIZE r37-39), RUN_COMPUTE,
+ * a WAIT on every scoreboard, and a marker stored after it: the marker says the compute work is over.
+ */
+static const uint8_t store_shader[32] = {
+	0x80, 0x00, 0x00, 0x00, 0x00, 0xc2, 0x91, 0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0xc3, 0x91, 0x00,
+	0xc0, 0x0d, 0xf0, 0x0d, 0x60, 0xc0, 0x10, 0x01, 0x42, 0x00, 0x00, 0x18, 0x02, 0x40, 0x61, 0x78,
+};
+
+static void
+compute_job(void)
+{
+	uint64_t *cmd = (uint64_t *)((uint8_t *)ring + ring_used);
+	unsigned int n = 0;
+	const uint64_t spd = DESC_VA, tsd = DESC_VA + 0x40, fau = DESC_VA + 0x80;
+
+	memcpy(code, store_shader, sizeof(store_shader));
+	to_gpu(code, 128);
+	memset(desc, 0, 0x100);
+	desc[0] = 8 | 1 << 4;                   /* shader program: type shader, stage compute, 64 registers a thread */
+	desc[2] = (uint32_t)CODE_VA;
+	desc[3] = (uint32_t)(CODE_VA >> 32);
+	desc[0x40 / 4 + 1] = 31;                /* local storage: WLS instances "no workgroup memory" (log2 of 1 << 31) */
+	*(uint64_t *)&desc[0x80 / 4] = TARGET_VA + 0x10;        /* push constant 0: where the shader stores */
+	to_gpu(desc, 0x100);
+	target[4] = 0x33333333;                 /* the shader's word */
+	target[8] = 0x44444444;                 /* the marker after the wait */
+	to_gpu(target, 64);
+
+	cmd[n++] = 34ULL << 56 | 1;                                     /* REQ_RESOURCE compute (without it the stream
+	                                                                 * stopped at RUN_COMPUTE, waiting for nothing said) */
+	cmd[n++] = 1ULL << 56 | 16ULL << 48 | spd;                      /* MOVE48 r16:r17 <- the shader program */
+	cmd[n++] = 1ULL << 56 | 24ULL << 48 | tsd;                      /* MOVE48 r24:r25 <- the local storage */
+	cmd[n++] = 1ULL << 56 | 8ULL << 48 | fau;                       /* MOVE48 r8:r9 <- the push constants ... */
+	cmd[n++] = 2ULL << 56 | 9ULL << 48 | (uint32_t)(fau >> 32) | 1u << 24;   /* ... one of them (count << 56) */
+	cmd[n++] = 1ULL << 56 | 0ULL << 48 | 0;                         /* MOVE48 r0:r1 <- no resource table */
+	cmd[n++] = 2ULL << 56 | 32ULL << 48 | 0;                        /* global attribute offset */
+	cmd[n++] = 2ULL << 56 | 33ULL << 48 | 0;                        /* workgroup size 1x1x1 (each minus 1) */
+	for (int r = 34; r <= 36; r++) {
+		cmd[n++] = 2ULL << 56 | (uint64_t)r << 48 | 0;          /* job offset */
+	}
+	for (int r = 37; r <= 39; r++) {
+		cmd[n++] = 2ULL << 56 | (uint64_t)r << 48 | 1;          /* job size: one workgroup */
+	}
+	cmd[n++] = 4ULL << 56 | 1;                                      /* RUN_COMPUTE: a workgroup a task, along X */
+	{
+		unsigned int nowait = 0;
+
+		PE_parse_boot_argn("mali_nowait", &nowait, sizeof(nowait));
+		if (!nowait) {
+			cmd[n++] = 3ULL << 56 | 0xffffULL << 16;        /* WAIT on every scoreboard */
+		}
+	}
+	cmd[n++] = 1ULL << 56 | 0ULL << 48 | (TARGET_VA + 0x20);        /* the marker: MOVE48 r0, MOVE32 r4, STORE */
+	cmd[n++] = 2ULL << 56 | 4ULL << 48 | 0x9a55ed00u;
+	cmd[n++] = 21ULL << 56 | 4ULL << 48 | 0ULL << 40 | 0x1ULL << 16 | 0;
+	to_gpu(cmd, n * 8);
+	ring_used += n * 8;
+	user_in[CS_INSERT / 4] = ring_used;
+	to_gpu(user_in, 16);
+	printf("mali: 9: %u instructions; the shader at 0x%llx, its descriptors at 0x%llx; the doorbell rung\n", n,
+	    CODE_VA, DESC_VA);
+	/* the GPU's L2 still holds what the firmware read for the first job (the old insert word among it): flushed, it
+	 * reads what we wrote. (Without this the queue stayed at the first job's end, 0x20.) */
+	flush_gpu();
+	/* the first job left group 0 idle, and the firmware said so (CSG_ACK bit 29 toggled, JOB_IRQ bit 0): Google's
+	 * driver acknowledges that (CSG_REQ's bit set to the ACK's, the CS interrupts acked, JOB_IRQ cleared) before it
+	 * kicks a queue again -- through the group's kernel doorbell bit for the stream and doorbell 0 -- and so does this */
+	from_gpu(csg_out, 64);
+	csg_in[CSG_REQ / 4] = (csg_in[CSG_REQ / 4] & ~CSG_REQ_IDLE) | (csg_out[CSG_ACK / 4] & CSG_REQ_IDLE);
+	csg_in[CSG_IRQ_ACK / 4] = csg_out[CSG_IRQ_REQ / 4];
+	csg_in[CSG_DB_REQ / 4] = csg_out[CSG_DB_ACK / 4] ^ 1u;
+	to_gpu(csg_in, 64);
+	wr(JOB_IRQ_CLEAR, 0xffffffff);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ 1u;
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	ring_doorbell(USER_DOORBELL);
+	for (int t = 0; t < 500; t++) {
+		flush_gpu();
+		from_gpu(user_out, 16);
+		from_gpu(target, 64);
+		if (target[8] != 0x44444444) {
+			break;
+		}
+		delay(1000);
+	}
+	printf("mali: 9: the queue read to 0x%x (of 0x%x); the shader's word 0x%08x, the marker 0x%08x\n",
+	    user_out[CS_EXTRACT / 4], ring_used, target[4], target[8]);
+	printf("mali: 9: %s\n", target[4] == 0x600df00d ? "A SHADER RAN ON THE SHADER CORES: it stored 0x600df00d" :
+	    target[8] == 0x9a55ed00 ? "the job was passed, but the shader's word was not written" :
+	    "the command stream did not get past the compute job");
+	/* the status words are filled in on request: CSG_REQ's STATUS_UPDATE toggled, the group's doorbell */
+	from_gpu(csg_out, 64);
+	csg_in[CSG_REQ / 4] = (csg_in[CSG_REQ / 4] & ~(1u << 5)) | ((csg_out[CSG_ACK / 4] ^ (1u << 5)) & (1u << 5));
+	to_gpu(csg_in, 64);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ 1u;
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	printf("mali: 9: status update %s\n", acked(&csg_in[CSG_REQ / 4], &csg_out[CSG_ACK / 4], 1u << 5, 100) ?
+	    "acknowledged" : "NOT acknowledged");
+	flush_gpu();
+	from_gpu(csg_out, 64);
+	printf("mali: 9: group 0: endpoints current 0x%x, requested 0x%x, progress timer state 0x%x; EP_REQ asked 0x%x; "
+	    "stream blocked reason 0x%x, cmd at 0x%x%08x\n", csg_out[0x10 / 4], csg_out[0x14 / 4], csg_out[0x1c / 4],
+	    csg_in[CSG_EP_REQ_LO / 4], cs_out[0x60 / 4], cs_out[0x44 / 4], cs_out[0x40 / 4]);
+	from_gpu(cs_out, 256);
+	printf("mali: 9: shaders ready 0x%llx (in transition 0x%llx), tiler ready 0x%llx; the stream: requested resources "
+	    "0x%x, scoreboards 0x%x, wait sync value 0x%x\n", rd64(SHADER_READY), rd64(0x200), rd64(TILER_READY),
+	    cs_out[0x4c / 4], cs_out[0x5c / 4], cs_out[0x58 / 4]);
+	fw_state("after the compute job");
 }
 
 /* ---- the steps ---- */
@@ -1218,6 +1415,10 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		goto out;
 	}
 	first_job();
+	if (!announce(9, "the first compute job: a shader of four instructions on the shader cores")) {
+		goto out;
+	}
+	compute_job();
 
 out:
 	if (step >= 2) {
