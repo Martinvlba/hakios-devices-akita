@@ -1,0 +1,6 @@
+# devices/akita/drivers/display/conf: the Pixel 8a's display pipeline (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_DISPLAY
+	file    bsd/dev/hakios.akita_display.c
+	help    zuma's display pipeline (DECON0, DPP0, the DPU's SysMMU) as the bootloader leaves it: its registers read into
+	help    the log (display_probe=1), before page flips, the DPP's scaler and iOS's surfaces read directly

@@ -14,11 +14,11 @@ HakiOS (iOS 16.5 on XNU) on the Google Pixel 8a. Last update: 2026-11-05.
 | Clock | keeps the time |
 | Shut down / restart | yes |
 | USB | seen as an iPhone: pairing, iPhone tools, photos to a computer (Linux) |
-| GPU | Mali-G715 runs, Metal copies and fills on it |
+| GPU | Mali-G715 runs, Metal copies, fills and compute programs on it |
 
 ## In progress
 
-- **Metal compute:** running Metal programs on the GPU.
+- **Framebuffer:** a faster screen than the software copy (about 10 frames a second).
 
 ## Not yet
 
