@@ -1522,6 +1522,106 @@ vm_kernel_region(unsigned int vm, vm_size_t size, uint64_t *va, bool exec)
 	return memory;
 }
 
+/* a kernel region taken back: out of the VM's tables, then freed */
+static void
+vm_kernel_free(unsigned int vm, uint64_t va, vm_offset_t memory, vm_size_t size)
+{
+	if (memory == 0) {
+		return;
+	}
+	if (vms[vm].used) {
+		for (vm_size_t off = 0; off < size; off += GPU_PAGE) {
+			unmap_page_in(vms[vm].root, va + off);
+		}
+		as_update(vm);
+	}
+	kmem_free(kernel_map, memory, round_page(size));
+}
+
+/*
+ * Tiler heaps (panthor's TILER_HEAP_CREATE): what the tiler writes a render pass's lists into. A heap is a context,
+ * zeroed, that the firmware keeps its state in (32 bytes; a page here), and chunks in a list: each chunk's first
+ * 64 bytes its header, whose first word is the next chunk's address | its size >> 12 (0: the last), the newest
+ * chunk first -- as Linux's panthor_heap.c makes them. All of a heap is in the VM's kernel half. Only the initial
+ * chunks so far: growing a heap is the answer to the firmware's tiler out-of-memory event, not handled yet (a pass
+ * that needs more waits).
+ */
+#define MAX_HEAPS               16
+#define MAX_HEAP_CHUNKS         32
+#define HEAP_INITIAL_BYTES      (64u << 20)     /* the most of a heap's initial chunks together */
+
+static struct {
+	bool used;
+	unsigned int vm, chunks;
+	uint32_t chunk_size;
+	uint64_t ctx_va, chunk_va[MAX_HEAP_CHUNKS];
+	vm_offset_t ctx, chunk[MAX_HEAP_CHUNKS];
+} heaps[MAX_HEAPS];
+
+void akita_mali_heap_free(int h);
+void
+akita_mali_heap_free(int h)
+{
+	if (h < 0 || h >= MAX_HEAPS || !heaps[h].used) {
+		return;
+	}
+	for (unsigned int i = 0; i < heaps[h].chunks; i++) {
+		vm_kernel_free(heaps[h].vm, heaps[h].chunk_va[i], heaps[h].chunk[i], heaps[h].chunk_size);
+	}
+	vm_kernel_free(heaps[h].vm, heaps[h].ctx_va, heaps[h].ctx, GPU_PAGE);
+	bzero(&heaps[h], sizeof(heaps[h]));
+}
+
+/* the heap's slot, or -1: bad arguments (as Linux checks them) or no memory */
+int akita_mali_heap_new(int vm, uint32_t chunk_size, uint32_t initial, uint32_t max_chunks, uint32_t in_flight,
+    uint64_t *ctx_va, uint64_t *first_chunk_va);
+int
+akita_mali_heap_new(int vm, uint32_t chunk_size, uint32_t initial, uint32_t max_chunks, uint32_t in_flight,
+    uint64_t *ctx_va, uint64_t *first_chunk_va)
+{
+	int h;
+
+	if (vm <= 0 || vm >= MAX_VMS || !vms[vm].used || chunk_size < (128u << 10) || chunk_size > (8u << 20) ||
+	    (chunk_size & (chunk_size - 1)) != 0 || initial == 0 || initial > max_chunks || in_flight == 0 ||
+	    in_flight > 65535 || initial > MAX_HEAP_CHUNKS || (uint64_t)initial * chunk_size > HEAP_INITIAL_BYTES) {
+		return -1;
+	}
+	for (h = 0; h < MAX_HEAPS && heaps[h].used; h++) {
+	}
+	if (h == MAX_HEAPS) {
+		return -1;
+	}
+	heaps[h].used = true;
+	heaps[h].vm = (unsigned int)vm;
+	heaps[h].chunk_size = chunk_size;
+	heaps[h].ctx = vm_kernel_region((unsigned int)vm, GPU_PAGE, &heaps[h].ctx_va, false);
+	if (heaps[h].ctx == 0) {
+		akita_mali_heap_free(h);
+		return -1;
+	}
+	for (unsigned int i = 0; i < initial; i++) {
+		uint64_t *header;
+
+		/* each chunk at an address that is a multiple of its size, as panthor's allocator gives large ones */
+		vms[vm].kernel_next = (vms[vm].kernel_next + chunk_size - 1) & ~(uint64_t)(chunk_size - 1);
+		heaps[h].chunk[i] = vm_kernel_region((unsigned int)vm, chunk_size, &heaps[h].chunk_va[i], false);
+		if (heaps[h].chunk[i] == 0) {
+			akita_mali_heap_free(h);
+			return -1;
+		}
+		heaps[h].chunks = i + 1;
+		header = (uint64_t *)heaps[h].chunk[i];
+		header[0] = i == 0 ? 0 : (heaps[h].chunk_va[i - 1] & ~0xfffULL) | (chunk_size >> 12);
+		clean_dcache((vm_offset_t)header, 64, FALSE);
+	}
+	as_update((unsigned int)vm);
+	*ctx_va = heaps[h].ctx_va;
+	*first_chunk_va = heaps[h].chunk_va[initial - 1];
+	printf("mali: tiler heap %d in VM %d: context at %#llx, %u chunk(s) of %u KiB, first at %#llx\n", h, vm,
+	    *ctx_va, initial, chunk_size >> 10, *first_chunk_va);
+	return h;
+}
+
 /* memory the MCU reaches (in its 28 bits): queues' user pages, suspend buffers */
 static vm_offset_t
 mcu_region(vm_size_t size, uint32_t *va)

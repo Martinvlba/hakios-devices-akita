@@ -11,8 +11,8 @@
  * What there is: the device's description; VMs (each its own address space of the GPU, with its own tables); buffers
  * (zeroed, write-combined for the processors, mapped into a VM page by page); groups of queues fed by the kernel; the
  * submission of a program's command streams; DRM sync objects, binary and timeline, signalled by submissions and
- * waited for (a submission's wait operations are waited for here, before it goes to the GPU). Not here yet: tiler heaps,
- * sync files, interrupts (waiting is asking again every millisecond), recovery of a group that faulted.
+ * waited for (a submission's wait operations are waited for here, before it goes to the GPU). Tiler heaps: their initial
+ * chunks (growing one is not here yet). Not here yet: sync files, interrupts (waiting is asking again every millisecond), recovery of a group that faulted.
  *
  * The structures are those of Linux's include/uapi/drm/panthor_drm.h and drm.h (MIT, Collabora and others), as
  * Mesa 26.2.5 carries them, written out here.
@@ -49,6 +49,9 @@ void akita_mali_group_free(int g);
 uint64_t akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size);
 uint64_t akita_mali_reached(int g, unsigned int q);
 void akita_mali_flush(void);
+int akita_mali_heap_new(int vm, uint32_t chunk_size, uint32_t initial, uint32_t max_chunks, uint32_t in_flight,
+    uint64_t *ctx_va, uint64_t *first_chunk_va);
+void akita_mali_heap_free(int h);
 void akita_mali_debug(void);
 void akita_mali_info(uint32_t *regs, uint32_t *csif);
 void akita_gpu_start(void);
@@ -109,6 +112,9 @@ struct drm_panthor_queue_submit {
 };
 struct drm_panthor_group_submit { uint32_t group_handle, pad; struct drm_panthor_obj_array queue_submits; };
 struct drm_panthor_group_get_state { uint32_t group_handle, state, fatal_queues, pad; };
+struct drm_panthor_tiler_heap_create { uint32_t vm_id, initial_chunk_count, chunk_size, max_chunks, target_in_flight, handle;
+	uint64_t tiler_heap_ctx_gpu_va, first_heap_chunk_gpu_va; };
+struct drm_panthor_tiler_heap_destroy { uint32_t handle, pad; };
 struct drm_gem_close { uint32_t handle, pad; };
 struct drm_syncobj_create { uint32_t handle, flags; };
 #define SYNCOBJ_CREATE_SIGNALED 1u
@@ -191,6 +197,7 @@ akita_gpu_start(void)
 #define MAX_POINTS              32
 #define MAX_CLIENT_VMS          4
 #define MAX_CLIENT_GROUPS       8
+#define MAX_CLIENT_HEAPS        8
 
 /* what a sync object waits for: nothing yet, done, or a queue reaching a number */
 struct fence {
@@ -215,6 +222,7 @@ class HakiosGPUUserClient : public IOUserClient
 	struct syncobj *fSyncs;
 	int fVms[MAX_CLIENT_VMS];
 	int fGroups[MAX_CLIENT_GROUPS];
+	int fHeaps[MAX_CLIENT_HEAPS];              /* the kernel's heap slots (handle: index + 1) */
 
 	bool done(const struct fence *f);
 	bool syncPointDone(struct syncobj *s, uint64_t point, bool *submitted);
@@ -252,6 +260,9 @@ HakiosGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
 	for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
 		fGroups[i] = -1;
 	}
+	for (int i = 0; i < MAX_CLIENT_HEAPS; i++) {
+		fHeaps[i] = -1;
+	}
 	return fBos != NULL && fSyncs != NULL;
 }
 
@@ -263,6 +274,12 @@ HakiosGPUUserClient::clientClose(void)
 		if (fGroups[i] >= 0) {
 			akita_mali_group_free(fGroups[i]);
 			fGroups[i] = -1;
+		}
+	}
+	for (int i = 0; i < MAX_CLIENT_HEAPS; i++) {
+		if (fHeaps[i] >= 0) {
+			akita_mali_heap_free(fHeaps[i]);
+			fHeaps[i] = -1;
 		}
 	}
 	for (int i = 0; i < MAX_CLIENT_VMS; i++) {
@@ -651,6 +668,8 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		struct drm_panthor_group_destroy groupDestroy;
 		struct drm_panthor_group_submit groupSubmit;
 		struct drm_panthor_group_get_state groupState;
+		struct drm_panthor_tiler_heap_create heapCreate;
+		struct drm_panthor_tiler_heap_destroy heapDestroy;
 		struct drm_gem_close gemClose;
 		struct drm_syncobj_create syncCreate;
 		struct drm_syncobj_destroy syncDestroy;
@@ -768,6 +787,38 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	case kGroupGetState:
 		r.groupState.state = 0;
 		r.groupState.fatal_queues = 0;
+		break;
+	case kTilerHeapCreate: {
+		int slot = -1, h = -1;
+
+		for (int i = 0; i < MAX_CLIENT_HEAPS; i++) {
+			if (fHeaps[i] < 0) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot < 0 || !ownsVm(r.heapCreate.vm_id)) {
+			ret = slot < 0 ? kIOReturnNoResources : kIOReturnBadArgument;
+			break;
+		}
+		h = akita_mali_heap_new((int)r.heapCreate.vm_id, r.heapCreate.chunk_size, r.heapCreate.initial_chunk_count,
+		    r.heapCreate.max_chunks, r.heapCreate.target_in_flight, &r.heapCreate.tiler_heap_ctx_gpu_va,
+		    &r.heapCreate.first_heap_chunk_gpu_va);
+		if (h < 0) {
+			ret = kIOReturnBadArgument;
+			break;
+		}
+		fHeaps[slot] = h;
+		r.heapCreate.handle = (uint32_t)slot + 1;
+		break;
+	}
+	case kTilerHeapDestroy:
+		if (r.heapDestroy.handle >= 1 && r.heapDestroy.handle <= MAX_CLIENT_HEAPS && fHeaps[r.heapDestroy.handle - 1] >= 0) {
+			akita_mali_heap_free(fHeaps[r.heapDestroy.handle - 1]);
+			fHeaps[r.heapDestroy.handle - 1] = -1;
+		} else {
+			ret = kIOReturnBadArgument;
+		}
 		break;
 	case kBoSetLabel:
 	case kSetUserMmioOffset:
@@ -905,8 +956,6 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	case kHakiosDebug:
 		akita_mali_debug();
 		break;
-	case kTilerHeapCreate:
-	case kTilerHeapDestroy:
 	default:
 		IOLog("HakiosGPU: request %#x (%zu bytes) is not answered here yet\n", selector, size);
 		ret = kIOReturnUnsupported;
