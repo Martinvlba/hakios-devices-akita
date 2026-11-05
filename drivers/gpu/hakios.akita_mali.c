@@ -941,7 +941,8 @@ global_setup(void)
 	from_gpu(g, GPU_PAGE);
 	glb_in = kernel_address(g[GLB_INPUT_VA_W]);
 	glb_out = kernel_address(g[GLB_OUTPUT_VA_W]);
-	doorbells = (volatile uint8_t *)ml_io_map(DOORBELL_PHYS, 0x20000);
+	doorbells = (volatile uint8_t *)ml_io_map(DOORBELL_PHYS, 9 * 0x10000);  /* doorbell 0 and 1 + each of 8 groups (two only:
+	                                                                     * group 1's doorbell 2 was a kernel data abort) */
 	if (glb_in == NULL || glb_out == NULL) {
 		printf("mali: 6: the global input/output blocks (0x%x, 0x%x) are in no section of ours\n", g[GLB_INPUT_VA_W],
 		    g[GLB_OUTPUT_VA_W]);
