@@ -196,3 +196,32 @@ hakios_rtc_set(uint64_t epoch)
 		thread_call_enter(write_call);
 	}
 }
+
+/*
+ * Before the phone is powered off (hakios.akita_power.c): the PMIC's restart features off, as Google's driver does in
+ * its shutdown hook (rtc-s2mpg14.c, s2m_rtc_shutdown -> s2m_rtc_disable_wtsr_smpl): SMPL (sudden momentary power loss,
+ * RTC register 0x02 bit 0) and WTSR and its cold reset (register 0x03, bits 0 and 4). Left on -- as the bootloader
+ * leaves them -- the PMIC took the power-off for a fault and started the phone again: the tester saw iOS's Shut Down
+ * come back to iOS, without a cable.
+ */
+#define RTC_SMPL                0x02
+#define RTC_WTSR                0x03
+#define SMPL_EN                 0x01
+#define WTSR_EN                 0x01
+#define COLDRST_EN              0x10
+
+void hakios_rtc_before_power_off(void);
+
+void
+hakios_rtc_before_power_off(void)
+{
+	uint8_t smpl = 0, wtsr = 0, smpl_after = 0, wtsr_after = 0;
+	bool read = rtc_access(PMIC_READ, RTC_SMPL, 0, 0, &smpl) && rtc_access(PMIC_READ, RTC_WTSR, 0, 0, &wtsr);
+	bool cleared = rtc_access(PMIC_UPDATE, RTC_SMPL, 0, SMPL_EN, NULL) &&
+	    rtc_access(PMIC_UPDATE, RTC_WTSR, 0, WTSR_EN | COLDRST_EN, NULL);
+
+	rtc_access(PMIC_READ, RTC_SMPL, 0, 0, &smpl_after);
+	rtc_access(PMIC_READ, RTC_WTSR, 0, 0, &wtsr_after);
+	printf("akita rtc: before power off: SMPL %#x -> %#x, WTSR %#x -> %#x%s\n", smpl, smpl_after, wtsr, wtsr_after,
+	    read && cleared ? "" : " (an ACPM request failed)");
+}

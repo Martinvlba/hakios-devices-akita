@@ -31,5 +31,6 @@ driver AKITA_RTC
 
 driver AKITA_POWER
 	file    bsd/dev/hakios.akita_power.c
+	requires AKITA_RTC
 	help    the Pixel 8a's way down: iOS's Shut Down powers the phone off, Restart resets it into the active slot (PSCI),
 	help    instead of the way back to the loader (still taken for xl's runs: loader_return_after)
