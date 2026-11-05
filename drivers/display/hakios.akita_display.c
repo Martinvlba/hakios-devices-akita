@@ -253,6 +253,169 @@ struct hakios_display_ops {
 extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
 static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown };
 
+/*
+ * The DPP's scaler, tried on its own (display_scale=1, without display_flip; display_scale_delay= seconds, 60): DPP0 made
+ * to read a 1125 x 2436 picture -- the iPhone X's, what iOS draws -- and scale it to the panel's 1080 x 2400, for 8 s,
+ * then the bootloader's setting back. The picture: the screen copied in, a red border around all of 1125 x 2436 and
+ * green lines where the panel's edges fell (x 1080, y 2400): scaled right, the whole red border is on the panel.
+ * Registers (Google's names, cal_9865): RDMA_SRC_WIDTH/HEIGHT (+0x10/0x14), RDMA_IMG_SIZE (+0x1c); DPP_COM_IMG_SIZE
+ * (+0x3c), DPP_COM_SCL_CTRL (+0x80: enable, coefficient set 0), SCALED_IMG_SIZE (+0x84), H/V_RATIO (+0x88/0x8c: source
+ * over destination, 20 fraction bits); the filter's coefficients in the scl_coef block (0x19940000): 9 phases of 8 taps
+ * across, 4 down, 11-bit signed, each phase summing to 512 -- here Catmull-Rom's cubic, worked out below (ours: Google's
+ * tables are not taken). The log says what the DPP took (its shadow registers, +0x100) and its configuration errors.
+ *
+ * Tried on the phone (11-05): it does NOT work and leaves the screen striped until a restart. DPP0's DMA takes the new
+ * size and address, but DPP0's own block (DPP_COM: sizes, scaler, ratios) takes nothing -- neither with
+ * IDMA_SFR_UPDATE_FORCE nor with DECON0's update request -- so 1125-pixel lines reach a stage set for 1080 and the DMA
+ * reports a deadlock (RDMA_IRQ bit 17). DPP_COM_TZPC (0x19930034) reads 1: DPP0's block is secure, its registers are
+ * not the kernel's to write. Scaling in hardware would need another DPP channel (and DECON0's window moved to it).
+ */
+#define DPP0_COM        0x19930000ULL
+#define DPP0_COEF       0x19940000ULL
+#define SRC_W           1125
+#define SRC_H           2436
+#define SRC_BYTES       (SRC_W * SRC_H * 4)
+#define DPP_IMG_SIZE    0x03c
+#define DPP_SCL_CTRL    0x080
+#define DPP_SCALED_SIZE 0x084
+#define DPP_H_RATIO     0x088
+#define DPP_V_RATIO     0x08c
+#define DPP_CFG_ERROR   0x01c
+#define DPP_SHADOW      0x100
+#define RDMA_SRC_WIDTH  0x010
+#define RDMA_SRC_HEIGHT 0x014
+#define RDMA_IMG_SIZE   0x01c
+#define RDMA_IRQ_REG    0x004
+#define RDMA_DONE       (1u << 16)
+
+static volatile uint32_t *dpp, *coef;
+
+/* Catmull-Rom's four weights at phase P (0..8 of 16), as 512ths that sum to 512 */
+static void
+cubic(unsigned phase, int w[4])
+{
+	/* in 1/4096ths of a pixel: t = phase/16 */
+	int64_t t = phase * 256, t2 = t * t / 4096, t3 = t2 * t / 4096;
+	int64_t a = (-t3 + 2 * t2 - t) / 2, c = (-3 * t3 + 4 * t2 + t) / 2, d = (t3 - t2) / 2;      /* (the pixel's own: what is left of 512) */
+
+	w[0] = (int)(a * 512 / 4096);
+	w[2] = (int)(c * 512 / 4096);
+	w[3] = (int)(d * 512 / 4096);
+	w[1] = 512 - w[0] - w[2] - w[3];
+}
+
+static void
+write_coefficients(void)
+{
+	for (unsigned n = 0; n < 9; n++) {
+		int w[4];
+
+		cubic(n, w);
+		for (unsigned s = 0; s < 8; s++) {              /* across: 8 taps, the pixel at tap 3 */
+			int v = s >= 2 && s <= 5 ? w[s - 2] : 0;
+
+			coef[(0x90 + n * 4 + s * 0x24) / 4] = (uint32_t)v & 0x7ff;
+		}
+		for (unsigned s = 0; s < 4; s++) {              /* down: 4 taps, the pixel at tap 1 */
+			coef[(n * 4 + s * 0x24) / 4] = (uint32_t)w[s] & 0x7ff;
+		}
+	}
+}
+
+static void
+wait_frame_done(void)
+{
+	uint64_t t0 = mach_absolute_time();
+
+	rdma[RDMA_IRQ_REG / 4] = RDMA_DONE;
+	while ((rdma[RDMA_IRQ_REG / 4] & RDMA_DONE) == 0 && micros(t0) < 50000) {
+		delay(50);
+	}
+}
+
+static void
+say_dpp(const char *when)
+{
+	printf("akita_display: scale %s: DPP shadow IMG_SIZE %#x SCL_CTRL %#x SCALED %#x RATIO %#x/%#x, CFG_ERROR %#x, DPP IRQ %#x; "
+	    "RDMA shadow SRC %u x %u IMG %#x base %#x, RDMA_IRQ %#x\n", when, dpp[(DPP_SHADOW + DPP_IMG_SIZE) / 4],
+	    dpp[(DPP_SHADOW + DPP_SCL_CTRL) / 4], dpp[(DPP_SHADOW + DPP_SCALED_SIZE) / 4], dpp[(DPP_SHADOW + DPP_H_RATIO) / 4],
+	    dpp[(DPP_SHADOW + DPP_V_RATIO) / 4], dpp[DPP_CFG_ERROR / 4], dpp[0x18 / 4], rdma[(RDMA_SHADOW + RDMA_SRC_WIDTH) / 4],
+	    rdma[(RDMA_SHADOW + RDMA_SRC_HEIGHT) / 4], rdma[(RDMA_SHADOW + RDMA_IMG_SIZE) / 4],
+	    rdma[(RDMA_SHADOW + RDMA_BASEADDR) / 4], rdma[RDMA_IRQ_REG / 4]);
+}
+
+/* the pipeline set for a source of W x H at BASE, scaled to the panel when it is not the panel's size */
+static void
+set_source(uint32_t w, uint32_t h, uint32_t base)
+{
+	bool scaled = w != FB_WIDTH || h != FB_HEIGHT;
+
+	wait_frame_done();
+	rdma[RDMA_SRC_WIDTH / 4] = w;
+	rdma[RDMA_SRC_HEIGHT / 4] = h;
+	rdma[RDMA_IMG_SIZE / 4] = h << 16 | w;
+	rdma[RDMA_BASEADDR / 4] = base;
+	dpp[DPP_IMG_SIZE / 4] = h << 16 | w;
+	dpp[DPP_SCALED_SIZE / 4] = scaled ? (uint32_t)(FB_HEIGHT << 16 | FB_WIDTH) : 0;
+	dpp[DPP_H_RATIO / 4] = (uint32_t)(((uint64_t)w << 20) / FB_WIDTH);
+	dpp[DPP_V_RATIO / 4] = (uint32_t)(((uint64_t)h << 20) / FB_HEIGHT);
+	dpp[DPP_SCL_CTRL / 4] = scaled ? 1 : 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
+}
+
+static void
+akita_display_scale(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	volatile uint32_t *pic, *front;
+
+	decon = (volatile uint32_t *)ml_io_map(DECON0, 0x1000);
+	rdma = (volatile uint32_t *)ml_io_map(DPP0_RDMA, 0x1000);
+	dpp = (volatile uint32_t *)ml_io_map(DPP0_COM, 0x1000);
+	coef = (volatile uint32_t *)ml_io_map(DPP0_COEF, 0x1000);
+	if (rdma[RDMA_BASEADDR / 4] != (uint32_t)FB_FRONT || decon[TRIG_CON / 4] != 0x3061) {
+		printf("akita_display: scale: the pipeline is not as the bootloader leaves it: not tried\n");
+		return;
+	}
+	say_dpp("before");
+	front = map_buffer(FB_FRONT, FB_BYTES);
+	pic = map_buffer(FB_BACK, SRC_BYTES);
+	if (front == NULL || pic == NULL) {
+		printf("akita_display: scale: no kernel addresses for the buffers\n");
+		return;
+	}
+	for (uint32_t y = 0; y < SRC_H; y++) {
+		for (uint32_t x = 0; x < SRC_W; x++) {
+			uint32_t v = x < FB_WIDTH && y < FB_HEIGHT ? front[y * FB_WIDTH + x] : 0xff202020u;
+
+			if (x < 6 || y < 6 || x >= SRC_W - 6 || y >= SRC_H - 6) {
+				v = 0xffff0000u;                /* red: the border of all 1125 x 2436 */
+			} else if ((x >= FB_WIDTH - 2 && x < FB_WIDTH + 2) || (y >= FB_HEIGHT - 2 && y < FB_HEIGHT + 2)) {
+				v = 0xff00ff00u;                /* green: where the panel's edges fell */
+			}
+			pic[y * SRC_W + x] = v;
+		}
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	write_coefficients();
+	set_source(SRC_W, SRC_H, (uint32_t)FB_BACK);
+	delay(100000);
+	say_dpp("1125x2436 at 0xfb800000, forced");
+	if (dpp[(DPP_SHADOW + DPP_SCL_CTRL) / 4] != 1) {
+		decon[0x050 / 4] = 0x3fff | (1u << 31);         /* SHD_REG_UP_REQ: every window, and the global one */
+		delay(100000);
+		say_dpp("and after DECON0's update request");
+	}
+	delay(8000000);
+	set_source(FB_WIDTH, FB_HEIGHT, (uint32_t)FB_FRONT);
+	delay(100000);
+	if (dpp[(DPP_SHADOW + DPP_SCL_CTRL) / 4] != 0) {
+		decon[0x050 / 4] = 0x3fff | (1u << 31);
+		delay(100000);
+	}
+	say_dpp("back to the bootloader's");
+}
+
 __startup_func
 static void
 akita_display_init(void)
@@ -267,6 +430,16 @@ akita_display_init(void)
 		}
 		seconds = 60;
 		hakios_display_ops = &akita_display_ops;
+	}
+	enabled = 0;
+	if (PE_parse_boot_argn("display_scale", &enabled, sizeof(enabled)) && enabled) {
+		static thread_call_t scaler;
+		uint32_t at = 60;
+
+		PE_parse_boot_argn("display_scale_delay", &at, sizeof(at));
+		scaler = thread_call_allocate(akita_display_scale, NULL);
+		clock_interval_to_deadline(at, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(scaler, deadline);
 	}
 	enabled = 0;
 	if (!PE_parse_boot_argn("display_probe", &enabled, sizeof(enabled)) || !enabled) {
