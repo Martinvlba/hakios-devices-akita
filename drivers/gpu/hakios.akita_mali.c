@@ -1919,6 +1919,36 @@ akita_mali_debug(void)
 	}
 	faults("the service asked");
 	fwlog_dump("the service asked");
+	/* the tiler heaps as the GPU left them: each context, and its newest chunk's header and top (the polygon lists) */
+	for (int h = 0; h < MAX_HEAPS; h++) {
+		if (!heaps[h].used) {
+			continue;
+		}
+		uint32_t *ctx = (uint32_t *)heaps[h].ctx;
+		vm_offset_t top = heaps[h].chunk[heaps[h].chunks - 1];
+		uint32_t *head = (uint32_t *)top, *end = (uint32_t *)(top + heaps[h].chunk_size - 0x200);
+		unsigned nonzero = 0, first = ~0u;
+
+		flush_dcache((vm_offset_t)ctx, 64, FALSE);
+		flush_dcache(top, 256, FALSE);
+		flush_dcache((vm_offset_t)end, 0x200, FALSE);
+		for (unsigned int i = 0; i < 0x200 / 4; i++) {
+			if (end[i] != 0) {
+				nonzero++;
+				first = first == ~0u ? i * 4 : first;
+			}
+		}
+		printf("mali: tiler heap %d: context %08x %08x %08x %08x %08x %08x %08x %08x; chunk 0x%llx: %08x %08x %08x %08x "
+		    "%08x %08x %08x %08x %08x %08x %08x %08x; its last 0x200 bytes: %u words set, the first at +0x%x\n", h, ctx[0],
+		    ctx[1], ctx[2], ctx[3], ctx[4], ctx[5], ctx[6], ctx[7], heaps[h].chunk_va[heaps[h].chunks - 1], head[0], head[1],
+		    head[2], head[3], head[4], head[5], head[6], head[7], head[16], head[17], head[18], head[19], nonzero, first);
+		if (first != ~0u) {
+			uint32_t *w = &end[first / 4];
+
+			printf("mali: tiler heap %d: at +0x%x of the last 0x200: %08x %08x %08x %08x %08x %08x %08x %08x\n", h, first, w[0],
+			    w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+		}
+	}
 	{
 		volatile uint8_t *m = (volatile uint8_t *)ml_io_map(S2MPU_G3D_PHYS, 0x10000);
 		uint32_t st = *(volatile uint32_t *)(m + S2MPU_FAULT_STATUS);
