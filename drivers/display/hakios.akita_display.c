@@ -67,15 +67,8 @@ akita_display_probe(__unused thread_call_param_t p0, __unused thread_call_param_
 	printf("akita_display: done\n");
 }
 
-/*
- * The flip (display_flip=1, display_flip_delay= seconds, 60): DPP0 shown a second buffer for 5 s, then the first again
- * -- what page flips will do for every frame. The second buffer is RAM nobody uses, after the bootloader's (zuma-akita.dts:
- * free between abl@f8800000 and dss_log_reserved@fd3f0000; the loader puts XNU elsewhere): the current picture copied in
- * with a band across its top, so the flip can be seen. A flip, as Google's driver does it (cal_9865): the new address
- * into RDMA_BASEADDR_P0, then an update request for window 0 and the global one in DECON0's SHD_REG_UP_REQ; the hardware
- * takes it at the next frame start (DSI command mode, TE-triggered), and its shadow copy (+0x400) says when. If it does
- * not, IDMA_SFR_UPDATE_FORCE (RDMA_ENABLE bit 4) is tried, and the log says which did it.
- */
+/* the two buffers: the bootloader's, and RAM nobody uses after it (zuma-akita.dts: free between abl@f8800000 and
+ * dss_log_reserved@fd3f0000; the loader puts XNU elsewhere, at 0x9_xxxxxxxx); the DMA's addresses are 32-bit */
 #define FB_FRONT        0xfac00000ULL
 #define FB_BACK         0xfb800000ULL
 #define FB_WIDTH        1080
@@ -124,91 +117,75 @@ micros(uint64_t since)
 	return ns / 1000;
 }
 
-/* the shadow copy at ADDR within 200 ms: how long it took, or -1 */
-static int64_t
-latched(uint32_t addr)
-{
-	uint64_t t0 = mach_absolute_time();
+/*
+ * Double buffering for MiniIOMobileFramebuffer (display_flip=1): the two buffers, and a flip that is taken between two
+ * of the panel's frames. DECON0 sends a frame at every TE (60 Hz); DPP0 says when it has read one out (RDMA_IRQ's
+ * frame done, bit 16, cleared by writing it). The flip clears it, waits for the next, and switches then -- the rest of
+ * the refresh is left before the next TE starts a read -- by the base address and IDMA_SFR_UPDATE_FORCE (DECON0's
+ * update request does not carry DPP0's address: seen on the phone). No frame done in 50 ms: switched anyway, counted.
+ */
+#define RDMA_IRQ        0x004
+#define FRAME_DONE      (1u << 16)
 
-	while (micros(t0) < 200000) {
-		if (rdma[(RDMA_SHADOW + RDMA_BASEADDR) / 4] == addr) {
-			return (int64_t)micros(t0);
-		}
-		delay(50);
-	}
-	return -1;
-}
+static const uint64_t buffer_phys[2] = { FB_FRONT, FB_BACK };
+static uint32_t flips, flips_late;
+static uint64_t flip_wait_us;
 
 static int
-flip(uint32_t addr)
+display_buffers(vm_offset_t va[2], uint32_t *width, uint32_t *height, uint32_t *row_bytes)
 {
-	int64_t us;
-
-	rdma[RDMA_BASEADDR / 4] = addr;
-	__asm__ volatile("dsb sy" ::: "memory");
-	decon[SHD_REG_UP_REQ / 4] = UP_REQ_WIN0 | UP_REQ_GLOBAL;
-	if ((us = latched(addr)) >= 0) {
-		printf("akita_display: flip to %#x by the update request: taken after %lld us (SHD_REG_UP_REQ now %#x)\n", addr,
-		    (long long)us, decon[SHD_REG_UP_REQ / 4]);
-		return 0;
+	decon = (volatile uint32_t *)ml_io_map(DECON0, 0x1000);
+	rdma = (volatile uint32_t *)ml_io_map(DPP0_RDMA, 0x1000);
+	if (rdma[RDMA_BASEADDR / 4] != (uint32_t)FB_FRONT || decon[TRIG_CON / 4] != 0x3061 ||
+	    rdma[0x1c / 4] != (FB_HEIGHT << 16 | FB_WIDTH)) {
+		printf("akita_display: no double buffering: the pipeline is not as the bootloader leaves it (RDMA_BASEADDR_P0 "
+		    "%#x, TRIG_CON %#x, RDMA_IMG_SIZE %#x)\n", rdma[RDMA_BASEADDR / 4], decon[TRIG_CON / 4], rdma[0x1c / 4]);
+		return -1;
 	}
-	printf("akita_display: flip to %#x: the update request was not taken in 200 ms (SHD_REG_UP_REQ %#x, shadow %#x); "
-	    "forcing\n", addr, decon[SHD_REG_UP_REQ / 4], rdma[(RDMA_SHADOW + RDMA_BASEADDR) / 4]);
-	rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
-	if ((us = latched(addr)) >= 0) {
-		printf("akita_display: flip to %#x by IDMA_SFR_UPDATE_FORCE: taken after %lld us\n", addr, (long long)us);
-		return 0;
+	for (int i = 0; i < 2; i++) {
+		if ((va[i] = (vm_offset_t)map_buffer(buffer_phys[i], FB_BYTES)) == 0) {
+			return -1;
+		}
 	}
-	printf("akita_display: flip to %#x: not taken at all (shadow %#x)\n", addr, rdma[(RDMA_SHADOW + RDMA_BASEADDR) / 4]);
-	return -1;
+	*width = FB_WIDTH;
+	*height = FB_HEIGHT;
+	*row_bytes = FB_WIDTH * 4;
+	printf("akita_display: double buffering: %#llx and %#llx, flipped by DPP0 between the panel's frames\n", FB_FRONT, FB_BACK);
+	return 0;
 }
 
 static void
-akita_display_flip(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+display_flip(unsigned index)
 {
-	volatile uint32_t *front, *back;
+	uint64_t t0 = mach_absolute_time(), us;
 
-	decon = (volatile uint32_t *)ml_io_map(DECON0, 0x1000);
-	rdma = (volatile uint32_t *)ml_io_map(DPP0_RDMA, 0x1000);
-	if (rdma[RDMA_BASEADDR / 4] != (uint32_t)FB_FRONT || decon[TRIG_CON / 4] != 0x3061) {
-		printf("akita_display: flip: not as the bootloader leaves it (RDMA_BASEADDR_P0 %#x, TRIG_CON %#x): not tried\n",
-		    rdma[RDMA_BASEADDR / 4], decon[TRIG_CON / 4]);
-		return;
+	__asm__ volatile("dsb sy" ::: "memory");        /* (the frame's last writes out of the write buffers) */
+	rdma[RDMA_IRQ / 4] = FRAME_DONE;
+	while ((rdma[RDMA_IRQ / 4] & FRAME_DONE) == 0) {
+		if (micros(t0) > 50000) {
+			flips_late++;
+			break;
+		}
+		delay(20);
 	}
-	/* (each step said, and a moment to reach the computer: the first run of this ended the kernel between them) */
-	printf("akita_display: flip: mapping the front buffer %#llx\n", FB_FRONT);
-	delay(500000);
-	front = map_buffer(FB_FRONT, FB_BYTES);
-	if (front == NULL) {
-		printf("akita_display: flip: no kernel addresses for the front buffer\n");
-		return;
-	}
-	printf("akita_display: flip: front at %p, first word %#x; mapping the back buffer %#llx\n", (void *)front, front[0], FB_BACK);
-	delay(500000);
-	back = map_buffer(FB_BACK, FB_BYTES);
-	if (back == NULL) {
-		printf("akita_display: flip: no kernel addresses for the back buffer\n");
-		return;
-	}
-	printf("akita_display: flip: back at %p; reading its first word\n", (void *)back);
-	delay(500000);
-	printf("akita_display: flip: back's first word %#x; writing it\n", back[0]);
-	delay(500000);
-	back[0] = 0xffff00ffu;
+	rdma[RDMA_BASEADDR / 4] = (uint32_t)buffer_phys[index & 1];
 	__asm__ volatile("dsb sy" ::: "memory");
-	printf("akita_display: flip: written (%#x); copying the picture\n", back[0]);
-	delay(500000);
-	for (unsigned i = 0; i < FB_WIDTH * FB_HEIGHT; i++) {
-		back[i] = i < FB_WIDTH * 240 ? 0xffff00ffu : front[i];     /* magenta across the top 240 rows */
+	rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
+	us = micros(t0);
+	flip_wait_us += us;
+	if (++flips % 600 == 0) {
+		printf("akita_display: %u flips, %llu us waited for the panel's frame on average, %u without one in 50 ms\n",
+		    flips, flip_wait_us / 600, flips_late);
+		flip_wait_us = 0;
 	}
-	__asm__ volatile("dsb sy" ::: "memory");
-	printf("akita_display: flip: a second buffer at %#llx (the picture with a magenta band); RDMA_ENABLE %#x\n",
-	    FB_BACK, rdma[RDMA_ENABLE / 4]);
-	if (flip((uint32_t)FB_BACK) == 0) {
-		delay(5000000);
-	}
-	flip((uint32_t)FB_FRONT);
 }
+
+struct hakios_display_ops {
+	int (*buffers)(vm_offset_t va[2], uint32_t *width, uint32_t *height, uint32_t *row_bytes);
+	void (*flip)(unsigned index);
+};
+extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
+static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip };
 
 __startup_func
 static void
@@ -216,14 +193,10 @@ akita_display_init(void)
 {
 	uint32_t enabled = 0, seconds = 60;
 	uint64_t deadline;
-	static thread_call_t probe, flipper;
+	static thread_call_t probe;
 
 	if (PE_parse_boot_argn("display_flip", &enabled, sizeof(enabled)) && enabled) {
-		PE_parse_boot_argn("display_flip_delay", &seconds, sizeof(seconds));
-		flipper = thread_call_allocate(akita_display_flip, NULL);
-		clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
-		thread_call_enter_delayed(flipper, deadline);
-		seconds = 60;
+		hakios_display_ops = &akita_display_ops;
 	}
 	enabled = 0;
 	if (!PE_parse_boot_argn("display_probe", &enabled, sizeof(enabled)) || !enabled) {
