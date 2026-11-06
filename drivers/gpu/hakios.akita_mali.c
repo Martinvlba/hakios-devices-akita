@@ -1705,12 +1705,14 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 		mq->ring_size = size;
 		mq->user_in = (volatile uint32_t *)user;
 		mq->user_out = (volatile uint32_t *)(user + GPU_PAGE);
-		/* the stream's first words: REQ_RESOURCE compute, held from its start; and 0xaaaa stored into the sequence
-		 * page's second word (a check that the group's writes arrive: akita_mali_debug prints it) */
+		/* the stream's first words: REQ_RESOURCE compute, fragment, tiler and IDVS, held from its start (a program's
+		 * own request, made after the group had been idle, never took effect: its first render pass drew, and every
+		 * later submission's IDVS bound nothing); and 0xaaaa stored into the sequence page's second word (a check that
+		 * the group's writes arrive: akita_mali_debug prints it) */
 		{
 			uint64_t *r = (uint64_t *)mq->ring;
 
-			r[0] = 34ULL << 56 | 1;
+			r[0] = 34ULL << 56 | 0xf;
 			r[1] = 1ULL << 56 | 92ULL << 48 | (mq->seqno_va + 8);
 			r[2] = 2ULL << 56 | 94ULL << 48 | 0xaaaa;
 			r[3] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;
@@ -1914,7 +1916,11 @@ akita_mali_debug(void)
 			    g, q, mq->insert, *(volatile uint64_t *)mq->user_out, mq->user_out[CS_ACTIVE / 4], sout[0x44 / 4],
 			    sout[0x40 / 4], sin[CS_REQ / 4], sout[CS_ACK / 4], sout[0x48 / 4], sout[0x60 / 4], sout[0x4c / 4],
 			    sout[CS_FAULT / 4], sout[CS_FATAL / 4], sout[0x8c / 4], sout[0x88 / 4], *mq->seqno, mq->submitted,
-			    mq->seqno[1]);
+			    mq->seqno[1]);	/* the firmware's count of the queue's render passes on its tiler heap (panthor_fw.h: heap_vt_start, heap_vt_end,
+			 * heap_frag_end, heap_address), its scoreboards, and the heap chunk it was last given (heap_start, heap_end) */
+			printf("mali: group %u queue %u: heap passes started %u, tiled %u, fragment done %u; heap 0x%x%08x; scoreboards "
+			    "0x%x; given chunks 0x%x%08x..0x%x%08x\n", g, q, sout[0xc0 / 4], sout[0xc4 / 4], sout[0xcc / 4], sout[0xd4 / 4],
+			    sout[0xd0 / 4], sout[0x5c / 4], sin[0x24 / 4], sin[0x20 / 4], sin[0x2c / 4], sin[0x28 / 4]);
 		}
 	}
 	faults("the service asked");
