@@ -132,6 +132,10 @@ static const uint32_t l2_hash_values[3] = { 0x36db6d, 0x5b6db6, 0x0 };
 #define PTE_RW                  (1ULL << 6)
 #define PTE_RO                  (3ULL << 6)
 #define PTE_NX                  (1ULL << 54)
+/* outer shareable, as Linux's io-pgtable maps a Mali's pages (ARM_LPAE_PTE_SH_OS): Mali's inner domain is the GPU's
+ * own cores, and memory of neither domain was not even coherent among those -- the tiler read what the shader cores
+ * had written to a geometry buffer or tiler heap as memory held it before */
+#define PTE_SH_OS               (2ULL << 8)
 #define PTE_ADDR                0x000000fffffff000ULL
 
 /* the firmware file (Google's loader: magic, header version 0.3, entries of a type, a size, and words) */
@@ -1397,7 +1401,7 @@ map_page_in(uint64_t *root, uint64_t va, uint64_t phys, uint64_t attributes)
 		}
 		table = (uint64_t *)phystokv(*entry & PTE_ADDR);
 	}
-	table[(va >> 12) & 511] = (phys & PTE_ADDR) | attributes | PTE_AF | PTE_VALID_TABLE;
+	table[(va >> 12) & 511] = (phys & PTE_ADDR) | attributes | PTE_SH_OS | PTE_AF | PTE_VALID_TABLE;
 	clean_dcache((vm_offset_t)&table[(va >> 12) & 511] & ~63UL, 64, FALSE);
 	return true;
 }
@@ -1501,9 +1505,10 @@ akita_mali_vm_flush(int vm)
 	}
 }
 
-/* memory of the kernel's in a VM's kernel half (rings, sequence pages); its kernel address */
+/* memory of the kernel's in a VM's kernel half (rings, sequence pages); its kernel address. UNCACHED: the GPU's view
+ * of it uncached too (tiler heaps: what the shader cores write there, the tiler read stale through the cached view) */
 static vm_offset_t
-vm_kernel_region(unsigned int vm, vm_size_t size, uint64_t *va, bool exec)
+vm_kernel_region_attr(unsigned int vm, vm_size_t size, uint64_t *va, bool exec, bool uncached)
 {
 	vm_offset_t memory = gpu_memory(size);
 
@@ -1514,12 +1519,18 @@ vm_kernel_region(unsigned int vm, vm_size_t size, uint64_t *va, bool exec)
 	*va = vms[vm].kernel_next;
 	for (vm_size_t off = 0; off < size; off += GPU_PAGE) {
 		if (!map_page_in(vms[vm].root, *va + off, kvtophys(memory + off), (exec ? PTE_RO : PTE_RW | PTE_NX) |
-		    (uint64_t)ATTR_CACHED << 2)) {
+		    (uint64_t)(uncached ? ATTR_NON_CACHEABLE : ATTR_CACHED) << 2)) {
 			return 0;
 		}
 	}
 	vms[vm].kernel_next += round_page(size) + PAGE_SIZE;   /* a page between them */
 	return memory;
+}
+
+static vm_offset_t
+vm_kernel_region(unsigned int vm, vm_size_t size, uint64_t *va, bool exec)
+{
+	return vm_kernel_region_attr(vm, size, va, exec, false);
 }
 
 /* a kernel region taken back: out of the VM's tables, then freed */
