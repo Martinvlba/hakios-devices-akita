@@ -14,14 +14,17 @@ driver AKITA_ACPM
 driver AKITA_THERMAL
 	file    bsd/dev/hakios.akita_thermal.c
 	requires AKITA_ACPM
-	help    the Pixel 8a's SoC temperatures (BIG, MID, LITTLE, G3D, ISP, TPU, AUR) through ACPM every 2 s: kern.hakios.thermal_*,
-	help    and the phone powered off at thermal_stop= degrees (100) three readings in a row (thermal=1); THERMAL's sysctls, for zuma
+	help    the Pixel 8a's SoC temperatures (BIG, MID, LITTLE, G3D, ISP, TPU, AUR) through ACPM every 2 s, the board's eight
+	help    thermistors (the S2MPG15's meter) and Android's VIRTUAL-SKIN from them: kern.hakios.thermal_*; the phone powered
+	help    off three readings in a row at thermal_stop= (100) on the SoC, thermal_skin_stop= (55) of skin, soc_therm 58,
+	help    the battery 68 (thermal=1); THERMAL's sysctls, for zuma
 
 driver AKITA_DVFS
 	file    bsd/dev/hakios.akita_dvfs.c
 	requires AKITA_ACPM AKITA_THERMAL
 	help    the Pixel 8a's CPU clusters' clocks through ACPM: a governor every 100 ms (the busiest core's share), held
-	help    down when hot: BIG from 75 C, all from 85 (dvfs=1; kern.hakios.dvfs_mhz)
+	help    down when hot: BIG from 75 C, all from 85; step-wise ceilings for the skin (BIG 39 C, MID 41, LITTLE 43) and
+	help    the GPU's clocks over 45 C of skin or 90 of G3D (dvfs=1; kern.hakios.dvfs_mhz, dvfs_skin_caps)
 
 driver AKITA_RTC
 	file    bsd/dev/hakios.akita_rtc.c
