@@ -190,6 +190,68 @@ klog_thread(void *parameter, __unused wait_result_t result)
 	lck_mtx_unlock(mux_lock);
 }
 
+/*
+ * Port 6: a picture of what the panel shows -- what the display's DMA reads, as hakios.akita_display.c finds it -- as a
+ * binary PPM (P6, RGB), a comment line first with the DMA's base, stride and size; then the connection is closed.
+ * devices/akita/tools/usbmux-shot.py on the host.
+ */
+extern int akita_display_snapshot(const uint8_t **pixels, uint64_t *phys, uint32_t *width, uint32_t *height, uint32_t *row_bytes);
+
+static bool
+screen_send(struct mux_conn *c, const void *data, uint32_t n)
+{
+	uint32_t seq;
+
+	lck_mtx_lock(mux_lock);
+	seq = c->tx_seq;
+	c->tx_seq += n;
+	lck_mtx_unlock(mux_lock);
+	return c->open && send_tcp(c, TH_ACK, seq, c->rx_next, data, n, true);
+}
+
+static void
+screen_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+	static char chunk[MAX_DATA];
+	const uint8_t *pixels;
+	uint64_t phys;
+	uint32_t w, h, rb, n = 0;
+
+	if (akita_display_snapshot(&pixels, &phys, &w, &h, &rb) != 0) {
+		n = (uint32_t)snprintf(chunk, sizeof(chunk), "no picture: the display reads %#llx (%u x %u, rows of %u bytes), "
+		    "outside the scan-out area\n", phys, w, h, rb);
+		screen_send(c, chunk, n);
+	} else {
+		n = (uint32_t)snprintf(chunk, sizeof(chunk), "P6\n# base %#llx stride %u size %ux%u\n%u %u\n255\n", phys, rb, w, h,
+		    w, h);
+		for (uint32_t y = 0; y < h && c->open; y++) {
+			const uint8_t *row = pixels + (uint64_t)y * rb;
+			for (uint32_t x = 0; x < w; x++) {
+				if (n + 3 > sizeof(chunk)) {
+					if (!screen_send(c, chunk, n)) goto done;
+					n = 0;
+				}
+				chunk[n++] = (char)row[4 * x + 2];      /* BGRA in memory */
+				chunk[n++] = (char)row[4 * x + 1];
+				chunk[n++] = (char)row[4 * x + 0];
+			}
+		}
+		if (n != 0) {
+			screen_send(c, chunk, n);
+		}
+	}
+done:
+	delay_for_interval(200, NSEC_PER_MSEC);
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_FIN | TH_ACK, c->tx_seq, c->rx_next, NULL, 0, false);
+		send_tcp(c, TH_RST, c->tx_seq + 1, c->rx_next, NULL, 0, false);
+	}
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
 #define PMU_REBOOT_CMD          0x15460810UL    /* Android's tree: pixel-reboot, syscon PMU 0x15460000, reboot-cmd-offset 0x810 */
 #define REBOOT_BOOTLOADER       0xfc
 #define TENSOR_SMC_PMU_SEC_REG  0x82000504
@@ -330,7 +392,7 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 		return;
 	}
-	if (phone_port == 1 || phone_port == 5) {
+	if (phone_port == 1 || phone_port == 5 || phone_port == 6) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {
 			if (!conns[i].used) {
@@ -348,9 +410,11 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 			send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 			return;
 		}
-		printf("akita usbmux: host port %u: the %s\n", host_port, phone_port == 1 ? "console log" : "kernel message buffer");
+		printf("akita usbmux: host port %u: the %s\n", host_port,
+		    phone_port == 1 ? "console log" : phone_port == 5 ? "kernel message buffer" : "screen");
 		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
-		if (kernel_thread_start(phone_port == 1 ? klog_thread : dmesg_thread, c, &thread) == KERN_SUCCESS) {
+		if (kernel_thread_start(phone_port == 1 ? klog_thread : phone_port == 5 ? dmesg_thread : screen_thread, c,
+		    &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}
 		return;

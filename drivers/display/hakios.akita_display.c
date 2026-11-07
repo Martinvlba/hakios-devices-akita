@@ -132,6 +132,17 @@ micros(uint64_t since)
 #define NO_BUFFER       (~0u)
 
 static const uint64_t buffer_phys[3] = { FB_FRONT, FB_BACK, FB_BACK + 0xa00000 };     /* the third: 0xfc200000 */
+/*
+ * The scan-out slots (zero copy, MiniIOMobileFramebuffer's fb_zc=1): the same free RAM cut into four pieces of
+ * 0x9f8000 bytes from 0xfac00000 -- room for 2400 rows of up to 4352 bytes each and a page, the last ending at 0xfd3e0000 below
+ * dss_log -- the first the framebuffer's own buffer, the others iOS's display surfaces, scanned out where they are.
+ */
+#define SLOT_SIZE       0x9f8000ULL      /* (2400 rows of 4352 bytes and a page more: the picture starts on a page) */
+#define SLOTS           4
+#define RDMA_SRC_WIDTH_REG 0x010              /* the source's width in pixels: its row stride */
+static volatile uint64_t scan_phys;            /* a slot queued to be scanned out (0: none) ... */
+static volatile uint32_t scan_stride;          /* ... and its rows' bytes */
+static volatile uint64_t scanned_phys;         /* what DPP0 reads now */
 static uint32_t nbuffers = 3;
 static volatile uint32_t shown_index, queued = NO_BUFFER;
 static uint32_t flips, flips_late, flips_dropped;
@@ -142,6 +153,9 @@ static lck_mtx_t *flip_lock;
 static void flipper(void *arg, wait_result_t wr);
 static void panel_set_hz(uint32_t hz);
 static uint32_t display_refresh_hz(void);
+static uint64_t display_slot(unsigned i, uint64_t *size);
+static void display_scanout(uint64_t phys, uint32_t row_bytes);
+static uint64_t display_scanned(void);
 static uint32_t measure_hz(void);
 static volatile uint32_t vblank_caught_hz;        /* frame dones the vblank thread caught in the last second */
 static volatile uint64_t vblank_at;
@@ -191,7 +205,9 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	*width = FB_WIDTH;
 	*height = FB_HEIGHT;
 	*row_bytes = FB_WIDTH * 4;
-	printf("akita_display: %u buffers from %#llx, flipped by DPP0 between the panel's frames\n", nbuffers, FB_FRONT);
+	scanned_phys = FB_FRONT;
+	printf("akita_display: %u buffers from %#llx, flipped by DPP0 between the panel's frames (RDMA_SRC_WIDTH %u)\n", nbuffers,
+	    FB_FRONT, rdma[RDMA_SRC_WIDTH_REG / 4]);
 	return 0;
 }
 
@@ -293,6 +309,18 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 			}
 		}
 		lck_mtx_lock(flip_lock);
+		if (scan_phys != 0) {
+			/* a surface scanned out where it is (zero copy): its address and its rows' stride */
+			__asm__ volatile("dsb sy" ::: "memory");
+			rdma[RDMA_BASEADDR / 4] = (uint32_t)scan_phys;
+			rdma[RDMA_SRC_WIDTH_REG / 4] = scan_stride / 4;
+			__asm__ volatile("dsb sy" ::: "memory");
+			rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
+			scanned_phys = scan_phys;
+			scan_phys = 0;
+			thread_wakeup((event_t)&scanned_phys);
+			flips++;
+		}
 		if (queued == NO_BUFFER) {
 			lck_mtx_unlock(flip_lock);
 			continue;
@@ -301,8 +329,10 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 		index = queued;                                 /* (the newest, if another came while waiting) */
 		queued = NO_BUFFER;
 		rdma[RDMA_BASEADDR / 4] = (uint32_t)buffer_phys[index];
+		rdma[RDMA_SRC_WIDTH_REG / 4] = FB_WIDTH;
 		__asm__ volatile("dsb sy" ::: "memory");
 		rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
+		scanned_phys = buffer_phys[index];
 		shown_index = index;
 		thread_wakeup((event_t)&shown_index);
 		lck_mtx_unlock(flip_lock);
@@ -323,6 +353,59 @@ display_refresh_hz(void)
 	return hz >= 112 && hz <= 128 ? 120 : hz >= 55 && hz <= 65 ? 60 : hz;
 }
 static uint64_t display_vblank_time(void) { return vblank_at; }
+
+/* a scan-out slot's physical address and size (0 past the last) */
+static uint64_t
+display_slot(unsigned i, uint64_t *size)
+{
+	*size = SLOT_SIZE;
+	return i < SLOTS ? FB_FRONT + i * SLOT_SIZE : 0;
+}
+
+/* PHYS (inside a slot, its rows ROW_BYTES apart) scanned out from the panel's next refresh on; returns at once */
+static void
+display_scanout(uint64_t phys, uint32_t row_bytes)
+{
+	if (phys < FB_FRONT || phys + (uint64_t)row_bytes * FB_HEIGHT > FB_FRONT + SLOTS * SLOT_SIZE || (row_bytes & 3) != 0 ||
+	    row_bytes < FB_WIDTH * 4) {
+		return;
+	}
+	lck_mtx_lock(flip_lock);
+	scan_stride = row_bytes;
+	scan_phys = phys;
+	lck_mtx_unlock(flip_lock);
+}
+
+static uint64_t display_scanned(void) { return scanned_phys; }
+
+/*
+ * What the panel shows, for a picture of it (hakios.akita_usbmux.c's port 6): what DPP0 reads -- its base address, its
+ * stride and size from the DMA's own registers, not what any driver believes it set -- and a kernel address for those
+ * bytes. The scan-out area (the four slots from 0xfac00000) is mapped once, the first time; 0 when the base is outside it.
+ */
+int akita_display_snapshot(const uint8_t **pixels, uint64_t *phys, uint32_t *width, uint32_t *height, uint32_t *row_bytes);
+
+int
+akita_display_snapshot(const uint8_t **pixels, uint64_t *phys, uint32_t *width, uint32_t *height, uint32_t *row_bytes)
+{
+	static volatile uint32_t *area;
+
+	if (rdma == NULL) {
+		rdma = (volatile uint32_t *)ml_io_map(DPP0_RDMA, 0x1000);
+	}
+	*phys = rdma[RDMA_BASEADDR / 4];
+	*row_bytes = rdma[RDMA_SRC_WIDTH_REG / 4] * 4;
+	*width = rdma[0x1c / 4] & 0xffff;                     /* RDMA_IMG_SIZE */
+	*height = rdma[0x1c / 4] >> 16;
+	if (area == NULL) {
+		area = map_buffer(FB_FRONT, SLOTS * SLOT_SIZE);
+	}
+	if (area == NULL || *phys < FB_FRONT || *phys + (uint64_t)*row_bytes * *height > FB_FRONT + SLOTS * SLOT_SIZE) {
+		return -1;
+	}
+	*pixels = (const uint8_t *)area + (*phys - FB_FRONT);
+	return 0;
+}
 
 /*
  * The panel's commands (display_hz=120 or 60): MIPI DCS writes through DSIM0 (drmdsim@19440000 in the phone's tree), as
@@ -456,10 +539,13 @@ struct hakios_display_ops {
 	uint32_t (*shown)(void);
 	uint32_t (*refresh_hz)(void);
 	uint64_t (*vblank_time)(void);
+	uint64_t (*slot)(unsigned i, uint64_t *size);
+	void (*scanout)(uint64_t phys, uint32_t row_bytes);
+	uint64_t (*scanned)(void);
 };
 extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
 static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown, display_refresh_hz,
-	                                                     display_vblank_time };
+	                                                     display_vblank_time, display_slot, display_scanout, display_scanned };
 
 /*
  * The DPP's scaler, tried on its own (display_scale=1, without display_flip; display_scale_delay= seconds, 60): DPP0 made

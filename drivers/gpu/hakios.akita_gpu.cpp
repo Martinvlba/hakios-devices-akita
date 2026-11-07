@@ -332,7 +332,9 @@ HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOM
 	if (type >= 1 && type <= MAX_BOS && fBos[type - 1].memory != NULL) {
 		fBos[type - 1].memory->retain();
 		*memory = fBos[type - 1].memory;
-		*options = 0;
+		/* (a scan-out slot's pixels are RAM outside the kernel's: mapped as device memory by default, where an unaligned
+		 * access faults -- write-combined instead, as MiniIOSurface maps them) */
+		*options = fBos[type - 1].surface != NULL && fBos[type - 1].surface->scanoutSlot > 0 ? kIOMapWriteCombineCache : 0;
 		ret = kIOReturnSuccess;
 	}
 	IOLockUnlock(gLock);
@@ -698,7 +700,9 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface *request)
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
-	if (s->client != NULL) {
+	/* (a surface around a client's memory: not; one in a display scan-out slot, MiniIOMobileFramebuffer's zero copy: its
+	 * pixels are that slot's physical memory, in `client`) */
+	if (s->client != NULL && s->scanoutSlot <= 0) {
 		MiniIOSurfaceDrop(s);
 		return kIOReturnUnsupported;
 	}
@@ -724,7 +728,8 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface *request)
 	}
 	for (h = 0; h < MAX_BOS && fBos[h].memory != NULL; h++) {
 	}
-	memory = h < MAX_BOS ? IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut) : NULL;
+	memory = h >= MAX_BOS ? NULL : s->scanoutSlot > 0 ? IOSubMemoryDescriptor::withSubRange(s->client, 0, size, kIODirectionInOut) :
+	    IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
 	if (memory == NULL) {
 		MiniIOSurfaceDrop(s);
 		return h < MAX_BOS ? kIOReturnNoMemory : kIOReturnNoResources;
