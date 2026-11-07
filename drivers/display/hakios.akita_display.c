@@ -140,6 +140,14 @@ static lck_grp_t *flip_group;
 static lck_mtx_t *flip_lock;
 
 static void flipper(void *arg, wait_result_t wr);
+static void panel_set_hz(uint32_t hz);
+static uint32_t display_refresh_hz(void);
+static uint32_t measure_hz(void);
+static volatile uint32_t vblank_caught_hz;        /* frame dones the vblank thread caught in the last second */
+static volatile uint64_t vblank_at;
+static volatile uint32_t vblank_hz;
+static volatile uint64_t vblank_period;         /* the refresh's length (mach_absolute_time units): the vblank thread's sleep */
+static volatile bool vblank_paused;             /* measure_hz has the frame-done bit to itself */
 
 static int
 display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *height, uint32_t *row_bytes)
@@ -165,8 +173,20 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 		printf("akita_display: no flips: the flipping thread could not start\n");
 		return -1;
 	}
-	thread_set_thread_name(thread, "akita_display: flips");
+	thread_set_thread_name(thread, "akita_display: vblank");
 	thread_deallocate(thread);
+	{
+		/* the panel's rate measured (a second and a bit), and display_hz= set before the framebuffer tells
+		 * CoreAnimation its refresh */
+		uint32_t hz = 0;
+
+		if (PE_parse_boot_argn("display_hz", &hz, sizeof(hz)) && (hz == 60 || hz == 120)) {
+			panel_set_hz(hz);
+		} else {
+			measure_hz();
+		}
+		printf("akita_display: the panel refreshes at %u Hz (counted %u)\n", display_refresh_hz(), vblank_hz);
+	}
 	*count = nbuffers;
 	*width = FB_WIDTH;
 	*height = FB_HEIGHT;
@@ -201,32 +221,83 @@ display_flip(unsigned index)
 	lck_mtx_unlock(flip_lock);
 }
 
+/*
+ * The panel's beat (the vblank thread, in place of a thread that woke only to flip): DPP0's frame done at every refresh
+ * -- DECON0 sends a frame at each of the panel's TE, 60 or 120 a second (display_hz=) -- each one timestamped, the rate
+ * measured over the last second, and a queued buffer switched to right there, in the rest of the refresh before the
+ * next TE starts a read. No interrupt is wired: the thread sleeps until just before the frame done it expects (the last
+ * one plus a period, less 1.5 ms) and then looks every 50 us; a frame done missed for 50 ms is counted, and a queued
+ * buffer is switched anyway.
+ */
+/* vblank_at: mach_absolute_time of the last frame done; vblank_hz: refreshes in the last second (declared above) */
+static uint64_t vblank_count;
+
 static void
 flipper(__unused void *arg, __unused wait_result_t wr)
 {
-	for (;;) {
-		uint64_t t0;
-		uint32_t index;
+	uint64_t second_start = mach_absolute_time(), period_abs, margin_abs, window_abs;
+	uint32_t in_second = 0;
 
-		lck_mtx_lock(flip_lock);
-		while (queued == NO_BUFFER) {
-			assert_wait((event_t)&queued, THREAD_UNINT);
-			lck_mtx_unlock(flip_lock);
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / 60, &period_abs);
+	vblank_period = period_abs;
+	nanoseconds_to_absolutetime(700 * NSEC_PER_USEC, &margin_abs);
+	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &window_abs);
+	rdma[RDMA_IRQ / 4] = FRAME_DONE;
+	for (;;) {
+		uint64_t now = mach_absolute_time(), t0;
+		uint32_t index;
+		bool seen = false;
+
+		/* asleep until a quarter of a refresh (1.5 ms at least) before the frame done that is due; the period is
+		 * measure_hz's, not guessed from the gaps seen here */
+		while (vblank_paused) {
+			assert_wait_timeout((event_t)&vblank_paused, THREAD_UNINT, 5, NSEC_PER_MSEC);
 			thread_block(THREAD_CONTINUE_NULL);
-			lck_mtx_lock(flip_lock);
+			now = mach_absolute_time();
 		}
-		lck_mtx_unlock(flip_lock);
+		period_abs = vblank_period;
+		margin_abs = period_abs / 4;
+		{
+			uint64_t least;
+			nanoseconds_to_absolutetime(1500 * NSEC_PER_USEC, &least);
+			if (margin_abs < least) margin_abs = least;
+		}
+		if (vblank_at != 0 && vblank_at + period_abs > now + margin_abs) {
+			assert_wait_deadline((event_t)&vblank_at, THREAD_UNINT, vblank_at + period_abs - margin_abs);
+			thread_block(THREAD_CONTINUE_NULL);
+		}
 		t0 = mach_absolute_time();
-		__asm__ volatile("dsb sy" ::: "memory");        /* (the frame's last writes out of the write buffers) */
-		rdma[RDMA_IRQ / 4] = FRAME_DONE;
-		while ((rdma[RDMA_IRQ / 4] & FRAME_DONE) == 0) {
-			if (micros(t0) > 50000) {
-				flips_late++;
+		while (mach_absolute_time() - t0 < window_abs) {
+			if (rdma[RDMA_IRQ / 4] & FRAME_DONE) {
+				seen = true;
 				break;
 			}
-			delay(100);
+			delay(50);
+		}
+		now = mach_absolute_time();
+		rdma[RDMA_IRQ / 4] = FRAME_DONE;
+		if (seen) {
+			vblank_at = now;
+			vblank_count++;
+			in_second++;
+		} else {
+			flips_late += queued != NO_BUFFER;
+		}
+		{
+			uint64_t ns;
+			absolutetime_to_nanoseconds(now - second_start, &ns);
+			if (ns >= NSEC_PER_SEC) {
+				vblank_caught_hz = (uint32_t)((uint64_t)in_second * NSEC_PER_SEC / ns);
+				second_start = now;
+				in_second = 0;
+			}
 		}
 		lck_mtx_lock(flip_lock);
+		if (queued == NO_BUFFER) {
+			lck_mtx_unlock(flip_lock);
+			continue;
+		}
+		__asm__ volatile("dsb sy" ::: "memory");        /* (the frame's last writes out of the write buffers) */
 		index = queued;                                 /* (the newest, if another came while waiting) */
 		queued = NO_BUFFER;
 		rdma[RDMA_BASEADDR / 4] = (uint32_t)buffer_phys[index];
@@ -235,23 +306,160 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 		shown_index = index;
 		thread_wakeup((event_t)&shown_index);
 		lck_mtx_unlock(flip_lock);
-		flip_wait_us += micros(t0);
 		if (++flips % 600 == 0) {
-			printf("akita_display: %u flips, %llu us from queued to shown on average, %u frames replaced by a newer "
-			    "before being shown, %u flips without a frame done in 50 ms\n", flips, flip_wait_us / 600, flips_dropped,
-			    flips_late);
-			flip_wait_us = 0;
+			printf("akita_display: %u flips; the panel at %u Hz, %u frame dones caught in the last second (%llu in all); %u "
+			    "frames replaced by a newer before being shown, %u flips without a frame done in 50 ms\n", flips, vblank_hz,
+			    vblank_caught_hz, vblank_count, flips_dropped, flips_late);
 		}
 	}
+}
+
+/* the panel's rate as its mode's (60 or 120) when the count is near it: a refresh missed now and then is the polling's */
+static uint32_t
+display_refresh_hz(void)
+{
+	uint32_t hz = vblank_hz;
+
+	return hz >= 112 && hz <= 128 ? 120 : hz >= 55 && hz <= 65 ? 60 : hz;
+}
+static uint64_t display_vblank_time(void) { return vblank_at; }
+
+/*
+ * The panel's commands (display_hz=120 or 60): MIPI DCS writes through DSIM0 (drmdsim@19440000 in the phone's tree), as
+ * Google's exynos_drm_dsim.c sends one without batching -- the payload's words into DSIM_PAYLOAD, then the header into
+ * DSIM_PKTHDR (data type 0x05 or 0x15 for one or two bytes, 0x39 and the length for more), and the FIFOs waited for.
+ * The sequence for a rate is Google's panel driver's for this panel (kernel/devices/google/akita display/
+ * panel-google-ak3b.c, ak3b_change_frequency): the test key, 60 00 00 (HS 120) or 60 08 00 (HS 60), B9 31 or 30 (the
+ * TE), F7 0F (the update), the test key off. In command mode the panel's TE then comes at that rate, and DECON0's
+ * hardware trigger with it: nothing else changes on this side.
+ */
+#define DSIM0           0x19440000ULL
+#define DSIM_PKTHDR     0x058
+#define DSIM_PAYLOAD    0x05c
+#define DSIM_FIFOCTRL   0x068
+#define DSIM_CMD_CONFIG 0x080
+#define FIFO_PH_EMPTY   (1u << 10)
+#define FIFO_PL_EMPTY   (1u << 8)
+#define PKT_GO_EN       (1u << 16)
+#define PKT_GO_RDY      (1u << 17)
+
+static volatile uint32_t *dsim;
+
+static bool
+dsim_fifo_empty(uint32_t which)
+{
+	uint64_t t0 = mach_absolute_time();
+
+	while ((dsim[DSIM_FIFOCTRL / 4] & which) != which) {
+		if (micros(t0) > 20000) {
+			return false;
+		}
+		delay(20);
+	}
+	return true;
+}
+
+static bool
+dsim_dcs(const uint8_t *b, uint32_t n)
+{
+	if (!dsim_fifo_empty(FIFO_PH_EMPTY | FIFO_PL_EMPTY)) {
+		return false;
+	}
+	if (n == 1) {
+		dsim[DSIM_PKTHDR / 4] = 0x05 | (uint32_t)b[0] << 8;
+	} else if (n == 2) {
+		dsim[DSIM_PKTHDR / 4] = 0x15 | (uint32_t)b[0] << 8 | (uint32_t)b[1] << 16;
+	} else {
+		for (uint32_t i = 0; i < n; i += 4) {
+			uint32_t w = 0;
+			for (uint32_t k = 0; k < 4 && i + k < n; k++) {
+				w |= (uint32_t)b[i + k] << (8 * k);
+			}
+			dsim[DSIM_PAYLOAD / 4] = w;
+		}
+		dsim[DSIM_PKTHDR / 4] = 0x39 | (n & 0xff) << 8 | (n >> 8 & 0xff) << 16;
+	}
+	if (dsim[DSIM_CMD_CONFIG / 4] & PKT_GO_EN) {
+		dsim[DSIM_CMD_CONFIG / 4] |= PKT_GO_RDY;
+	}
+	return dsim_fifo_empty(FIFO_PH_EMPTY | FIFO_PL_EMPTY);
+}
+
+/*
+ * The panel's true rate: the vblank thread paused, frame done's edges counted for half a second by polling every 20 us
+ * (no sleeping in between, so none is missed); the period set from it for the vblank thread
+ */
+static uint32_t
+measure_hz(void)
+{
+	uint64_t t0, first = 0, last = 0;
+	uint32_t edges = 0;
+
+	vblank_paused = true;
+	delay(20000);                           /* (the thread out of its poll) */
+	rdma[RDMA_IRQ / 4] = FRAME_DONE;
+	t0 = mach_absolute_time();
+	while (micros(t0) < 500000) {
+		if (rdma[RDMA_IRQ / 4] & FRAME_DONE) {
+			uint64_t now = mach_absolute_time();
+			rdma[RDMA_IRQ / 4] = FRAME_DONE;
+			if (edges++ == 0) first = now;
+			last = now;
+		}
+		delay(20);
+	}
+	if (edges >= 2) {
+		vblank_period = (last - first) / (edges - 1);
+		vblank_at = last;
+	}
+	vblank_paused = false;
+	thread_wakeup((event_t)&vblank_paused);
+	{
+		uint64_t ns;
+		absolutetime_to_nanoseconds(vblank_period, &ns);
+		vblank_hz = ns ? (uint32_t)((NSEC_PER_SEC + ns / 2) / ns) : 0;
+	}
+	return vblank_hz;
+}
+
+static void
+panel_set_hz(uint32_t hz)
+{
+	const uint8_t key_on[] = { 0xf0, 0x5a, 0x5a }, key_off[] = { 0xf0, 0xa5, 0xa5 }, update[] = { 0xf7, 0x0f };
+	const uint8_t hs120[] = { 0x60, 0x00, 0x00 }, hs60[] = { 0x60, 0x08, 0x00 };
+	const uint8_t te120[] = { 0xb9, 0x31 }, te60[] = { 0xb9, 0x30 };
+	uint32_t before = measure_hz();
+	bool ok;
+
+	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);
+	printf("akita_display: the panel to %u Hz (it refreshes at %u now); DSIM0 CMD_CONFIG %#x FIFOCTRL %#x\n", hz, before,
+	    dsim[DSIM_CMD_CONFIG / 4], dsim[DSIM_FIFOCTRL / 4]);
+	/* right after a frame done: the rest of the refresh is free for commands */
+	{
+		uint64_t at = vblank_at, t0 = mach_absolute_time();
+		while (vblank_at == at && micros(t0) < 50000) {
+			delay(100);
+		}
+	}
+	ok = dsim_dcs(key_on, sizeof(key_on)) && dsim_dcs(hz == 120 ? hs120 : hs60, 3) &&
+	    dsim_dcs(hz == 120 ? te120 : te60, 2) && dsim_dcs(update, sizeof(update)) && dsim_dcs(key_off, sizeof(key_off));
+	/* the new rate measured afresh */
+	delay(200000);
+	measure_hz();
+	printf("akita_display: the panel's commands %s; it refreshes at %u Hz now (FIFOCTRL %#x)\n", ok ? "sent" : "NOT all sent",
+	    vblank_hz, dsim[DSIM_FIFOCTRL / 4]);
 }
 
 struct hakios_display_ops {
 	int (*buffers)(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *height, uint32_t *row_bytes);
 	void (*flip)(unsigned index);
 	uint32_t (*shown)(void);
+	uint32_t (*refresh_hz)(void);
+	uint64_t (*vblank_time)(void);
 };
 extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
-static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown };
+static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown, display_refresh_hz,
+	                                                     display_vblank_time };
 
 /*
  * The DPP's scaler, tried on its own (display_scale=1, without display_flip; display_scale_delay= seconds, 60): DPP0 made

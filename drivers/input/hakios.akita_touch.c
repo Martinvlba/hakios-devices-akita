@@ -13,7 +13,7 @@
  *       touch report and how big a finger's record is (14 bytes on this chip, 8 on others), read from its description.
  *
  * The chip keeps its firmware in its own flash (Android's driver finds it current and loads nothing), so nothing is
- * loaded here. No interrupt is used: the interrupt line (gpn0-0, low while a report waits) is looked at 125 times a
+ * loaded here. No interrupt is used: the interrupt line (gpn0-0, low while a report waits) is looked at 250 times a
  * second, and the report read when it is low, or every 80 ms anyway.
  *
  * Found on the phone (2026-11-01): from U-Boot (uefi cmd/hakios_tspi.c) the chip's version block read back
@@ -449,12 +449,12 @@ interrupt_line_low(void)
 static void
 akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t poll_us = 8000, idle = 0, idle_looks;
+	uint32_t poll_us = 4000, idle = 0, idle_looks;     /* 250 a second: about two looks in each 120 Hz refresh */
 	bool found = false;
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	if (poll_us < 250 || poll_us > 100000) {
-		poll_us = 8000;
+		poll_us = 4000;
 	}
 	idle_looks = 80000 / poll_us;
 
