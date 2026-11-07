@@ -30,6 +30,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -175,6 +176,72 @@ read_regs(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
 }
 
 static bool
+write_reg(uint8_t addr, uint8_t reg, uint8_t value)
+{
+	uint8_t b[2] = { reg, value };
+
+	return transfer(addr, false, b, 2, true);
+}
+
+/*
+ * The charge current's thermal limit (Android's fcc cooling device, from hakios.akita_dvfs.c's controllers): asked for
+ * from any thread, written by this driver's own thread on its next look (the I2C is its). The charger's CHG_CNFG_02
+ * CHGCC (bits 5:0; 0x03 200 mA .. 0x3c 4 A, 66.67 mA a step, Google's max77759_charger.c), its write protection
+ * (CHG_CNFG_06 CHGPROT, bits 3:2) lifted for the write and put back; 0 asks for the charger's own value again (what it
+ * was before the first limit). kern.hakios.charge_limit_ma (0: none).
+ */
+#define CHG_CNFG_02             0xbb
+#define CHG_CNFG_06             0xbf
+static volatile int32_t cc_wanted_ua;           /* 0 none */
+static int32_t cc_applied_ua;                   /* what is in the charger (0: its own) */
+static int cc_own = -1;                         /* CHGCC before the first limit; -1 not read */
+static int charge_limit_ma;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_INT(_kern_hakios, OID_AUTO, charge_limit_ma, CTLFLAG_RD | CTLFLAG_LOCKED, &charge_limit_ma, 0,
+    "the charge current's thermal limit, in mA (0: none)");
+
+void akita_charger_limit_ua(int32_t ua);
+void
+akita_charger_limit_ua(int32_t ua)
+{
+	cc_wanted_ua = ua > 0 ? ua : 0;
+}
+
+static void
+charge_limit_apply(void)
+{
+	int32_t want = cc_wanted_ua;
+	uint8_t cc, prot;
+	int value;
+
+	if (want == cc_applied_ua) {
+		return;
+	}
+	if (!read_regs(CHARGER, CHG_CNFG_02, &cc, 1) || !read_regs(CHARGER, CHG_CNFG_06, &prot, 1)) {
+		return;
+	}
+	if (cc_own < 0) {
+		cc_own = cc & 0x3f;
+	}
+	if (want == 0) {
+		value = cc_own;
+	} else {
+		value = want <= 200000 ? 0x03 : want >= 4000000 ? 0x3c : 0x03 + (want - 200000) / 66670;
+		value = value > cc_own && cc_own >= 0x03 ? cc_own : value;      /* never above the charger's own */
+	}
+	if (!write_reg(CHARGER, CHG_CNFG_06, (uint8_t)(prot | 0x0c)) ||
+	    !write_reg(CHARGER, CHG_CNFG_02, (uint8_t)((cc & 0xc0) | value))) {
+		return;
+	}
+	write_reg(CHARGER, CHG_CNFG_06, (uint8_t)(prot & ~0x0c));
+	cc_applied_ua = want;
+	charge_limit_ma = want / 1000;
+	printf("akita battery: charge current %s (CHGCC 0x%02x, the charger's own 0x%02x)\n", want ? "held down by the "
+	    "heat" : "back to the charger's own", value, cc_own);
+}
+
+static bool
 gauge_word(uint8_t reg, int32_t *value, bool is_signed)
 {
 	uint8_t b[2];
@@ -273,6 +340,7 @@ akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 		} else {
 			failed++;
 		}
+		charge_limit_apply();
 		delay_for_interval(5000, NSEC_PER_MSEC);
 	}
 }

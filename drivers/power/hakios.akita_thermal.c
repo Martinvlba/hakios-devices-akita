@@ -36,7 +36,8 @@
  * hakios.akita_dvfs.c's, from akita_thermal_skin_mc().
  *
  *   - kern.hakios.thermal_skin_mc, thermal_skin_level (0..6), thermal_board ("modem=29 quiet=28 ..."),
- *     thermal_battery (C)
+ *     thermal_battery (C), thermal_skin_charge_mc (Android's VIRTUAL-SKIN-CHARGE, which holds the charge current down:
+ *     0.209 modem + 0.368 rffe + 0.261 soc + 0.146 charger + 300 and 0.606 quiet + 0.429 rffe + 10, the larger)
  */
 #include <kern/clock.h>
 #include <kern/startup.h>
@@ -77,6 +78,7 @@ static const char *const ntc_names[NNTC] = { "modem", "quiet", "rffe", "usb_conn
 static int ntc_mc[NNTC];                        /* millidegrees (the skin only once every channel was read) */
 static bool ntc_ok;                             /* the meter answered and its channels are on */
 static int thermal_skin_mc = -273000, thermal_skin_level, thermal_battery_c = -273;
+static int thermal_skin_charge_mc = -273000;    /* Android's VIRTUAL-SKIN-CHARGE (what the charge current is held by) */
 static char thermal_board[160] = "";
 static uint32_t skin_stop_c = 55;
 static int skin_hot, soc_hot, battery_hot;
@@ -106,6 +108,8 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_skin_mc, CTLFLAG_RD | CTLFLAG_LOCKED,
     "Android's VIRTUAL-SKIN from the board's thermistors, in millidegrees C");
 SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_skin_level, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_skin_level, 0,
     "the skin's severity, 0..6 (Android's: 6 shuts the phone down)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_skin_charge_mc, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_skin_charge_mc, 0,
+    "Android's VIRTUAL-SKIN-CHARGE, in millidegrees C");
 SYSCTL_STRING(_kern_hakios, OID_AUTO, thermal_board, CTLFLAG_RD | CTLFLAG_LOCKED, thermal_board, 0,
     "the board's thermistors, in degrees C");
 SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_battery, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_battery_c, 0,
@@ -122,6 +126,7 @@ akita_thermal_hottest_c(void)
 
 /* for the clocks: the skin in millidegrees (-273000 while not known), one SoC sensor in degrees (BIG 0 .. AUR 6) */
 int akita_thermal_skin_mc(void);
+int akita_thermal_skin_charge_mc(void);
 int akita_thermal_sensor_c(unsigned id);
 extern int hakios_battery_temperature(void);
 
@@ -129,6 +134,12 @@ int
 akita_thermal_skin_mc(void)
 {
 	return thermal_skin_mc;
+}
+
+int
+akita_thermal_skin_charge_mc(void)
+{
+	return thermal_skin_charge_mc;
 }
 
 int
@@ -258,6 +269,12 @@ look_board(void)
 	int skin = s1 > s2 ? s1 : s2;
 	skin = s3 > skin ? s3 : skin;
 	thermal_skin_mc = skin;
+	/* VIRTUAL-SKIN-CHARGE: 0.209 modem + 0.368 rffe + 0.261 soc + 0.146 charger + 300; 0.606 quiet + 0.429 rffe + 10 */
+	{
+		int c1 = (209 * ntc_mc[0] + 368 * ntc_mc[2] + 261 * ntc_mc[4] + 146 * ntc_mc[5]) / 1000 + 300;
+		int c2 = (606 * ntc_mc[1] + 429 * ntc_mc[2]) / 1000 + 10;
+		thermal_skin_charge_mc = c1 > c2 ? c1 : c2;
+	}
 	/* the severity: up at a threshold, down 1.9 degrees under it */
 	while (thermal_skin_level < 6 && skin >= skin_levels_mc[thermal_skin_level]) {
 		thermal_skin_level++;
