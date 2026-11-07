@@ -25,6 +25,8 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
+#include "MiniIOSurface.h"
 #include <libkern/c++/OSObject.h>
 #include <pexpert/pexpert.h>
 #include <IOKit/IOKitKeys.h>
@@ -116,6 +118,15 @@ struct drm_panthor_tiler_heap_create { uint32_t vm_id, initial_chunk_count, chun
 	uint64_t tiler_heap_ctx_gpu_va, first_heap_chunk_gpu_va; };
 struct drm_panthor_tiler_heap_destroy { uint32_t handle, pad; };
 struct drm_gem_close { uint32_t handle, pad; };
+/* kHakiosSurface: the Adreno service's struct hakios_surface (drivers/gpu/hakios.gpu.cpp), the same layout */
+struct hakios_surface {
+	uint32_t surface;                       /* the IOSurface's ID */
+	uint32_t handle;                        /* kHakiosDescribe: no buffer wanted; else, back: the buffer, */
+	uint64_t size;                          /* how big it is, */
+	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
+	uint32_t width, height, pixelFormat, planes;    /* and what they are */
+};
+#define kHakiosDescribe         0xffffffffu
 struct drm_syncobj_create { uint32_t handle, flags; };
 #define SYNCOBJ_CREATE_SIGNALED 1u
 struct drm_syncobj_destroy { uint32_t handle, pad; };
@@ -140,6 +151,7 @@ enum {
 	kBoSync, kBoQueryInfo,
 	kSyncobjCreate = 0xbf, kSyncobjDestroy = 0xc0, kSyncobjWait = 0xc3, kSyncobjReset = 0xc4, kSyncobjSignal = 0xc5,
 	kSyncobjTimelineWait = 0xca, kSyncobjQuery = 0xcb, kSyncobjTransfer = 0xcc, kSyncobjTimelineSignal = 0xcd,
+	kHakiosSurface = 0x7e,          /* not Linux's: an IOSurface's memory as a buffer (as the Adreno service's) */
 	kHakiosDebug = 0x7f,            /* not Linux's: the queues' state into the kernel's log */
 };
 
@@ -218,7 +230,10 @@ class HakiosGPUUserClient : public IOUserClient
 {
 	OSDeclareDefaultStructors(HakiosGPUUserClient);
 
-	struct bo { IOBufferMemoryDescriptor *memory; uint64_t size; } *fBos;
+	/* a buffer: memory of its own, or an IOSurface's (held while the buffer is there) */
+	struct bo { IOMemoryDescriptor *memory; uint64_t size; MiniIOSurface *surface; } *fBos;
+	void boRelease(int i);
+	IOReturn surfaceBuffer(struct hakios_surface *request);
 	struct syncobj *fSyncs;
 	int fVms[MAX_CLIENT_VMS];
 	int fGroups[MAX_CLIENT_GROUPS];
@@ -298,7 +313,7 @@ HakiosGPUUserClient::free(void)
 {
 	if (fBos != NULL) {
 		for (int i = 0; i < MAX_BOS; i++) {
-			OSSafeReleaseNULL(fBos[i].memory);
+			boRelease(i);
 		}
 		IOFree(fBos, sizeof(*fBos) * MAX_BOS);
 	}
@@ -651,6 +666,76 @@ HakiosGPUUserClient::groupSubmit(struct drm_panthor_group_submit *s)
 	return kIOReturnSuccess;
 }
 
+/* a buffer given back: its memory released, and its surface let go if it was one's (gLock held) */
+void
+HakiosGPUUserClient::boRelease(int i)
+{
+	if (i < 0 || i >= MAX_BOS) {
+		return;
+	}
+	OSSafeReleaseNULL(fBos[i].memory);
+	if (fBos[i].surface != NULL) {
+		MiniIOSurfaceDrop(fBos[i].surface);
+		fBos[i].surface = NULL;
+	}
+	fBos[i].size = 0;
+}
+
+/*
+ * The memory of an IOSurface as a buffer (the Adreno service's surfaceBuffer, for the panthor interface): its pixels,
+ * from the page after the surface's shared state on (MiniIOSurface.h), bound and mapped like any buffer. The surface
+ * is held while the buffer is there; a surface that is a buffer of this client's already is that buffer again. A
+ * surface around a program's own memory is refused, as there. kHakiosDescribe: only described. (gLock held)
+ */
+IOReturn
+HakiosGPUUserClient::surfaceBuffer(struct hakios_surface *request)
+{
+	MiniIOSurface *s = MiniIOSurfaceCopy(request->surface);
+	IOMemoryDescriptor *memory;
+	uint64_t size;
+	int h;
+
+	if (s == NULL) {
+		return kIOReturnNotFound;
+	}
+	if (s->client != NULL) {
+		MiniIOSurfaceDrop(s);
+		return kIOReturnUnsupported;
+	}
+	size = round_page_64(s->info.allocSize);
+	request->size = size;
+	request->offset = s->info.offset;
+	request->rowBytes = s->info.bytesPerRow;
+	request->width = s->info.width;
+	request->height = s->info.height;
+	request->pixelFormat = s->info.pixelFormat;
+	request->planes = s->info.planeCount;
+	if (request->handle == kHakiosDescribe || size == 0 || size > (512ULL << 20)) {
+		request->handle = 0;
+		MiniIOSurfaceDrop(s);
+		return size == 0 || size > (512ULL << 20) ? kIOReturnNoMemory : kIOReturnSuccess;
+	}
+	for (h = 0; h < MAX_BOS; h++) {
+		if (fBos[h].memory != NULL && fBos[h].surface == s) {
+			request->handle = (uint32_t)h + 1;
+			MiniIOSurfaceDrop(s);           /* (held once, by that buffer) */
+			return kIOReturnSuccess;
+		}
+	}
+	for (h = 0; h < MAX_BOS && fBos[h].memory != NULL; h++) {
+	}
+	memory = h < MAX_BOS ? IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut) : NULL;
+	if (memory == NULL) {
+		MiniIOSurfaceDrop(s);
+		return h < MAX_BOS ? kIOReturnNoMemory : kIOReturnNoResources;
+	}
+	fBos[h].memory = memory;
+	fBos[h].size = size;
+	fBos[h].surface = s;
+	request->handle = (uint32_t)h + 1;
+	return kIOReturnSuccess;
+}
+
 IOReturn
 HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
     OSObject *target, void *reference)
@@ -671,6 +756,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		struct drm_panthor_tiler_heap_create heapCreate;
 		struct drm_panthor_tiler_heap_destroy heapDestroy;
 		struct drm_gem_close gemClose;
+		struct hakios_surface surface;
 		struct drm_syncobj_create syncCreate;
 		struct drm_syncobj_destroy syncDestroy;
 		struct drm_syncobj_wait syncWait;
@@ -767,7 +853,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	case kGemClose:
 		if (r.gemClose.handle >= 1 && r.gemClose.handle <= MAX_BOS) {
 			/* (unmapped from VMs by the program's own UNMAP binds first, as panthor's users do) */
-			OSSafeReleaseNULL(fBos[r.gemClose.handle - 1].memory);
+			boRelease((int)r.gemClose.handle - 1);
 		}
 		break;
 	case kGroupCreate:
@@ -953,6 +1039,9 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		syncSignal(r.syncTransfer.dst_handle, r.syncTransfer.dst_point, &f);
 		break;
 	}
+	case kHakiosSurface:
+		ret = surfaceBuffer(&r.surface);
+		break;
 	case kHakiosDebug:
 		akita_mali_debug();
 		break;
