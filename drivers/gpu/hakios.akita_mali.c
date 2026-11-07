@@ -1356,6 +1356,7 @@ struct mali_queue {
 	volatile uint32_t *user_in, *user_out;
 	volatile uint64_t *seqno;       /* the sequence page: the last number the queue reached */
 	uint64_t seqno_va, submitted;
+	uint64_t seen;                  /* the last sequence number a completion check saw */
 };
 
 static struct mali_vm {
@@ -1372,6 +1373,49 @@ static struct mali_group {
 
 static uint32_t mcu_next = MCU_ZONE_BASE;
 static bool kept;
+
+/*
+ * How busy the GPU is, for the clocks' governor (hakios.akita_dvfs.c): the time any queue had work submitted and not
+ * yet seen done -- from the submission that found every queue idle to the completion check that found them all caught
+ * up (waiters check often: HakiosGPU's SYNCOBJ_WAIT, hakios-metal's completion thread). The shader cores' power is no
+ * measure here: the host keeps them on (mali_hctl=1).
+ */
+static uint64_t busy_since, busy_total;         /* mach absolute time */
+
+static void
+busy_update(void)
+{
+	bool busy = false;
+	uint64_t now = mach_absolute_time();
+
+	for (unsigned int g = 0; g < MAX_GROUPS && !busy; g++) {
+		if (!groups[g].used) {
+			continue;
+		}
+		for (unsigned int q = 0; q < groups[g].queues; q++) {
+			if (groups[g].q[q].submitted > groups[g].q[q].seen) {
+				busy = true;
+				break;
+			}
+		}
+	}
+	if (busy && busy_since == 0) {
+		busy_since = now;
+	} else if (!busy && busy_since != 0) {
+		busy_total += now - busy_since;
+		busy_since = 0;
+	}
+}
+
+/* the GPU's busy time so far, in mach absolute time units */
+uint64_t akita_mali_busy_abs(void);
+uint64_t
+akita_mali_busy_abs(void)
+{
+	uint64_t since = busy_since;
+
+	return busy_total + (since ? mach_absolute_time() - since : 0);
+}
 
 bool akita_mali_ready(void);
 bool
@@ -1714,6 +1758,7 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 			return -1;
 		}
 		mq->ring_size = size;
+		mq->seen = mq->submitted;       /* (a group's slot used again: nothing outstanding on it) */
 		mq->user_in = (volatile uint32_t *)user;
 		mq->user_out = (volatile uint32_t *)(user + GPU_PAGE);
 		/* the stream's first words: REQ_RESOURCE compute, fragment, tiler and IDVS, held from its start (a program's
@@ -1805,6 +1850,7 @@ akita_mali_group_free(int g)
 	ring_doorbell(0);
 	acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200);
 	groups[g].used = false;         /* (its memory stays: given again with the next group's) */
+	busy_update();
 }
 
 /*
@@ -1830,6 +1876,7 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 		return 0;                       /* the ring is full: the GPU is that far behind */
 	}
 	mq->submitted++;
+	busy_update();
 	{
 		unsigned int calltest = 0;      /* mali_calltest=1: the ring stores 0xbbbb at stream - 0x800 + 0x130 first */
 
@@ -1886,7 +1933,9 @@ akita_mali_reached(int g, unsigned int q)
 	}
 	flush_gpu();
 	from_gpu(groups[g].q[q].seqno, 8);
-	return *groups[g].q[q].seqno;
+	groups[g].q[q].seen = *groups[g].q[q].seqno;
+	busy_update();
+	return groups[g].q[q].seen;
 }
 
 /* every group's queues as the firmware sees them (a wait that timed out asks for this) */

@@ -23,8 +23,11 @@
  * (sustainable power + P + I, within its limits) shared by weight among its cooling devices -- the three clusters and
  * the GPU -- whose states come from the power each state costs; per severity a ceiling (and at 52-55 C a hard limit),
  * a step at a time; each device takes the most throttling request. A cluster's state n is a ceiling n steps under its
- * top; the GPU's state is a row of its clocks (domains 8 and 7), never above what the bootloader set (nothing raises
- * the GPU's clocks yet: it stays at 160/150 MHz). thermal_test_shift=N reads the skin N degrees warmer (to see it act).
+ * top; the GPU's state is a floor under its governor's row. thermal_test_shift=N reads the skin N degrees warmer.
+ *
+ * The GPU's clocks (domains 8 and 7, the Mali driver's 13 rows, 900/890 to 160/150 MHz): a governor with Android's
+ * bounds per row (its dvfs_table's util min/max and hysteresis) on the GPU's busy share since the last look
+ * (hakios.akita_mali.c: the time work was outstanding on any queue).
  *
  * kern.hakios.dvfs_mhz ("LITTLE=1328 MID=1065 BIG=500 GPU=160/150"), kern.hakios.dvfs_changes, dvfs_skin_caps (the
  * thermal ceilings).
@@ -123,8 +126,19 @@ static const uint32_t gpu_rows[][2] = {
 	{ 430000, 337000 }, { 386000, 302000 }, { 160000, 150000 },
 };
 #define NGPUROWS (sizeof(gpu_rows) / sizeof(gpu_rows[0]))
+/* each row's utilisation bounds (percent) and how many looks under the lower one before going down: the Mali driver's
+ * dvfs_table on this phone (Android's quickstep governor works from these) */
+static const uint8_t gpu_util[][3] = {
+	{ 85, 97, 1 }, { 76, 94, 1 }, { 85, 96, 2 }, { 83, 97, 3 }, { 78, 95, 3 }, { 80, 96, 3 }, { 76, 95, 3 },
+	{ 72, 95, 3 }, { 67, 94, 2 }, { 65, 94, 1 }, { 60, 94, 1 }, { 50, 92, 1 }, { 0, 90, 1 },
+};
 static uint32_t gpu_boot[2];            /* kHz, as the bootloader left them (0: not readable: the GPU left alone) */
-static int gpu_applied = -1;            /* the GPU state last set (-1: the bootloader's clocks untouched) */
+static int gpu_applied = -1;            /* the row last set (-1: the bootloader's clocks untouched) */
+static int gpu_want;                    /* the governor's row (fastest 0), before the thermal floor */
+static unsigned gpu_low_looks;          /* looks in a row under the row's lower bound */
+static int gpu_util_pct;
+static uint64_t gpu_busy_last, gpu_time_last;
+extern uint64_t akita_mali_busy_abs(void);
 
 /*
  * Android's thermal policy for this phone, from its thermal HAL (hardware/google/pixel thermal/utils/
@@ -357,20 +371,52 @@ android_thermal_step(void)
 	return changed;
 }
 
-/* the GPU's clocks for its state: no faster than the bootloader left them */
+/* the GPU's clocks: the governor's row, no faster than Android's controllers allow (their state is a floor) */
 static void
 gpu_apply(void)
 {
-	int st = cd_state[CD_GPU];
+	int row = gpu_want > cd_state[CD_GPU] ? gpu_want : cd_state[CD_GPU];
 
-	if (!gpu_boot[0] || st == gpu_applied || (st == 0 && gpu_applied < 0)) {
+	if (!gpu_boot[0] || row == gpu_applied) {
 		return;
 	}
-	uint32_t a = gpu_rows[st][0] < gpu_boot[0] ? gpu_rows[st][0] : gpu_boot[0];
-	uint32_t b = gpu_rows[st][1] < gpu_boot[1] ? gpu_rows[st][1] : gpu_boot[1];
-	domain_set_khz(8, a);
-	domain_set_khz(7, b);
-	gpu_applied = st;
+	if (domain_set_khz(8, gpu_rows[row][0]) && domain_set_khz(7, gpu_rows[row][1])) {
+		gpu_applied = row;
+		dvfs_changes_value++;
+	}
+}
+
+/*
+ * The GPU's governor (every look of the clusters'): its busy share since the last look (hakios.akita_mali.c's busy
+ * time); over the row's upper bound a row faster (two when it is saturated), under its lower bound for the row's
+ * count of looks a row slower -- the bounds Android's governor uses.
+ */
+static void
+gpu_govern(void)
+{
+	uint64_t busy = akita_mali_busy_abs(), now = mach_absolute_time();
+
+	if (!gpu_boot[0]) {
+		return;
+	}
+	if (gpu_time_last != 0 && now > gpu_time_last) {
+		gpu_util_pct = (int)((busy - gpu_busy_last) * 100 / (now - gpu_time_last));
+		gpu_util_pct = gpu_util_pct > 100 ? 100 : gpu_util_pct;
+		if (gpu_util_pct > gpu_util[gpu_want][1] && gpu_want > 0) {
+			gpu_want -= gpu_util_pct >= 99 && gpu_want > 1 ? 2 : 1;
+			gpu_low_looks = 0;
+		} else if (gpu_util_pct < gpu_util[gpu_want][0] && gpu_want < (int)NGPUROWS - 1) {
+			if (++gpu_low_looks >= gpu_util[gpu_want][2]) {
+				gpu_want++;
+				gpu_low_looks = 0;
+			}
+		} else {
+			gpu_low_looks = 0;
+		}
+	}
+	gpu_busy_last = busy;
+	gpu_time_last = now;
+	gpu_apply();
 }
 
 static bool
@@ -432,9 +478,9 @@ describe(void)
 		    clusters[i].steps[clusters[i].now]);
 	}
 	if (gpu_boot[0]) {
-		int st = gpu_applied < 0 ? -1 : gpu_applied;
-		uint32_t a = st >= 0 && gpu_rows[st][0] < gpu_boot[0] ? gpu_rows[st][0] : gpu_boot[0];
-		uint32_t b = st >= 0 && gpu_rows[st][1] < gpu_boot[1] ? gpu_rows[st][1] : gpu_boot[1];
+		int st = gpu_applied;
+		uint32_t a = st >= 0 ? gpu_rows[st][0] : gpu_boot[0];
+		uint32_t b = st >= 0 ? gpu_rows[st][1] : gpu_boot[1];
 		n += snprintf(dvfs_mhz + n, sizeof(dvfs_mhz) - n, " GPU=%u/%u", a / 1000, b / 1000);
 	}
 	n = 0;
@@ -511,6 +557,11 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 		printf("akita dvfs: the GPU's clocks could not be read (%u, %u kHz): the GPU is left alone\n", gpu_boot[0],
 		    gpu_boot[1]);
 		gpu_boot[0] = gpu_boot[1] = 0;
+	} else {
+		/* the governor starts from the row of the bootloader's shader clock */
+		for (gpu_want = 0; gpu_want < (int)NGPUROWS - 1 && gpu_rows[gpu_want][1] > gpu_boot[1]; gpu_want++) {
+		}
+		gpu_applied = gpu_rows[gpu_want][1] == gpu_boot[1] && gpu_rows[gpu_want][0] == gpu_boot[0] ? gpu_want : -1;
 	}
 	describe();
 	printf("akita dvfs: the clusters' clocks every %u ms (cores 0-%u); now %s\n", period_ms, real_ncpus - 1, dvfs_mhz);
@@ -537,14 +588,21 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 				govern(&clusters[i]);
 			}
 		}
+		{
+			int was = gpu_applied;
+			gpu_govern();
+			if (gpu_applied != was) {
+				describe();
+			}
+		}
 		now = mach_absolute_time();
 		if (now >= next_log) {
 			next_log = now + minute;
-			printf("akita dvfs: %s (%d changes; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d %%\n", dvfs_mhz,
+			printf("akita dvfs: %s (%d changes; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d, GPU %d %%\n", dvfs_mhz,
 			    dvfs_changes_value, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
 			    "held to the lowest: hot", clusters[0].core_share[0], clusters[0].core_share[1],
 			    clusters[0].core_share[2], clusters[0].core_share[3], clusters[1].core_share[0],
-			    clusters[1].core_share[1], clusters[1].core_share[2], clusters[1].core_share[3]);
+			    clusters[1].core_share[1], clusters[1].core_share[2], clusters[1].core_share[3], gpu_util_pct);
 		}
 		delay_for_interval(period_ms, NSEC_PER_MSEC);
 	}
