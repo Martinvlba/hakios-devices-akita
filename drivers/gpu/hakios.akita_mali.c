@@ -1897,6 +1897,7 @@ mali_irq_attach(void)
 		return;
 	}
 	wr(JOB_IRQ_CLEAR, 0xffffffff);
+	wr(MMU_IRQ_CLEAR, 0xffffffff);          /* (an AS1 bus fault left from start-up work: mmu_faults would act on it) */
 	if (gic_v3_spi_attach(MALI_JOB_INTID, false, mali_irq, NULL) == KERN_SUCCESS) {
 		wr(JOB_IRQ_MASK, 0xffffffff);
 		mali_irq_on = true;
@@ -2095,6 +2096,7 @@ group_restart(unsigned int g)
 	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
 		printf("mali: group %u: not ended for its restart (CSG_REQ 0x%x, ACK 0x%x)\n", g, gin[CSG_REQ / 4], gout[CSG_ACK / 4]);
 	}
+	as_update(grp->vm);             /* (its address space back on, if a page fault turned it off: mmu_faults) */
 	for (unsigned int q = 0; q < grp->queues; q++) {
 		struct mali_queue *mq = &grp->q[q];
 		uint64_t *r = (uint64_t *)mq->ring;
@@ -2105,6 +2107,15 @@ group_restart(unsigned int g)
 		mq->seen = mq->submitted;
 		bzero((void *)mq->ring, mq->ring_size);
 		r[0] = 34ULL << 56 | 0xf;
+		/* the queue's tiler heap again (HEAP_SET: hakios-metal sets it once, in its first command buffer; a restarted
+		 * queue without it ended its next draw in an invalid instruction fault, 0x49) -- the VM's first heap */
+		for (int h = 0; h < MAX_HEAPS; h++) {
+			if (heaps[h].used && heaps[h].vm == grp->vm) {
+				r[1] = 1ULL << 56 | 0ULL << 48 | (heaps[h].ctx_va & 0xffffffffffffULL);     /* MOVE48 r0 <- context */
+				r[2] = 48ULL << 56;                                                      /* HEAP_SET */
+				break;
+			}
+		}
 		mq->insert = 64;
 		to_gpu((void *)mq->ring, mq->ring_size);
 		bzero((void *)mq->user_in, 16);
@@ -2155,6 +2166,51 @@ group_restart(unsigned int g)
 	}
 	wr(MMU_IRQ_CLEAR, 0xffffffff);
 	printf("mali: group %u started again after a fatal error (restart %u)\n", g, grp->restarts);
+}
+
+/*
+ * A GPU PAGE FAULT (MMU_IRQ_RAWSTAT bit n, a bus fault bit 16 + n, for address space n -- a VM's AS is its number): the
+ * address space stalls the access and waits; nothing in the queue reports it (the CS just stays blocked: the 10 s
+ * timeout). As panthor: the fault cleared and the address space turned off (unmapped), so that what stalled fails;
+ * then the groups on it restarted (group_restart turns it on again).
+ */
+#define TRANSCFG_UNMAPPED       1ULL
+
+static void
+mmu_faults(void)
+{
+	uint32_t raw = rd(MMU_IRQ_RAWSTAT);
+
+	if (raw == 0) {
+		return;
+	}
+	for (unsigned int vm = 1; vm < MAX_VMS; vm++) {
+		uint32_t base = AS0 + vm * 0x40, status = rd(base + AS_FAULTSTATUS);
+		/* page faults only: AS1's bus fault bit comes back at once after every clear, from start-up on, and the fault
+		 * status keeps the last page fault's -- acting on it restarted the group in a loop */
+		uint32_t bits = 1u << vm;
+		bool any = false;
+
+		if (!vms[vm].used || !(raw & bits)) {
+			continue;
+		}
+		printf("mali: address space %u: %s fault 0x%x at 0x%llx; it is turned off and its groups restart\n", vm,
+		    "page", status, rd64(base + AS_FAULTADDRESS));
+		faults("a GPU page fault");
+		wr(MMU_IRQ_CLEAR, bits);
+		wr64(base + AS_TRANSCFG, TRANSCFG_UNMAPPED);
+		wr(base + AS_COMMAND, AS_CMD_UPDATE);
+		wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+		for (unsigned int g = 0; g < MAX_GROUPS; g++) {
+			if (groups[g].used && groups[g].vm == vm) {
+				group_restart(g);
+				any = true;
+			}
+		}
+		if (!any) {
+			as_update(vm);
+		}
+	}
 }
 
 static void
@@ -2245,6 +2301,7 @@ akita_mali_reached(int g, unsigned int q)
 		irqs_seen = irqs;
 	}
 	flush_gpu();
+	mmu_faults();
 	tiler_oom();
 	if (mali_irq_on) {
 		for (unsigned int i = 0; i < MAX_GROUPS; i++) {
