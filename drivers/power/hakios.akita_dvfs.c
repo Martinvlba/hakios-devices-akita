@@ -133,6 +133,13 @@ static const uint8_t gpu_util[][3] = {
 	{ 85, 97, 1 }, { 76, 94, 1 }, { 85, 96, 2 }, { 83, 97, 3 }, { 78, 95, 3 }, { 80, 96, 3 }, { 76, 95, 3 },
 	{ 72, 95, 3 }, { 67, 94, 2 }, { 65, 94, 1 }, { 60, 94, 1 }, { 50, 92, 1 }, { 0, 90, 1 },
 };
+/* each row's floor for the memory's clock (MIF, ACPM domain 0), kHz: the dvfs_table's mif_min (its v2 rows 1-13 on this
+ * phone); 0 is MIF's least, 421000. Without it MIF stayed at 421 MHz: a full-screen pass that loads and stores two
+ * targets took 17.3 ms, at 3172 MHz 3.2 ms (mali_draw_test's bench). */
+static const uint32_t gpu_mif_min[] = { 3172000, 1716000, 1716000, 1352000, 1352000, 1352000, 845000, 845000, 0, 0, 0, 0, 0 };
+#define MIF_LEAST 421000
+static uint32_t mif_applied;
+static bool mif_fixed;                  /* boot-arg mif_khz: MIF left where it says */
 static uint32_t gpu_boot[2];            /* kHz, as the bootloader left them (0: not readable: the GPU left alone) */
 static int gpu_applied = -1;            /* the row last set (-1: the bootloader's clocks untouched) */
 static int gpu_want;                    /* the governor's row (fastest 0), before the thermal floor */
@@ -406,6 +413,14 @@ gpu_apply(void)
 		gpu_applied = row;
 		dvfs_changes_value++;
 	}
+	/* the memory's clock: the row's floor (MIF up before a faster GPU needs it, down after) */
+	if (!mif_fixed && gpu_applied >= 0) {
+		uint32_t mif = gpu_mif_min[gpu_applied] ? gpu_mif_min[gpu_applied] : MIF_LEAST;
+
+		if (mif != mif_applied && domain_set_khz(0, mif)) {
+			mif_applied = mif;
+		}
+	}
 }
 
 /*
@@ -424,7 +439,13 @@ gpu_govern(void)
 	if (gpu_time_last != 0 && now > gpu_time_last) {
 		gpu_util_pct = (int)((busy - gpu_busy_last) * 100 / (now - gpu_time_last));
 		gpu_util_pct = gpu_util_pct > 100 ? 100 : gpu_util_pct;
-		if (gpu_util_pct > gpu_util[gpu_want][1] && gpu_want > 0) {
+		if (gpu_util_pct >= 90 && gpu_want > 0) {
+			/* nearly saturated: straight to the fastest row (the thermal state still caps it), as Android's Mali
+			 * governor jumps to its high-speed clock -- a row a look took 1.6 s from 160 to 900 MHz, most of a
+			 * drag in Settings */
+			gpu_want = 0;
+			gpu_low_looks = 0;
+		} else if (gpu_util_pct > gpu_util[gpu_want][1] && gpu_want > 0) {
 			gpu_want -= gpu_util_pct >= 99 && gpu_want > 1 ? 2 : 1;
 			gpu_low_looks = 0;
 		} else if (gpu_util_pct < gpu_util[gpu_want][0] && gpu_want < (int)NGPUROWS - 1) {
@@ -438,7 +459,21 @@ gpu_govern(void)
 	}
 	gpu_busy_last = busy;
 	gpu_time_last = now;
-	gpu_apply();
+	{
+		static int say = -1, said;
+		int was = gpu_applied;
+
+		gpu_apply();
+		if (say < 0) {
+			say = 0;
+			PE_parse_boot_argn("dvfs_gpu_say", &say, sizeof(say));
+		}
+		if (say && gpu_applied != was && said++ < 400) {
+			printf("akita dvfs: GPU row %d -> %d (%u/%u MHz, MIF %u): busy %d %%, wanted %d, thermal floor %d\n", was,
+			    gpu_applied, gpu_rows[gpu_applied][0] / 1000, gpu_rows[gpu_applied][1] / 1000, mif_applied / 1000,
+			    gpu_util_pct, gpu_want, cd_state[CD_GPU]);
+		}
+	}
 }
 
 static bool
@@ -644,6 +679,25 @@ static void
 akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	thread_t thread;
+	uint32_t khz = 0;
+
+	/*
+	 * The memory and the interconnect (MIF and INT: exynos-devfreq's dfs_id 0xb040000 and 0xb040001, ACPM DVFS domains
+	 * 0 and 1 as the clusters are 2-4; 421-3744 MHz MIF in the device tree). Android's devfreq governs them -- the GPU
+	 * driver asks a MIF floor of up to 3172 MHz per clock row -- and this port did not touch them. Said at start, every
+	 * domain 0-8; boot-arg mif_khz=N sets MIF once (a test).
+	 */
+	printf("akita dvfs: ACPM domains' clocks (kHz):");
+	for (uint32_t d = 0; d <= 8; d++) {
+		printf(" %u=%u", d, domain_get_khz(d));
+	}
+	printf("\n");
+	if (PE_parse_boot_argn("mif_khz", &khz, sizeof(khz)) && khz >= 421000 && khz <= 3744000) {
+		bool ok = domain_set_khz(0, khz);
+		mif_fixed = ok;
+		printf("akita dvfs: mif_khz=%u: MIF set %s, now %u kHz (INT %u)\n", khz, ok ? "ok" : "FAILED", domain_get_khz(0),
+		    domain_get_khz(1));
+	}
 
 	if (kernel_thread_start(akita_dvfs_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
