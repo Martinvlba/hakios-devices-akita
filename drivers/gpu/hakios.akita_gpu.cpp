@@ -55,6 +55,7 @@ int akita_mali_heap_new(int vm, uint32_t chunk_size, uint32_t initial, uint32_t 
     uint64_t *ctx_va, uint64_t *first_chunk_va);
 void akita_mali_heap_free(int h);
 void akita_mali_debug(void);
+extern "C" int mali_irq_event;
 void akita_mali_info(uint32_t *regs, uint32_t *csif);
 void akita_gpu_start(void);
 }
@@ -447,8 +448,10 @@ HakiosGPUUserClient::waitPoints(const uint32_t *handles, const uint64_t *points,
 			}
 			return false;
 		}
+		/* until the GPU's JOB interrupt (a submission counted done: hakios.akita_mali.c's mali_irq) or a millisecond */
 		IOLockUnlock(gLock);
-		IOSleep(1);
+		assert_wait_timeout((event_t)&mali_irq_event, THREAD_UNINT, 1000, NSEC_PER_USEC);
+		thread_block(THREAD_CONTINUE_NULL);
 		IOLockLock(gLock);
 	}
 }

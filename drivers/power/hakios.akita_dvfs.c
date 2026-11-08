@@ -406,16 +406,19 @@ gpu_apply(void)
 {
 	int row = gpu_want > cd_state[CD_GPU] ? gpu_want : cd_state[CD_GPU];
 
-	if (!gpu_boot[0] || row == gpu_applied) {
+	if (!gpu_boot[0]) {
 		return;
 	}
-	if (domain_set_khz(8, gpu_rows[row][0]) && domain_set_khz(7, gpu_rows[row][1])) {
+	if (row != gpu_applied && domain_set_khz(8, gpu_rows[row][0]) && domain_set_khz(7, gpu_rows[row][1])) {
 		gpu_applied = row;
 		dvfs_changes_value++;
 	}
-	/* the memory's clock: the row's floor (MIF up before a faster GPU needs it, down after) */
+	/* the memory's clock: the floor of the row the governor WANTS -- not of the row the skin's temperature lets the
+	 * GPU have: warm (40 C), the GPU held at 531 MHz took MIF down to 421 with it and Settings fell from 55 to 21 fps;
+	 * Android's devfreq governs MIF apart from the GPU's thermal cap */
 	if (!mif_fixed && gpu_applied >= 0) {
-		uint32_t mif = gpu_mif_min[gpu_applied] ? gpu_mif_min[gpu_applied] : MIF_LEAST;
+		int r = gpu_want >= 0 && gpu_want < (int)NGPUROWS ? gpu_want : gpu_applied;
+		uint32_t mif = gpu_mif_min[r] ? gpu_mif_min[r] : MIF_LEAST;
 
 		if (mif != mif_applied && domain_set_khz(0, mif)) {
 			mif_applied = mif;

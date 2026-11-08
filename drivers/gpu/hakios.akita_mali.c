@@ -1721,6 +1721,7 @@ stream_blocks(uint32_t *gc, unsigned int q, volatile uint32_t **in, volatile uin
 }
 
 /* ring sizes in bytes (powers of two, 4 KiB to 1 MiB); the group's slot or -1 */
+static void mali_irq_attach(void);
 int akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority);
 int
 akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority)
@@ -1766,6 +1767,8 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 		mq->ring_size = size;
 		grp->user_va[q] = mcu_va;
 		mq->seen = mq->submitted;       /* (a group's slot used again: nothing outstanding on it) */
+		*mq->seqno = mq->submitted;     /* (the ring adds 1 a submission to it) */
+		to_gpu((void *)mq->seqno, 8);
 		mq->user_in = (volatile uint32_t *)user;
 		mq->user_out = (volatile uint32_t *)(user + GPU_PAGE);
 		/* the stream's first words: REQ_RESOURCE compute, fragment, tiler and IDVS, held from its start (a program's
@@ -1835,6 +1838,7 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 	grp->queues = nqueues;
 	grp->suspend_va = suspend_va;
 	grp->priority = priority;
+	mali_irq_attach();
 	printf("mali: group %u started in address space %d, %u queue(s)\n", g, vm, nqueues);
 	return (int)g;
 }
@@ -1860,6 +1864,76 @@ akita_mali_group_free(int g)
 	acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200);
 	groups[g].used = false;         /* (its memory stays: given again with the next group's) */
 	busy_update();
+}
+
+/*
+ * THE JOB INTERRUPT (the device tree's "JOB", SPI 0x15b: GIC intid 379, level): the firmware raises it for a group's
+ * events -- SYNC_UPDATE when a ring's SYNC_ADD64 counted a submission done. The handler only quiets it and wakes the
+ * waiters (HakiosGPU's syncobj wait sleeps on mali_irq_event, a millisecond at most as before); the events are acked
+ * by akita_mali_reached (mali_ack_events).
+ */
+#define JOB_IRQ_STATUS          0x100c
+#define JOB_IRQ_MASK            0x1008
+#define MALI_JOB_INTID          (32 + 0x15b)
+#define CSG_SYNC_UPDATE         (1u << 28)
+int mali_irq_event;
+static bool mali_irq_on;
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern uint64_t gic_v3_spi_count(uint32_t intid);
+
+static void
+mali_irq(__unused void *context, __unused uint32_t intid)
+{
+	wr(JOB_IRQ_CLEAR, rd(JOB_IRQ_STATUS) | rd(JOB_IRQ_RAWSTAT));
+	wakeup((void *)&mali_irq_event);       /* (BSD wakeup: thread_wakeup on that event) */
+}
+
+static void
+mali_irq_attach(void)
+{
+	unsigned int off = 0;
+
+	if (mali_irq_on || (PE_parse_boot_argn("mali_irq", &off, sizeof(off)) && off == 0)) {
+		return;
+	}
+	wr(JOB_IRQ_CLEAR, 0xffffffff);
+	if (gic_v3_spi_attach(MALI_JOB_INTID, false, mali_irq, NULL) == KERN_SUCCESS) {
+		wr(JOB_IRQ_MASK, 0xffffffff);
+		mali_irq_on = true;
+		printf("mali: the JOB interrupt (intid %u) taken: waits wake on it\n", MALI_JOB_INTID);
+	} else {
+		printf("mali: the JOB interrupt (intid %u) could not be taken: waits poll\n", MALI_JOB_INTID);
+	}
+}
+
+/* how many JOB interrupts so far (sysctl-free check from the service's log) */
+uint64_t akita_mali_irq_count(void);
+uint64_t
+akita_mali_irq_count(void)
+{
+	return mali_irq_on ? gic_v3_spi_count(MALI_JOB_INTID) : 0;
+}
+
+/* a group's events acked -- SYNC_UPDATE and IDLE in CSG_REQ set to CSG_ACK's, the CS interrupts acked -- and the
+ * firmware told (panthor's sched_process_csg_irq_locked), so that the next one raises the interrupt again */
+static void
+mali_ack_events(unsigned int g)
+{
+	volatile uint32_t *gin, *gout;
+	uint32_t *gc, mask = CSG_SYNC_UPDATE | CSG_REQ_IDLE;
+
+	group_blocks(g, &gin, &gout, &gc);
+	from_gpu(gout, 64);
+	if (((gin[CSG_REQ / 4] ^ gout[CSG_ACK / 4]) & mask) == 0 && gin[CSG_IRQ_ACK / 4] == gout[CSG_IRQ_REQ / 4]) {
+		return;
+	}
+	gin[CSG_IRQ_ACK / 4] = gout[CSG_IRQ_REQ / 4];
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~mask) | (gout[CSG_ACK / 4] & mask);
+	to_gpu(gin, 64);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << g)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << g)) & (1u << g));
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
 }
 
 /*
@@ -1901,8 +1975,10 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 	cmd[n++] = 32ULL << 56 | 92ULL << 40 | 94ULL << 32;                     /* CALL [r92], r94 */
 	cmd[n++] = 3ULL << 56 | 0xffffULL << 16;                                /* WAIT on every scoreboard */
 	cmd[n++] = 1ULL << 56 | 92ULL << 48 | mq->seqno_va;                     /* MOVE48 r92 <- the sequence page */
-	cmd[n++] = 1ULL << 56 | 94ULL << 48 | (mq->submitted & 0xffffffffffffULL);     /* MOVE48 r94:r95 <- the number */
-	cmd[n++] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x3ULL << 16;      /* STORE_MULTIPLE r94..r95 -> [r92] */
+	cmd[n++] = 1ULL << 56 | 94ULL << 48 | 1;                                /* MOVE48 r94:r95 <- 1 */
+	/* SYNC_ADD64 [r92] += r94, scope CSG: the firmware's sync update event, the JOB interrupt (mali_irq) -- the
+	 * page counts the submissions done, seeded with the count at the group's start */
+	cmd[n++] = 51ULL << 56 | 92ULL << 40 | 94ULL << 32 | 2ULL << 1;
 	cmd[n++] = 0;                                                           /* NOP */
 	while ((mq->insert + n * 8) & 63) {
 		cmd[n++] = 0;                   /* NOPs to the end of the line: each submission in whole lines of the ring */
@@ -1910,7 +1986,18 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 	for (unsigned int i = 0; i < n; i++) {
 		*(uint64_t *)(mq->ring + ((mq->insert + i * 8) & (mq->ring_size - 1))) = cmd[i];
 	}
-	to_gpu((void *)mq->ring, mq->ring_size);
+	{
+		/* only what was written to the GPU (the whole ring was cleaned at every submission), in two pieces when it
+		 * wraps around the ring's end */
+		uint64_t at = mq->insert & (mq->ring_size - 1), len = (uint64_t)n * 8;
+
+		if (at + len <= mq->ring_size) {
+			to_gpu((void *)(mq->ring + at), (size_t)len);
+		} else {
+			to_gpu((void *)(mq->ring + at), (size_t)(mq->ring_size - at));
+			to_gpu((void *)mq->ring, (size_t)(at + len - mq->ring_size));
+		}
+	}
 	mq->insert += n * 8;
 	*(volatile uint64_t *)mq->user_in = mq->insert;
 	to_gpu(mq->user_in, 16);
@@ -2142,8 +2229,30 @@ akita_mali_reached(int g, unsigned int q)
 	if (g < 0 || g >= MAX_GROUPS || !groups[g].used || q >= groups[g].queues) {
 		return 0;
 	}
+	if (mali_irq_on) {
+		/* nothing new since the last look -- no interrupt (every event raises one), and the page (read past the CPU's
+		 * cache, possibly behind the GPU's but never ahead) already says all done: no cache flush, no events. The
+		 * flush cost most of the time a short command buffer waited. */
+		static uint64_t irqs_seen;
+		uint64_t irqs = akita_mali_irq_count();
+
+		from_gpu(groups[g].q[q].seqno, 8);
+		if (irqs == irqs_seen && *groups[g].q[q].seqno >= groups[g].q[q].submitted) {
+			groups[g].q[q].seen = *groups[g].q[q].seqno;
+			busy_update();
+			return groups[g].q[q].seen;
+		}
+		irqs_seen = irqs;
+	}
 	flush_gpu();
 	tiler_oom();
+	if (mali_irq_on) {
+		for (unsigned int i = 0; i < MAX_GROUPS; i++) {
+			if (groups[i].used) {
+				mali_ack_events(i);
+			}
+		}
+	}
 	from_gpu(groups[g].q[q].seqno, 8);
 	groups[g].q[q].seen = *groups[g].q[q].seqno;
 	busy_update();
