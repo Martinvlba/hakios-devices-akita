@@ -61,7 +61,8 @@ for ms, frames in stalls:
     named = [name(f[2:]) if f.startswith('c:') else f for f in frames]
     print(f'{ms:5d} ms: ' + '  <  '.join(named[:8]))
     for n in set(named):
-        by_frame[n] += ms
+        if not n.startswith('cpu:'):            # (the thread's processor time in the turn, not a frame)
+            by_frame[n] += ms
 print('\nby frame (ms of the stalls it was in):')
 for n, ms in by_frame.most_common(40):
     print(f'{ms:6d}  {n}')

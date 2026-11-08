@@ -87,6 +87,7 @@ static int skin_shift_mc;               /* thermal_test_shift=N: every skin targ
 #define NCLUSTERS (sizeof(clusters) / sizeof(clusters[0]))
 
 static uint32_t period_ms = 100;
+static uint32_t top_always;            /* dvfs_top=1 (a test): every cluster at its top step, within the thermal caps */
 static int dvfs_changes_value;
 static char dvfs_mhz[96] = "";
 static int hot_cap = -1;                /* every cluster's cap while hot: -1 none, 1 the middle step, 0 the lowest */
@@ -530,6 +531,9 @@ govern(struct cluster *c)
 	while (want < c->nsteps - 1 && c->steps[want] < target) {
 		want++;
 	}
+	if (top_always) {
+		want = c->nsteps - 1;
+	}
 	if (hot_cap == 0) {
 		cap = 0;
 	} else if (hot_cap == 1 || (big_cap && c->domain == 4)) {
@@ -657,6 +661,7 @@ akita_dvfs_init(void)
 	if (!PE_parse_boot_argn("dvfs", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	PE_parse_boot_argn("dvfs_top", &top_always, sizeof(top_always));
 	if (PE_parse_boot_argn("dvfs_period_ms", &value, sizeof(value)) && value >= 20 && value <= 2000) {
 		period_ms = value;
 	}
