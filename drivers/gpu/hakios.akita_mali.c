@@ -35,6 +35,7 @@
 #include <kern/startup.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
+#include <libkern/OSAtomic.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
@@ -1369,6 +1370,10 @@ static struct mali_group {
 	bool used;
 	unsigned int vm, queues;
 	struct mali_queue q[MAX_QUEUES];
+	/* what its start was given, for a restart after a fatal error (group_restart) */
+	uint32_t suspend_va, user_va[MAX_QUEUES];
+	uint8_t priority;
+	unsigned int restarts;
 } groups[MAX_GROUPS];
 
 static uint32_t mcu_next = MCU_ZONE_BASE;
@@ -1597,17 +1602,17 @@ vm_kernel_free(unsigned int vm, uint64_t va, vm_offset_t memory, vm_size_t size)
  * Tiler heaps (panthor's TILER_HEAP_CREATE): what the tiler writes a render pass's lists into. A heap is a context,
  * zeroed, that the firmware keeps its state in (32 bytes; a page here), and chunks in a list: each chunk's first
  * 64 bytes its header, whose first word is the next chunk's address | its size >> 12 (0: the last), the newest
- * chunk first -- as Linux's panthor_heap.c makes them. All of a heap is in the VM's kernel half. Only the initial
- * chunks so far: growing a heap is the answer to the firmware's tiler out-of-memory event, not handled yet (a pass
- * that needs more waits).
+ * chunk first -- as Linux's panthor_heap.c makes them. All of a heap is in the VM's kernel half. When the chunks are
+ * used up the firmware raises the queue's tiler out-of-memory event and waits: tiler_oom() gives it one chunk more
+ * (heap_grow, panthor_heap_grow's), up to the heap's max_chunks.
  */
 #define MAX_HEAPS               16
-#define MAX_HEAP_CHUNKS         32
+#define MAX_HEAP_CHUNKS         64
 #define HEAP_INITIAL_BYTES      (64u << 20)     /* the most of a heap's initial chunks together */
 
 static struct {
 	bool used;
-	unsigned int vm, chunks;
+	unsigned int vm, chunks, max_chunks;
 	uint32_t chunk_size;
 	uint64_t ctx_va, chunk_va[MAX_HEAP_CHUNKS];
 	vm_offset_t ctx, chunk[MAX_HEAP_CHUNKS];
@@ -1649,6 +1654,7 @@ akita_mali_heap_new(int vm, uint32_t chunk_size, uint32_t initial, uint32_t max_
 	heaps[h].used = true;
 	heaps[h].vm = (unsigned int)vm;
 	heaps[h].chunk_size = chunk_size;
+	heaps[h].max_chunks = max_chunks < MAX_HEAP_CHUNKS ? max_chunks : MAX_HEAP_CHUNKS;
 	heaps[h].ctx = vm_kernel_region((unsigned int)vm, GPU_PAGE, &heaps[h].ctx_va, false);
 	if (heaps[h].ctx == 0) {
 		akita_mali_heap_free(h);
@@ -1758,6 +1764,7 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 			return -1;
 		}
 		mq->ring_size = size;
+		grp->user_va[q] = mcu_va;
 		mq->seen = mq->submitted;       /* (a group's slot used again: nothing outstanding on it) */
 		mq->user_in = (volatile uint32_t *)user;
 		mq->user_out = (volatile uint32_t *)(user + GPU_PAGE);
@@ -1826,6 +1833,8 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 	grp->used = true;
 	grp->vm = (unsigned)vm;
 	grp->queues = nqueues;
+	grp->suspend_va = suspend_va;
+	grp->priority = priority;
 	printf("mali: group %u started in address space %d, %u queue(s)\n", g, vm, nqueues);
 	return (int)g;
 }
@@ -1923,6 +1932,208 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 	return mq->submitted;
 }
 
+/*
+ * TILER OUT OF MEMORY (panthor_sched.c's group_process_tiler_oom, panthor_heap.c's panthor_heap_grow): a queue whose
+ * render passes filled its heap raises CS_REQ/ACK bit 26 and stops. The answer: one more chunk, zeroed, its header's
+ * next 0, given in the queue's input as heap_start = heap_end = its address | its size >> 12, the event acked (REQ's bit
+ * set to ACK's) and the group's doorbell rung. A heap at its most chunks gets 0: the firmware then waits for passes in
+ * flight to finish and give chunks back. Checked wherever a queue's progress is (akita_mali_reached, polled by every
+ * waiter): the GPU raises no interrupt here that anyone takes.
+ */
+#define CS_TILER_OOM            (1u << 26)
+#define CS_HEAP_START           0x20
+#define CS_HEAP_END             0x28
+#define CS_HEAP_ADDRESS         0xd0
+
+static uint64_t
+heap_grow(uint64_t ctx_va)
+{
+	for (int h = 0; h < MAX_HEAPS; h++) {
+		if (!heaps[h].used || heaps[h].ctx_va != ctx_va) {
+			continue;
+		}
+		unsigned int i = heaps[h].chunks, vm = heaps[h].vm;
+		uint32_t size = heaps[h].chunk_size;
+
+		if (i >= heaps[h].max_chunks) {
+			printf("mali: tiler heap %d: out of memory at %u chunks of %u KiB, its most; the firmware waits\n", h, i,
+			    size >> 10);
+			return 0;
+		}
+		vms[vm].kernel_next = (vms[vm].kernel_next + size - 1) & ~(uint64_t)(size - 1);
+		heaps[h].chunk[i] = vm_kernel_region(vm, size, &heaps[h].chunk_va[i], false);
+		if (heaps[h].chunk[i] == 0) {
+			printf("mali: tiler heap %d: no memory for chunk %u\n", h, i);
+			return 0;
+		}
+		*(uint64_t *)heaps[h].chunk[i] = 0;
+		clean_dcache(heaps[h].chunk[i], 64, FALSE);
+		heaps[h].chunks = i + 1;
+		as_update(vm);
+		printf("mali: tiler heap %d: grown to %u chunks (%u MiB)\n", h, i + 1, (i + 1) * (size >> 10) >> 10);
+		return (heaps[h].chunk_va[i] & ~0xfffULL) | (size >> 12);
+	}
+	printf("mali: tiler out of memory for heap context %#llx, which is none of ours\n", ctx_va);
+	return 0;
+}
+
+/*
+ * A QUEUE'S FATAL ERROR (CS_REQ/ACK bit 31: a GPU page fault, an invalid instruction...): the queue stops for good, and
+ * every later wait on the group timed out -- the screen went black. panthor kills the group and fails its jobs; here
+ * the group is ended (CSG TERMINATE) and started again in place with empty rings, everything submitted to it counted
+ * as reached (the waiters go on; the frames in it are lost), so that the window server keeps drawing. A fault that is
+ * not fatal (bit 30) is acknowledged and the queue goes on, as panthor does.
+ */
+#define CS_FAULT_BIT            (1u << 30)
+#define CS_FATAL_BIT            (1u << 31)
+
+static void
+group_restart(unsigned int g)
+{
+	struct mali_group *grp = &groups[g];
+	volatile uint32_t *gin, *gout, *sin, *sout;
+	uint32_t *gc;
+	uint64_t shaders = rd64(SHADER_PRESENT);
+	unsigned int compute = 0;
+
+	grp->restarts++;
+	group_blocks(g, &gin, &gout, &gc);
+	from_gpu(gout, 64);
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u);            /* TERMINATE */
+	to_gpu(gin, 64);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
+		printf("mali: group %u: not ended for its restart (CSG_REQ 0x%x, ACK 0x%x)\n", g, gin[CSG_REQ / 4], gout[CSG_ACK / 4]);
+	}
+	for (unsigned int q = 0; q < grp->queues; q++) {
+		struct mali_queue *mq = &grp->q[q];
+		uint64_t *r = (uint64_t *)mq->ring;
+
+		/* everything it was given counted done; the ring from its start again, as group_new left it */
+		*mq->seqno = mq->submitted;
+		to_gpu((void *)mq->seqno, 8);
+		mq->seen = mq->submitted;
+		bzero((void *)mq->ring, mq->ring_size);
+		r[0] = 34ULL << 56 | 0xf;
+		mq->insert = 64;
+		to_gpu((void *)mq->ring, mq->ring_size);
+		bzero((void *)mq->user_in, 16);
+		bzero((void *)mq->user_out, 16);
+		mq->user_in[CS_INSERT / 4] = (uint32_t)mq->insert;
+		to_gpu(mq->user_in, 16);
+		to_gpu(mq->user_out, 16);
+		stream_blocks(gc, q, &sin, &sout);
+		from_gpu(sin, 128);
+		from_gpu(sout, 128);
+		sin[CS_BASE_LO / 4] = (uint32_t)mq->ring_va;
+		sin[CS_BASE_HI / 4] = (uint32_t)(mq->ring_va >> 32);
+		sin[CS_SIZE / 4] = mq->ring_size;
+		sin[CS_USER_INPUT_LO / 4] = grp->user_va[q];
+		sin[CS_USER_INPUT_HI / 4] = 0;
+		sin[CS_USER_OUTPUT_LO / 4] = grp->user_va[q] + GPU_PAGE;
+		sin[CS_USER_OUTPUT_HI / 4] = 0;
+		sin[CS_CONFIG / 4] = (1 + g) << 8 | 1;
+		sin[CS_ACK_IRQ_MASK / 4] = 0xffffffff;
+		sin[CS_REQ / 4] = (sout[CS_ACK / 4] & 0xc0000000u) | CS_REQ_IDLE_BITS | CS_STATE_START;
+		to_gpu(sin, 128);
+	}
+	for (uint64_t m = shaders; m; m &= m - 1) {
+		compute++;
+	}
+	from_gpu(gout, 64);
+	gin[CSG_DB_REQ / 4] = gout[CSG_DB_ACK / 4] ^ ((1u << grp->queues) - 1);
+	gin[CSG_ALLOW_COMPUTE_LO / 4] = (uint32_t)shaders;
+	gin[CSG_ALLOW_COMPUTE_HI / 4] = (uint32_t)(shaders >> 32);
+	gin[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
+	gin[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
+	gin[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
+	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(grp->priority & 15) << 28;
+	gin[CSG_EP_REQ_HI / 4] = 0;
+	gin[CSG_CONFIG / 4] = grp->vm;
+	gin[CSG_SUSPEND_BUF_LO / 4] = grp->suspend_va;
+	gin[CSG_SUSPEND_BUF_HI / 4] = 0;
+	gin[CSG_ACK_IRQ_MASK / 4] = 0xffffffff;
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u) | CSG_STATE_START;
+	to_gpu(gin, 128);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
+		printf("mali: group %u did not start again (CSG_REQ 0x%x, ACK 0x%x)\n", g, gin[CSG_REQ / 4], gout[CSG_ACK / 4]);
+		return;
+	}
+	wr(MMU_IRQ_CLEAR, 0xffffffff);
+	printf("mali: group %u started again after a fatal error (restart %u)\n", g, grp->restarts);
+}
+
+static void
+tiler_oom(void)
+{
+	static volatile UInt32 busy;
+
+	if (!OSCompareAndSwap(0, 1, &busy)) {
+		return;                         /* (another waiter is at it) */
+	}
+	for (unsigned int g = 0; g < MAX_GROUPS; g++) {
+		volatile uint32_t *gin, *gout, *sin, *sout;
+		uint32_t *gc;
+		bool rang = false;
+
+		if (!groups[g].used) {
+			continue;
+		}
+		group_blocks(g, &gin, &gout, &gc);
+		for (unsigned int q = 0; q < groups[g].queues; q++) {
+			stream_blocks(gc, q, &sin, &sout);
+			from_gpu(sout, 256);
+			uint32_t events = sin[CS_REQ / 4] ^ sout[CS_ACK / 4];
+			if (events & CS_FATAL_BIT) {
+				printf("mali: group %u queue %u: fatal 0x%x (info 0x%x%08x), cmd at 0x%x%08x; the group restarts\n", g, q,
+				    sout[CS_FATAL / 4], sout[0x94 / 4], sout[0x90 / 4], sout[0x44 / 4], sout[0x40 / 4]);
+				faults("a queue's fatal error");
+				group_restart(g);
+				rang = false;
+				break;
+			}
+			if (events & CS_FAULT_BIT) {
+				printf("mali: group %u queue %u: fault 0x%x (info 0x%x%08x), acknowledged\n", g, q, sout[CS_FAULT / 4],
+				    sout[0x8c / 4], sout[0x88 / 4]);
+				sin[CS_REQ / 4] = (sin[CS_REQ / 4] & ~CS_FAULT_BIT) | (sout[CS_ACK / 4] & CS_FAULT_BIT);
+				to_gpu(sin, 64);
+				gin[CSG_DB_REQ / 4] = (gin[CSG_DB_REQ / 4] & ~(1u << q)) | ((gout[CSG_DB_ACK / 4] ^ (1u << q)) & (1u << q));
+				rang = true;
+			}
+			if (!(events & CS_TILER_OOM)) {
+				continue;
+			}
+			uint64_t ctx = (uint64_t)sout[CS_HEAP_ADDRESS / 4] | (uint64_t)sout[CS_HEAP_ADDRESS / 4 + 1] << 32;
+			uint64_t chunk = heap_grow(ctx);
+
+			*(volatile uint64_t *)&sin[CS_HEAP_START / 4] = chunk;
+			*(volatile uint64_t *)&sin[CS_HEAP_END / 4] = chunk;
+			sin[CS_REQ / 4] = (sin[CS_REQ / 4] & ~CS_TILER_OOM) | (sout[CS_ACK / 4] & CS_TILER_OOM);
+			to_gpu(sin, 64);
+			gin[CSG_DB_REQ / 4] = (gin[CSG_DB_REQ / 4] & ~(1u << q)) | ((gout[CSG_DB_ACK / 4] ^ (1u << q)) & (1u << q));
+			rang = true;
+		}
+		if (rang) {
+			from_gpu(gout, 64);
+			gin[CSG_IRQ_ACK / 4] = gout[CSG_IRQ_REQ / 4];
+			to_gpu(gin, 64);
+			from_gpu(glb_out, 64);
+			glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << g)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << g)) & (1u << g));
+			to_gpu(glb_in, 64);
+			ring_doorbell(0);
+			ring_doorbell(1 + g);
+		}
+	}
+	busy = 0;
+}
+
 /* the last sequence number the queue reached (what the GPU wrote is read after its caches are flushed) */
 uint64_t akita_mali_reached(int g, unsigned int q);
 uint64_t
@@ -1932,6 +2143,7 @@ akita_mali_reached(int g, unsigned int q)
 		return 0;
 	}
 	flush_gpu();
+	tiler_oom();
 	from_gpu(groups[g].q[q].seqno, 8);
 	groups[g].q[q].seen = *groups[g].q[q].seqno;
 	busy_update();
