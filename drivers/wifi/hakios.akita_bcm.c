@@ -31,6 +31,9 @@
  *              first and last bytes in the log); then the regulatory database (fw/bcmdhd_clm.blob_4383_a3, "clmload")
  *              and the transmit caps (fw/bcmdhd_txcap.blob_4383_a3, "txcapload") in chunks of 1400 bytes; events
  *              the firmware sends meanwhile are said by number
+ *   7  talks   the events this driver wants ("event_msgs"), power saving off ("mpc" 0), infrastructure mode, the
+ *              radio up (WLC_UP), an escan of every channel (scan parameters version 2 if "scan_ver" says so), the
+ *              access points it heard: name, band, channel, signal, protection (BSSIDs shortened in the log)
  * The chip is left running, polled (no interrupts yet); the chip's deep-sleep requests are acked as brcmfmac does.
  *
  * How the chip is reached: BAR0 (64 KB at 0x60200000) shows 4 KB of the chip's backplane at the address in its
@@ -806,20 +809,106 @@ h2d_commit(unsigned ring, unsigned count)
 	pcie_wr(PCIE_H2D_MAILBOX_0, 1);
 }
 
-static void
-event_say(const uint8_t *frame, uint32_t length)
+/* ---- events ---- */
+
+#define EV_SET_SSID             0
+#define EV_AUTH                 3
+#define EV_DEAUTH               5
+#define EV_DEAUTH_IND           6
+#define EV_ASSOC                7
+#define EV_DISASSOC_IND         12
+#define EV_LINK                 16
+#define EV_PSK_SUP              46
+#define EV_COUNTRY_CODE_CHANGED 47
+#define EV_IF                   54
+#define EV_ESCAN_RESULT         69
+#define EV_STATUS_PARTIAL       8
+#define EVENT_HDR               (14 + 10)       /* Ethernet, then Broadcom's header */
+#define EVENT_MSG               48              /* the event itself, big-endian */
+
+static inline uint32_t
+be32(const uint8_t *p)
 {
-	/* an Ethernet header (14), Broadcom's (10: subtype, length, version, OUI, user subtype), then the event, big-endian */
-	if (length < 24 + 24) {
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+#define HEARD_MOST              64
+static struct heard {
+	uint8_t bssid[6], ssid[33], ssid_len;
+	uint16_t chanspec, capability;
+	int16_t rssi;
+} heard[HEARD_MOST];
+static unsigned heard_count;
+static bool escan_done;
+static int escan_status = -1;
+
+static void
+escan_result(const uint8_t *d, uint32_t len)
+{
+	if (len < 12) {
+		return;
+	}
+	uint32_t buflen = get32(d, 0), at = 12;
+	uint16_t count = get16(d, 10);
+
+	if (buflen > len) {
+		buflen = len;
+	}
+	for (unsigned n = 0; n < count && at + 90 <= buflen; n++) {
+		const uint8_t *b = d + at;
+		uint32_t blen = get32(b, 4);
+		struct heard h;
+
+		if (blen < 90 || at + blen > buflen) {
+			break;
+		}
+		bzero(&h, sizeof(h));
+		memcpy(h.bssid, b + 8, 6);
+		h.capability = get16(b, 16);
+		h.ssid_len = b[18] > 32 ? 32 : b[18];
+		memcpy(h.ssid, b + 19, h.ssid_len);
+		h.chanspec = get16(b, 72);
+		h.rssi = (int16_t)get16(b, 78);
+		unsigned i;
+
+		for (i = 0; i < heard_count; i++) {
+			if (memcmp(heard[i].bssid, h.bssid, 6) == 0) {
+				if (h.rssi > heard[i].rssi) {
+					heard[i] = h;
+				}
+				break;
+			}
+		}
+		if (i == heard_count && heard_count < HEARD_MOST) {
+			heard[heard_count++] = h;
+		}
+		at += (blen + 3) & ~3u;
+	}
+}
+
+static void
+event_handle(const uint8_t *frame, uint32_t length)
+{
+	if (length < EVENT_HDR + EVENT_MSG) {
 		printf("wifi: %u: an event of %u bytes\n", step, length);
 		return;
 	}
-	const uint8_t *e = frame + 24;
-	uint32_t type = (uint32_t)e[4] << 24 | (uint32_t)e[5] << 16 | (uint32_t)e[6] << 8 | e[7];
-	uint32_t status = (uint32_t)e[8] << 24 | (uint32_t)e[9] << 16 | (uint32_t)e[10] << 8 | e[11];
-	uint32_t reason = (uint32_t)e[12] << 24 | (uint32_t)e[13] << 16 | (uint32_t)e[14] << 8 | e[15];
+	const uint8_t *e = frame + EVENT_HDR;
+	uint32_t type = be32(e + 4), status = be32(e + 8), reason = be32(e + 12), datalen = be32(e + 20);
+	const uint8_t *data = e + EVENT_MSG;
 
-	printf("wifi: %u: event %u, status %u, reason %u\n", step, type, status, reason);
+	if (datalen > length - EVENT_HDR - EVENT_MSG) {
+		datalen = length - EVENT_HDR - EVENT_MSG;
+	}
+	if (type == EV_ESCAN_RESULT) {
+		escan_result(data, datalen);
+		if (status != EV_STATUS_PARTIAL) {
+			escan_done = true;
+			escan_status = (int)status;
+		}
+		return;
+	}
+	printf("wifi: %u: event %u, status %u, reason %u, %u bytes\n", step, type, status, reason, datalen);
 }
 
 static void
@@ -868,7 +957,7 @@ d2h_ctrl_poll(void)
 			break;
 		case MSG_WL_EVENT:
 			if (id > CTRL_BUFS && id <= 2 * CTRL_BUFS) {
-				event_say(mb.ctrl_buf[id - 1] + mb.rx_dataoffset, get16(m, 12));
+				event_handle(mb.ctrl_buf[id - 1] + mb.rx_dataoffset, get16(m, 12));
 				mb.events++;
 				ctrl_buf_post(id);
 			}
@@ -1112,6 +1201,116 @@ rings_up(uint32_t shared)
 	return true;
 }
 
+static int
+cmd_int(uint32_t cmd, uint32_t value)
+{
+	return bcm_ioctl(cmd, &value, 4, NULL, 4);
+}
+
+static int
+iovar_int(const char *name, uint32_t value)
+{
+	return iovar_set(name, &value, 4);
+}
+
+static const char *
+band_of(uint16_t chanspec)
+{
+	switch (chanspec & 0xc000) {
+	case 0x0000: return "2.4";
+	case 0x4000: return "4.9";
+	case 0x8000: return "6";
+	default: return "5";
+	}
+}
+
+/* step 7: the events this driver wants, the radio up, an escan of every channel, what it heard */
+static void
+scan_all(void)
+{
+	uint8_t mask[16];
+	uint32_t scan_ver = 0;
+	int err;
+	static const uint8_t wanted[] = { EV_SET_SSID, EV_AUTH, EV_DEAUTH, EV_DEAUTH_IND, EV_ASSOC, EV_DISASSOC_IND, EV_LINK,
+		                          EV_PSK_SUP, EV_COUNTRY_CODE_CHANGED, EV_IF, EV_ESCAN_RESULT };
+
+	bzero(mask, sizeof(mask));
+	err = iovar_get("event_msgs", mask, sizeof(mask));
+	for (unsigned i = 0; i < sizeof(wanted); i++) {
+		mask[wanted[i] / 8] |= (uint8_t)(1u << (wanted[i] % 8));
+	}
+	printf("wifi: 7: \"event_msgs\" read: %d; set: %d\n", err, iovar_set("event_msgs", mask, sizeof(mask)));
+	printf("wifi: 7: \"mpc\" 0: %d; infrastructure: %d; up: %d\n", iovar_int("mpc", 0), cmd_int(20, 1), cmd_int(2, 1));
+	err = iovar_get("scan_ver", &scan_ver, sizeof(scan_ver));
+	printf("wifi: 7: \"scan_ver\": %d, %u\n", err, scan_ver);
+
+	/* the escan's parameters: version, action (1: start), sync id; then the scan's (version 2 if the firmware says so) */
+	uint8_t p[8 + 72];
+	uint32_t size;
+
+	bzero(p, sizeof(p));
+	put16(p, 4, 1);
+	put16(p, 6, 0x1234);
+	if (err == 0 && scan_ver >= 2) {
+		uint8_t *v = p + 8;
+
+		put32(p, 0, 2);
+		put16(v, 0, 2);                 /* version */
+		put16(v, 2, 72);                /* length */
+		memset(v + 40, 0xff, 6);        /* any BSSID */
+		v[46] = 2;                      /* any BSS type */
+		put32(v, 48, 0);                /* active */
+		put32(v, 52, 0xffffffffu);      /* the firmware's own probes and dwell times */
+		put32(v, 56, 0xffffffffu);
+		put32(v, 60, 0xffffffffu);
+		put32(v, 64, 0xffffffffu);
+		put32(v, 68, 0);                /* every channel */
+		size = 8 + 72;
+	} else {
+		uint8_t *v = p + 8;             /* version 1: ssid 36, bssid 6, bss type, scan type, four times, channels */
+
+		put32(p, 0, 1);
+		memset(v + 36, 0xff, 6);
+		v[42] = 2;
+		v[43] = 0;
+		put32(v, 44, 0xffffffffu);
+		put32(v, 48, 0xffffffffu);
+		put32(v, 52, 0xffffffffu);
+		put32(v, 56, 0xffffffffu);
+		put32(v, 60, 0);
+		size = 8 + 64;
+	}
+	heard_count = 0;
+	escan_done = false;
+	escan_status = -1;
+	err = iovar_set("escan", p, size);
+	printf("wifi: 7: \"escan\" (version %u): %d\n", get32(p, 0), err);
+	if (err != 0) {
+		return;
+	}
+	uint64_t t0 = mach_absolute_time();
+
+	while (!escan_done && micros_since(t0) < 15000000) {
+		if (d2h_ctrl_poll() == 0) {
+			sleep_ms(5);
+		}
+	}
+	printf("wifi: 7: the scan %s after %llu ms (status %d): %u access points\n", escan_done ? "ended" : "did NOT end",
+	    micros_since(t0) / 1000, escan_status, heard_count);
+	for (unsigned i = 0; i < heard_count; i++) {
+		struct heard *h = &heard[i];
+		char name[33];
+
+		for (unsigned j = 0; j < h->ssid_len; j++) {
+			name[j] = (h->ssid[j] >= 0x20 && h->ssid[j] < 0x7f) ? (char)h->ssid[j] : '?';
+		}
+		name[h->ssid_len] = 0;
+		printf("wifi: 7: %4d dBm  %3s GHz channel %3u  %s  xx:xx:xx:xx:%02x:%02x  \"%s\"\n", h->rssi,
+		    band_of(h->chanspec), h->chanspec & 0xff, (h->capability & 0x10) ? "protected" : "open     ", h->bssid[4],
+		    h->bssid[5], h->ssid_len ? name : "(hidden)");
+	}
+}
+
 void
 akita_bcm_run(void)
 {
@@ -1337,4 +1536,10 @@ akita_bcm_run(void)
 		    mb.w[RING_H2D_CTRL], mb.idx[mb.h2d_r + RING_H2D_CTRL], mem_rd(mb.tcm_h2d_r + 4 * RING_H2D_CTRL) & 0xffff);
 		printf("wifi: 6: %u events so far; the firmware answers\n", mb.events);
 	}
+
+	if (!announce(7, "talks: the events wanted, the radio up, a scan of every channel")) {
+		return;
+	}
+	scan_all();
+	console_say(shared);
 }
