@@ -472,12 +472,15 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 static void
 tcp_input(const uint8_t *t, uint32_t len)
 {
+	if (len < TCP_HDR) {
+		return;                 /* (before any field is read: a short packet's fields are past its end) */
+	}
 	uint16_t host_port = get16(t), phone_port = get16(t + 2);
 	uint32_t seq = get32(t + 4), off = (t[12] >> 4) * 4;
 	uint8_t flags = t[13];
 	struct mux_conn *c;
 
-	if (len < TCP_HDR || off < TCP_HDR || off > len) {
+	if (off < TCP_HDR || off > len) {
 		return;
 	}
 	if (flags & TH_SYN) {
