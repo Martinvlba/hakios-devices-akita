@@ -260,29 +260,60 @@ static const uint8_t dev_desc[18] = {
 	18, 1, 0x00, 0x02, 0, 0, 0, 64,
 	0xac, 0x05, 0xa8, 0x12,                 /* Apple, iPhone (usbmuxd takes 0x1290..0x12af) */
 	0x01, 0x10,                             /* bcdDevice 0x1001 */
-	1, 2, 3, 1
+	1, 2, 3, 4                              /* four configurations, as an iPhone (one alone is a phone being restored) */
 };
-static const uint8_t qualifier[10] = { 10, 6, 0x00, 0x02, 0, 0, 0, 64, 1, 0 };
+static const uint8_t qualifier[10] = { 10, 6, 0x00, 0x02, 0, 0, 0, 64, 4, 0 };
 /*
  * The BOS: a header and a USB 2.0 Extension with nothing in it (no link power management). Windows' Apple driver asks for
  * it after the charging request (GET_DESCRIPTOR 0x0f00) and, refused, sent nothing more: the device was given up.
  */
 static const uint8_t bos_desc[12] = { 5, 0x0f, 12, 0, 1, 7, 0x10, 0x02, 0, 0, 0, 0 };
-static const uint8_t cfg_desc[62] = {
-	9, 2, 62, 0, 2, 1, 0, 0xc0, 250,        /* two interfaces, self-powered, 500 mA */
-	9, 4, 0, 0, 3, 0x06, 0x01, 0x01, 5,     /* PTP (Still Image Capture), as an iPhone's interface 0: the photos */
-	7, 5, 0x83, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
-	7, 5, 0x03, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
-	7, 5, 0x84, 3, 64, 0, 8,                /* its events: never sent */
-	9, 4, 1, 0, 2, 0xff, 0xfe, 2, 4,        /* Apple Mobile Device: usbmux */
-	7, 5, 0x81, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
-	7, 5, 0x01, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
+/*
+ * THE CONFIGURATIONS, an iPhone's four (11-09): with one alone (PTP + usbmux) Windows' Apple driver took the phone for
+ * one being restored -- its child "USB\VID_05AC&PID_12A8&RESTORE_MODE&MI_01", no driver (Code 28), no PTP, nothing in
+ * Explorer -- while Linux (usbmuxd, gphoto2) did not mind. 1 "PTP"; 2 "iPod USB Interface" (an iPhone's audio and HID:
+ * none here, no interfaces); 3 "PTP + Apple Mobile Device"; 4 the same + "Apple USB Ethernet" (tethering: its interface
+ * is described, alternate setting 1 has two bulk endpoints, nothing serves them). The host picks: usbmuxd the last one
+ * with usbmux (4), Windows' Apple driver its own. 1, 3 and 4 turn the endpoints on.
+ */
+#define PTP_INTF \
+	9, 4, 0, 0, 3, 0x06, 0x01, 0x01, 5,     /* PTP (Still Image Capture), as an iPhone's interface 0: the photos */ \
+	7, 5, 0x83, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0, \
+	7, 5, 0x03, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0, \
+	7, 5, 0x84, 3, 64, 0, 8                 /* its events: never sent */
+#define MUX_INTF \
+	9, 4, 1, 0, 2, 0xff, 0xfe, 2, 4,        /* Apple Mobile Device: usbmux */ \
+	7, 5, 0x81, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0, \
+	7, 5, 0x01, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0
+static const uint8_t cfg1_desc[39] = {
+	9, 2, 39, 0, 1, 1, 6, 0xc0, 250,        /* one interface, self-powered, 500 mA */
+	PTP_INTF,
 };
+static const uint8_t cfg2_desc[9] = {
+	9, 2, 9, 0, 0, 2, 7, 0xc0, 250,         /* "iPod USB Interface": no interfaces here */
+};
+static const uint8_t cfg3_desc[62] = {
+	9, 2, 62, 0, 2, 3, 8, 0xc0, 250,
+	PTP_INTF,
+	MUX_INTF,
+};
+static const uint8_t cfg4_desc[94] = {
+	9, 2, 94, 0, 3, 4, 9, 0xc0, 250,
+	PTP_INTF,
+	MUX_INTF,
+	9, 4, 2, 0, 0, 0xff, 0xfd, 1, 10,       /* Apple USB Ethernet, setting 0: no endpoints */
+	9, 4, 2, 1, 2, 0xff, 0xfd, 1, 10,       /* ... setting 1: its bulk pair (never served) */
+	7, 5, 0x85, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
+	7, 5, 0x05, 2, BULK_MPS & 0xff, BULK_MPS >> 8, 0,
+};
+static unsigned current_config;
 
 static unsigned
 string_desc(unsigned index, uint8_t *out)
 {
-	static const char *const strings[] = { NULL, "Apple Inc.", "iPhone", serial, "Apple Mobile Device", "PTP" };
+	static const char *const strings[] = { NULL, "Apple Inc.", "iPhone", serial, "Apple Mobile Device", "PTP", "PTP",
+		                               "iPod USB Interface", "PTP + Apple Mobile Device",
+		                               "PTP + Apple Mobile Device + Apple USB Ethernet", "Apple USB Ethernet Interface" };
 	const char *s;
 	unsigned n = 2;
 
@@ -495,7 +526,15 @@ ep0_request(void)
 	} else if (req == 6 && in) {            /* GET_DESCRIPTOR */
 		switch (value >> 8) {
 		case 1: memcpy(buf, dev_desc, n = sizeof(dev_desc)); break;
-		case 2: memcpy(buf, cfg_desc, n = sizeof(cfg_desc)); break;
+		case 2:
+			switch (value & 0xff) {
+			case 0: memcpy(buf, cfg1_desc, n = sizeof(cfg1_desc)); break;
+			case 1: memcpy(buf, cfg2_desc, n = sizeof(cfg2_desc)); break;
+			case 2: memcpy(buf, cfg3_desc, n = sizeof(cfg3_desc)); break;
+			case 3: memcpy(buf, cfg4_desc, n = sizeof(cfg4_desc)); break;
+			default: ok = false;
+			}
+			break;
 		case 3: n = string_desc(value & 0xff, buf); ok = n != 0; break;
 		case 6: memcpy(buf, qualifier, n = sizeof(qualifier)); break;
 		case 15: memcpy(buf, bos_desc, n = sizeof(bos_desc)); break;
@@ -505,13 +544,15 @@ ep0_request(void)
 		pending_address = value & 0x7f;
 		wr(DCFG, (rd(DCFG) & ~(0x7fu << 3)) | (pending_address << 3));
 	} else if (req == 9 && !in) {           /* SET_CONFIGURATION */
-		if (value == 1) {
+		printf("akita usb: the host chose configuration %u\n", value & 0xff);
+		current_config = value & 0xff;
+		if (current_config == 1 || current_config == 3 || current_config == 4) {
 			bulk_enable();
 		} else {
 			bulk_disable();
 		}
 	} else if (req == 8 && in) {            /* GET_CONFIGURATION */
-		buf[0] = bulk_on ? 1 : 0;
+		buf[0] = bulk_on ? (uint8_t)current_config : 0;
 		n = 1;
 	} else if (req == 0 && in) {            /* GET_STATUS */
 		buf[0] = (type & 0x1f) == 0 ? 1 : 0;    /* the device: self-powered */
