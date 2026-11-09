@@ -331,16 +331,68 @@ battery_read(struct hakios_battery_state *s)
 #define RPTR_DISABLE_P1         0x40
 extern void akita_usb_reconnect(void);
 
+/*
+ * THE USB DATA SWITCH in the USB-C port controller (the MAX77759's TCPC, vendor registers; Google's tcpci_max77759.c,
+ * enable_data_path_locked): at every attach the chip's BC1.2 charger detection takes D+/D- for itself, and Android
+ * connects them to the USB PHY again afterwards -- USBSW_CTRL (0x93) = 0x09 -- "always, the hardware may not". The
+ * bootloader leaves it connected; after a replug nobody here did, and the host saw no device at all (11-09: the
+ * re-init of the link and the controller alone brings USB back with the cable in, not after a replug).
+ */
+#define TCPC_BC_STATUS1         0x87            /* bits 1:0 the charger type found (0: none yet) */
+#define TCPC_BC_CTRL1           0x8f            /* bit 0 BC1.2 detection on */
+#define TCPC_USBSW_CTRL         0x93
+#define USBSW_CONNECT           0x09
+
+static void
+usb_switch_say(const char *when)
+{
+	uint8_t sw = 0xff, bc = 0xff, st = 0xff;
+
+	(void)read_regs(TCPC, TCPC_USBSW_CTRL, &sw, 1);
+	(void)read_regs(TCPC, TCPC_BC_CTRL1, &bc, 1);
+	(void)read_regs(TCPC, TCPC_BC_STATUS1, &st, 1);
+	printf("akita battery: %s: USB data switch (TCPC 0x93) %#x, BC1.2 control %#x, status %#x\n", when, sw, bc, st);
+}
+
+/* after an attach: the charger detection's end awaited (3 s at most), then D+/D- connected to the USB PHY */
+static void
+usb_switch_connect(void)
+{
+	uint8_t st = 0, sw = 0;
+	unsigned waited = 0;
+
+	usb_switch_say("the cable is back");
+	while (waited < 3000 && read_regs(TCPC, TCPC_BC_STATUS1, &st, 1) && (st & 3) == 0) {
+		delay(100000);
+		waited += 100;
+	}
+	bool ok = write_reg(TCPC, TCPC_USBSW_CTRL, USBSW_CONNECT);
+
+	(void)read_regs(TCPC, TCPC_USBSW_CTRL, &sw, 1);
+	printf("akita battery: charger detection ended after %u ms (type %u); the USB data switch connected (%s, now %#x)\n",
+	    waited, st & 3, ok ? "written" : "NOT written", sw);
+}
+
 static void
 usb_repeater_check(bool external, bool was_external)
 {
 	uint8_t cfg = 0;
 
+	static bool said;
+
+	if (!said) {
+		said = true;
+		usb_switch_say("as the bootloader left it");
+	}
 	if (!external) {
 		if (was_external) {
 			printf("akita battery: the cable went\n");
+			usb_switch_say("the cable went");
 		}
 		return;
+	}
+	if (!was_external) {
+		usb_switch_connect();
 	}
 	if (!read_regs(REPEATER, RPTR_GLOBAL_CONFIG, &cfg, 1)) {
 		return;
