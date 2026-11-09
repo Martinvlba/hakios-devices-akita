@@ -109,6 +109,9 @@ static const uint32_t l2_hash_values[3] = { 0x36db6d, 0x5b6db6, 0x0 };
 #define IRQ_RESET_COMPLETED     (1u << 8)
 #define COHERENCY_NONE          31
 #define AS_CMD_UPDATE           1
+#define AS_CMD_LOCK             2
+#define AS_CMD_UNLOCK           3
+#define AS_LOCKADDR             0x10            /* 64 bits: a region's base | log2(its size) - 1 */
 #define AS_STATUS_ACTIVE        1u
 #define MCU_REQ_DISABLE         0
 #define MCU_REQ_AUTO            2               /* as Google's driver starts it */
@@ -1485,6 +1488,16 @@ as_update(unsigned int as)
 	wr64(base + AS_MEMATTR, MEMATTR_TABLE);
 	wr(base + AS_COMMAND, AS_CMD_UPDATE);
 	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+	/* the MMU's cached translations dropped (kbase's mmu_hw_do_flush on GPUs with cache flush commands: LOCK the
+	 * region, the GPU's caches flushed, UNLOCK -- which forgets the region's walks): the whole 48-bit space. UPDATE
+	 * alone did not: a second client's grown heap chunks (fresh level-3 tables in its VM) faulted at level 2 one
+	 * after the other, 120 group restarts */
+	wr64(base + AS_LOCKADDR, 47);
+	wr(base + AS_COMMAND, AS_CMD_LOCK);
+	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+	flush_gpu();
+	wr(base + AS_COMMAND, AS_CMD_UNLOCK);
+	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
 }
 
 int akita_mali_vm_new(void);
@@ -1820,7 +1833,11 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 	gin[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
 	gin[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
 	gin[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
-	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(priority & 15) << 28;
+	/* SEVERAL GROUPS (TODO 16): each its own CSG priority, 15 - its slot (panthor gives every slot a priority of its
+	 * own). With the same one (every hakios-metal client asks 1) the firmware handed the endpoints out in pieces -- one
+	 * group the compute ones, another the fragment and tiler -- and each waited for the other's for good (CS blocked
+	 * on resources, 0x5). The first group, backboardd's as a rule, ranks first. (The client's PRIORITY is kept.) */
+	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(15 - g) << 28;
 	gin[CSG_EP_REQ_HI / 4] = 0;
 	gin[CSG_CONFIG / 4] = (uint32_t)vm;     /* the group's address space is its VM's slot */
 	gin[CSG_SUSPEND_BUF_LO / 4] = suspend_va;
@@ -2038,10 +2055,13 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 #define CS_HEAP_ADDRESS         0xd0
 
 static uint64_t
-heap_grow(uint64_t ctx_va)
+heap_grow(unsigned int vm, uint64_t ctx_va)
 {
+	/* (the heap by its context AND the VM of the group that ran out: every client's first heap context is at the same
+	 * address of its own VM -- found by address alone, a second client's OOM grew backboardd's heap, and its own tiler
+	 * wrote to chunks its VM never had: a page fault a chunk) */
 	for (int h = 0; h < MAX_HEAPS; h++) {
-		if (!heaps[h].used || heaps[h].ctx_va != ctx_va) {
+		if (!heaps[h].used || heaps[h].ctx_va != ctx_va || heaps[h].vm != vm) {
 			continue;
 		}
 		unsigned int i = heaps[h].chunks, vm = heaps[h].vm;
@@ -2158,7 +2178,7 @@ group_restart(unsigned int g)
 	gin[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
 	gin[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
 	gin[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
-	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(grp->priority & 15) << 28;
+	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(15 - (grp - groups)) << 28;   /* (as group_new) */
 	gin[CSG_EP_REQ_HI / 4] = 0;
 	gin[CSG_CONFIG / 4] = grp->vm;
 	gin[CSG_SUSPEND_BUF_LO / 4] = grp->suspend_va;
@@ -2272,7 +2292,7 @@ tiler_oom(void)
 				continue;
 			}
 			uint64_t ctx = (uint64_t)sout[CS_HEAP_ADDRESS / 4] | (uint64_t)sout[CS_HEAP_ADDRESS / 4 + 1] << 32;
-			uint64_t chunk = heap_grow(ctx);
+			uint64_t chunk = heap_grow(groups[g].vm, ctx);
 
 			if (mali_heap_say) {
 				from_gpu(gout, 64);
