@@ -2213,6 +2213,8 @@ mmu_faults(void)
 	}
 }
 
+static int mali_heap_say = -1;      /* boot-arg mali_heap_say: each tiler OOM said */
+
 static void
 tiler_oom(void)
 {
@@ -2220,6 +2222,11 @@ tiler_oom(void)
 
 	if (!OSCompareAndSwap(0, 1, &busy)) {
 		return;                         /* (another waiter is at it) */
+	}
+	if (mali_heap_say < 0) {
+		int say = 0;
+		PE_parse_boot_argn("mali_heap_say", &say, sizeof(say));
+		mali_heap_say = say;
 	}
 	for (unsigned int g = 0; g < MAX_GROUPS; g++) {
 		volatile uint32_t *gin, *gout, *sin, *sout;
@@ -2247,6 +2254,7 @@ tiler_oom(void)
 				    sout[0x8c / 4], sout[0x88 / 4]);
 				sin[CS_REQ / 4] = (sin[CS_REQ / 4] & ~CS_FAULT_BIT) | (sout[CS_ACK / 4] & CS_FAULT_BIT);
 				to_gpu(sin, 64);
+				from_gpu(gout, 64);
 				gin[CSG_DB_REQ / 4] = (gin[CSG_DB_REQ / 4] & ~(1u << q)) | ((gout[CSG_DB_ACK / 4] ^ (1u << q)) & (1u << q));
 				rang = true;
 			}
@@ -2256,10 +2264,22 @@ tiler_oom(void)
 			uint64_t ctx = (uint64_t)sout[CS_HEAP_ADDRESS / 4] | (uint64_t)sout[CS_HEAP_ADDRESS / 4 + 1] << 32;
 			uint64_t chunk = heap_grow(ctx);
 
+			if (mali_heap_say) {
+				from_gpu(gout, 64);
+				printf("mali: group %u queue %u: tiler OOM: passes started %u, tiled %u, fragment done %u; CS_REQ 0x%x ACK 0x%x, "
+				    "CSG_IRQ_REQ 0x%x ACK 0x%x; wait 0x%x blocked 0x%x; chunk given 0x%llx\n", g, q, sout[0xc0 / 4],
+				    sout[0xc4 / 4], sout[0xcc / 4], sin[CS_REQ / 4], sout[CS_ACK / 4], gout[CSG_IRQ_REQ / 4], gin[CSG_IRQ_ACK / 4],
+				    sout[0x48 / 4], sout[0x60 / 4], chunk);
+			}
+
 			*(volatile uint64_t *)&sin[CS_HEAP_START / 4] = chunk;
 			*(volatile uint64_t *)&sin[CS_HEAP_END / 4] = chunk;
 			sin[CS_REQ / 4] = (sin[CS_REQ / 4] & ~CS_TILER_OOM) | (sout[CS_ACK / 4] & CS_TILER_OOM);
 			to_gpu(sin, 64);
+			/* the queue's doorbell request toggled from its ACK as the firmware has it NOW: from a stale copy (the
+			 * firmware had acked the last OOM's doorbell since) the "toggle" left REQ = ACK, no doorbell -- the
+			 * firmware never read the new chunk, and a pass needing more than ~3 grows stalled for good */
+			from_gpu(gout, 64);
 			gin[CSG_DB_REQ / 4] = (gin[CSG_DB_REQ / 4] & ~(1u << q)) | ((gout[CSG_DB_ACK / 4] ^ (1u << q)) & (1u << q));
 			rang = true;
 		}
@@ -2339,8 +2359,9 @@ akita_mali_debug(void)
 		acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 1u << 5, 100);
 		flush_gpu();
 		from_gpu(gout, 64);
-		printf("mali: group %u: CSG_REQ 0x%x ACK 0x%x, DB_REQ 0x%x ACK 0x%x, endpoints 0x%x of 0x%x\n", g,
-		    gin[CSG_REQ / 4], gout[CSG_ACK / 4], gin[CSG_DB_REQ / 4], gout[CSG_DB_ACK / 4], gout[0x10 / 4], gout[0x14 / 4]);
+		printf("mali: group %u: CSG_REQ 0x%x ACK 0x%x, DB_REQ 0x%x ACK 0x%x, IRQ_REQ 0x%x ACK 0x%x, endpoints 0x%x of 0x%x\n", g,
+		    gin[CSG_REQ / 4], gout[CSG_ACK / 4], gin[CSG_DB_REQ / 4], gout[CSG_DB_ACK / 4], gout[CSG_IRQ_REQ / 4],
+		    gin[CSG_IRQ_ACK / 4], gout[0x10 / 4], gout[0x14 / 4]);
 		for (unsigned int q = 0; q < groups[g].queues; q++) {
 			struct mali_queue *mq = &groups[g].q[q];
 
