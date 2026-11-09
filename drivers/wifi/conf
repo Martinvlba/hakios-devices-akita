@@ -1,0 +1,6 @@
+# devices/akita/drivers/wifi/conf: the Pixel 8a's Wi-Fi (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_WIFI
+	file    bsd/dev/hakios.akita_pcie.c
+	help    the Pixel 8a's Wi-Fi chip, a Broadcom BCM4383 on zuma's PCIe channel 1: the link brought up step by step
+	help    (pcie=N): the pins and the chip's power, the PHY, link training, the chip's configuration space and identity
