@@ -1,12 +1,13 @@
 #!/bin/bash
 # build user space (JOBFILE= job file), make a boot image, boot it once with fastboot boot (nothing flashed), log for
 # SECS seconds into LOGDIR (default ~/akita/logs/run: build-boot.log, test-console.log, test-k.log). Extra boot-args in
+# (found in Android: the run before's logs from pstore first, into LOGDIR/previous-run-pstore: tools/pstore-klog.py)
 # BOOTARGS (usb_lost_reboot=90 after them: a phone that loses its USB link restarts into the active slot, Android;
 # usb_lost_reboot=0 in BOOTARGS turns it off -- the first one counts); THERMAL= overrides "thermal=1 dvfs=1". Never set RC or JOBS (userland/build.sh reads them).
 cd ~/akita/hackios-kernel; D=~/akita/darwin-flash; S=${LOGDIR:-$HOME/akita/logs/run}; mkdir -p $S
 env -u RC -u JOBS BIG_IN_ROOT=1 RC_JOBS=${JOBFILE:-rc.jobs.maldraw} HAKIOS_METAL_OUT=ios-mali LOCKDOWND=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh > $S/build-boot.log 2>&1 || { echo build failed; exit 1; }
 xnuloader/mkpayload.py -o $D/test-payload.bin kernel=hakios-kernel ramdisk=userland/root.apfs resident=userland/flashboot.apfs --cmdline "debug=0x8 cpus=9 touchscreen=1 buttons=1 fuelgauge=1 usbmux=1 usb_serial=d6ca5f8da676e44a1ed9455d72d070481d33dd9e ${THERMAL-thermal=1 dvfs=1} root_apfs=ufs_darwin ufs=2 ufs_write=1 var_hfs=ufs_darwin_data mali_keep=1 metal=1 metal_plugin=../../../redwood/lib/HakiosMetal display_flip=1 $BOOTARGS usb_lost_reboot=90" >/dev/null && tools/mkubootimg.py -d akita -p $D/test-payload.bin -o $D/test.img >/dev/null || exit 1
-if adb devices 2>/dev/null | grep -q "device$"; then adb reboot bootloader; elif lsusb | grep -q 05ac; then timeout 30 python3 devices/akita/tools/usbmux-reboot.py bootloader >/dev/null; fi
+if adb devices 2>/dev/null | grep -q "device$"; then timeout 90 python3 devices/akita/tools/pstore-klog.py $S/previous-run-pstore >$S/previous-run-pstore.txt 2>&1; adb reboot bootloader; elif lsusb | grep -q 05ac; then timeout 30 python3 devices/akita/tools/usbmux-reboot.py bootloader >/dev/null; fi
 for i in $(seq 1 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; done
 fastboot boot $D/test.img >/dev/null 2>&1 || { echo boot failed; exit 1; }
 for i in $(seq 1 60); do lsusb | grep -q 05ac && break; sleep 2; done
