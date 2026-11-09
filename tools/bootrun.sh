@@ -13,9 +13,16 @@ case "$BOOTARGS" in *test_reboot_after=*) ;; *) SAFE="$SAFE test_reboot_after=60
 CMDLINE="debug=0x8 $SAFE cpus=9 touchscreen=1 buttons=1 fuelgauge=1 usbmux=1 usb_serial=d6ca5f8da676e44a1ed9455d72d070481d33dd9e ${THERMAL-thermal=1 dvfs=1} root_apfs=ufs_darwin ufs=2 ufs_write=1 var_hfs=ufs_darwin_data mali_keep=1 metal=1 metal_plugin=../../../redwood/lib/HakiosMetal display_flip=1 $BOOTARGS"
 [ ${#CMDLINE} -gt 495 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the loader keeps with its own (~495 of 607); shorten BOOTARGS"; exit 1; }
 xnuloader/mkpayload.py -o $D/test-payload.bin kernel=hakios-kernel ramdisk=userland/root.apfs resident=userland/flashboot.apfs --cmdline "$CMDLINE" >/dev/null && tools/mkubootimg.py -d akita -p $D/test-payload.bin -o $D/test.img >/dev/null || exit 1
-if adb devices 2>/dev/null | grep -q "device$"; then adb reboot bootloader; elif lsusb | grep -q 05ac; then timeout 30 python3 devices/akita/tools/usbmux-reboot.py bootloader >/dev/null; fi
-for i in $(seq 1 60); do fastboot devices 2>/dev/null | grep -q . && break; sleep 2; done
-fastboot boot $D/test.img >/dev/null 2>&1 || { echo boot failed; exit 1; }
+# to the bootloader from wherever the phone is -- and again if it turns up elsewhere meanwhile (a test build's own
+# restart, usb_lost_reboot or test_reboot_after, lands in Android: a run started then waited for fastboot for ever)
+for i in $(seq 1 90); do
+  fastboot devices 2>/dev/null | grep -q . && break
+  if adb devices 2>/dev/null | grep -q "device$"; then adb reboot bootloader >/dev/null 2>&1; sleep 8
+  elif lsusb | grep -q 05ac; then timeout 30 python3 devices/akita/tools/usbmux-reboot.py bootloader >/dev/null 2>&1; sleep 8
+  else sleep 2; fi
+done
+fastboot devices 2>/dev/null | grep -q . || { echo "no fastboot device (adb: $(adb devices | grep -c 'device$'), usb: $(lsusb | grep -o '05ac:[0-9a-f]*\|18d1:[0-9a-f]*'))"; exit 1; }
+timeout 120 fastboot boot $D/test.img >/dev/null 2>&1 || { echo boot failed; exit 1; }
 for i in $(seq 1 60); do lsusb | grep -q 05ac && break; sleep 2; done
 rm -f $S/test-console.log $S/test-k.log
 for i in $(seq 1 20); do timeout 2 python3 devices/akita/tools/usbmux-log.py /dev/null >/dev/null 2>&1; [ $? -eq 124 ] && break; sleep 2; done
