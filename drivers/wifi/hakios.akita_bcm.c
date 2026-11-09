@@ -34,6 +34,9 @@
  *   7  talks   the events this driver wants ("event_msgs"), power saving off ("mpc" 0), infrastructure mode, the
  *              radio up (WLC_UP), an escan of every channel (scan parameters version 2 if "scan_ver" says so), the
  *              access points it heard: name, band, channel, signal, protection (BSSIDs shortened in the log)
+ *   8  talks   the network of fw/network (a name and a passphrase, the tester's; only their lengths in the log)
+ *              joined as WPA2-PSK with AES, the firmware's own supplicant ("sup_wpa", WLC_SET_WSEC_PMK with the
+ *              passphrase), WLC_SET_SSID; the events awaited: set SSID, link, the supplicant's "keyed"
  * The chip is left running, polled (no interrupts yet); the chip's deep-sleep requests are acked as brcmfmac does.
  *
  * How the chip is reached: BAR0 (64 KB at 0x60200000) shows 4 KB of the chip's backplane at the address in its
@@ -841,6 +844,9 @@ static struct heard {
 static unsigned heard_count;
 static bool escan_done;
 static int escan_status = -1;
+static int join_status = -1;            /* SET_SSID's status (0: joined), -1: not yet */
+static bool link_up, keyed;
+static int psk_status = -1;
 
 static void
 escan_result(const uint8_t *d, uint32_t len)
@@ -908,7 +914,35 @@ event_handle(const uint8_t *frame, uint32_t length)
 		}
 		return;
 	}
-	printf("wifi: %u: event %u, status %u, reason %u, %u bytes\n", step, type, status, reason, datalen);
+	uint16_t flags = (uint16_t)(e[2] << 8 | e[3]);
+	const char *name = "";
+
+	switch (type) {
+	case EV_SET_SSID:
+		name = " (set SSID: 0 joined, 1 failed, 2 no network, 3 timeout)";
+		join_status = (int)status;
+		break;
+	case EV_AUTH: name = " (authentication)"; break;
+	case EV_ASSOC: name = " (association)"; break;
+	case EV_DEAUTH: case EV_DEAUTH_IND: name = " (deauthenticated)"; link_up = keyed = false; break;
+	case EV_DISASSOC_IND: name = " (disassociated)"; link_up = keyed = false; break;
+	case EV_LINK:
+		link_up = (flags & 1) != 0;
+		name = link_up ? " (link up)" : " (link down)";
+		if (!link_up) {
+			keyed = false;
+		}
+		break;
+	case EV_PSK_SUP:
+		psk_status = (int)status;
+		keyed = status == 6;
+		name = status == 6 ? " (supplicant: keys set)" : " (supplicant: 4 authenticating, 5 key exchange, 6 keyed, 7 timeout)";
+		break;
+	case EV_COUNTRY_CODE_CHANGED: name = " (country code changed)"; break;
+	case EV_IF: name = " (interface)"; break;
+	}
+	printf("wifi: %u: event %u%s, status %u, reason %u, flags 0x%x, %u bytes\n", step, type, name, status, reason, flags,
+	    datalen);
 }
 
 static void
@@ -1311,6 +1345,109 @@ scan_all(void)
 	}
 }
 
+/*
+ * The network to join: fw/network of the small image (fw-wifi/network of the build, the tester's, never in a
+ * repository): its name on the first line, its passphrase on the second (as upstream's hakios_wifi_network). Only
+ * their lengths go into the log.
+ */
+static bool
+network_file(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length)
+{
+	uint64_t size = 0;
+	const uint8_t *file = hakios_image_file("fw", "network", &size, NULL), *end, *line;
+	unsigned lengths[2] = { 0, 0 }, sizes[2] = { *name_length, *passphrase_length };
+	uint8_t *where[2] = { name, passphrase };
+
+	if (file == NULL) {
+		printf("wifi: %u: no fw/network in the small image (fw-wifi/network: a name, a passphrase): nothing to join\n",
+		    step);
+		return false;
+	}
+	end = file + size;
+	line = file;
+	for (unsigned n = 0; n < 2 && line < end; n++) {
+		const uint8_t *stop = line;
+
+		while (stop < end && *stop != '\n') {
+			stop++;
+		}
+		lengths[n] = (unsigned)(stop - line) - (stop > line && stop[-1] == '\r' ? 1 : 0);
+		if (lengths[n] > sizes[n]) {
+			lengths[n] = 0;
+		} else {
+			memcpy(where[n], line, lengths[n]);
+		}
+		line = stop + 1;
+	}
+	printf("wifi: %u: fw/network: a name of %u bytes and a passphrase of %u bytes%s\n", step, lengths[0], lengths[1],
+	    lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63 ? ": NOT A NAME OF 1 TO 32 BYTES AND A PASSPHRASE OF 8 TO 63" :
+	    "");
+	if (lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63) {
+		return false;
+	}
+	*name_length = lengths[0];
+	*passphrase_length = lengths[1];
+	return true;
+}
+
+/* step 8: WPA2-PSK (AES) with the firmware's supplicant: the passphrase handed over, the SSID set, the events awaited */
+static void
+join_network(void)
+{
+	uint8_t name[32], pass[64], pmk[2 + 2 + 256 + 2], params[52];
+	unsigned name_len = sizeof(name), pass_len = sizeof(pass);
+	int err;
+
+	bzero(name, sizeof(name));
+	bzero(pass, sizeof(pass));
+	if (!network_file(name, &name_len, pass, &pass_len)) {
+		return;
+	}
+	printf("wifi: 8: \"wpa_auth\" WPA2-PSK: %d; \"auth\" open: %d; \"wsec\" AES: %d; \"sup_wpa\" 1: %d\n",
+	    iovar_int("wpa_auth", 0x80), iovar_int("auth", 0), iovar_int("wsec", 4), iovar_int("sup_wpa", 1));
+
+	/* WLC_SET_WSEC_PMK: the passphrase itself (flag 1); this firmware's structure has room for 256 bytes and a TLV length */
+	bzero(pmk, sizeof(pmk));
+	put16(pmk, 0, (uint16_t)pass_len);
+	put16(pmk, 2, 1);
+	memcpy(pmk + 4, pass, pass_len);
+	err = bcm_ioctl(268, pmk, sizeof(pmk), NULL, sizeof(pmk));
+	bzero(pmk, sizeof(pmk));
+	bzero(pass, sizeof(pass));
+	bzero(mb.ioctl_req, IOCTL_MAX);
+	printf("wifi: 8: the passphrase handed over: %d\n", err);
+
+	/* WLC_SET_SSID: the name, any BSSID, every channel */
+	bzero(params, sizeof(params));
+	put32(params, 0, name_len);
+	memcpy(params + 4, name, name_len);
+	memset(params + 36, 0xff, 6);
+	put32(params, 44, 0);
+	join_status = -1;
+	psk_status = -1;
+	link_up = keyed = false;
+	uint64_t t0 = mach_absolute_time();
+
+	err = bcm_ioctl(26, params, sizeof(params), NULL, sizeof(params));
+	printf("wifi: 8: join asked: %d\n", err);
+	if (err != 0) {
+		return;
+	}
+	while (!keyed && micros_since(t0) < 20000000 && (join_status <= 0)) {
+		if (d2h_ctrl_poll() == 0) {
+			sleep_ms(5);
+		}
+	}
+	printf("wifi: 8: after %llu ms: join %d, link %s, supplicant %d: %s\n", micros_since(t0) / 1000, join_status,
+	    link_up ? "up" : "down", psk_status, keyed ? "JOINED, the keys set" : "not joined");
+	/* a while longer, to see whether the access point keeps us */
+	for (unsigned i = 0; i < 100; i++) {
+		(void)d2h_ctrl_poll();
+		sleep_ms(50);
+	}
+	printf("wifi: 8: 5 s later: link %s, keys %s\n", link_up ? "up" : "down", keyed ? "set" : "not set");
+}
+
 void
 akita_bcm_run(void)
 {
@@ -1541,5 +1678,11 @@ akita_bcm_run(void)
 		return;
 	}
 	scan_all();
+	console_say(shared);
+
+	if (!announce(8, "talks: the network of fw/network joined, WPA2-PSK by the firmware's own supplicant")) {
+		return;
+	}
+	join_network();
 	console_say(shared);
 }

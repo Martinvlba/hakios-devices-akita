@@ -9,7 +9,9 @@ env -u RC -u JOBS BIG_IN_ROOT=1 RC_JOBS=${JOBFILE:-rc.jobs.maldraw} HAKIOS_METAL
 # the safety arguments first (a long command line loses its end: the loader keeps 607 characters, ~110 of them its own),
 # unless BOOTARGS gives them itself
 SAFE=""; case "$BOOTARGS" in *usb_lost_reboot=*) ;; *) SAFE="usb_lost_reboot=90";; esac
-case "$BOOTARGS" in *test_reboot_after=*) ;; *) SAFE="$SAFE test_reboot_after=600";; esac
+# the tester, 11-09 23:20: no ten-minute restart while he tests by hand, until 2026-11-10 13:30 (Tallinn); then 600 again
+TRA=600; [ "$(date +%s)" -lt "$(date -d '2026-11-10 13:30' +%s)" ] && TRA=0
+case "$BOOTARGS" in *test_reboot_after=*) ;; *) SAFE="$SAFE test_reboot_after=$TRA";; esac
 CMDLINE="debug=0x8 $SAFE cpus=9 touchscreen=1 buttons=1 fuelgauge=1 usbmux=1 usb_serial=d6ca5f8da676e44a1ed9455d72d070481d33dd9e ${THERMAL-thermal=1 dvfs=1} root_apfs=ufs_darwin ufs=2 ufs_write=1 var_hfs=ufs_darwin_data mali_keep=1 metal=1 metal_plugin=../../../redwood/lib/HakiosMetal display_flip=1 $BOOTARGS"
 [ ${#CMDLINE} -gt 495 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the loader keeps with its own (~495 of 607); shorten BOOTARGS"; exit 1; }
 xnuloader/mkpayload.py -o $D/test-payload.bin kernel=hakios-kernel ramdisk=userland/root.apfs resident=userland/flashboot.apfs --cmdline "$CMDLINE" >/dev/null && tools/mkubootimg.py -d akita -p $D/test-payload.bin -o $D/test.img >/dev/null || exit 1
