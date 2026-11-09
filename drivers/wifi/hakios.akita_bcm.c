@@ -22,7 +22,16 @@
  *   4  runs    the ARM let go; the word at the top of memory awaited until it is no longer the length token: it is
  *              then the address of pcie_shared (Android: 0x8d7a98 after ~770 ms). Its flags (protocol version...)
  *              and the firmware's console (its own log, in its memory) are read into the log
- * The chip is left running: the next steps (the message rings) build on it.
+ *   5  writes  the message rings (msgbuf, protocol 7) in host memory -- the five common rings (H2D control and rx
+ *              post, D2H control, tx and rx completions), the index arrays the chip DMAs its read and write indices
+ *              to and from (the "DMA indices" its flags offer), brcmfmac's scratch and ring-update buffers --, all
+ *              described in the chip's ring table; "host ready" (doorbell 1); 8 ioctl-answer and 8 event buffers
+ *              posted on the control ring
+ *   6  talks   the first ioctls: "ver" (the firmware's version, the line Android logs), "cur_etheraddr" (only its
+ *              first and last bytes in the log); then the regulatory database (fw/bcmdhd_clm.blob_4383_a3, "clmload")
+ *              and the transmit caps (fw/bcmdhd_txcap.blob_4383_a3, "txcapload") in chunks of 1400 bytes; events
+ *              the firmware sends meanwhile are said by number
+ * The chip is left running, polled (no interrupts yet); the chip's deep-sleep requests are acked as brcmfmac does.
  *
  * How the chip is reached: BAR0 (64 KB at 0x60200000) shows 4 KB of the chip's backplane at the address in its
  * configuration register 0x80 (the "BAR0 window"); BAR0 + 0x2000 is always the PCIe core's registers. BAR2 (4 MB at
@@ -43,11 +52,13 @@
 #include <sys/random.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
+#include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern uint64_t mach_absolute_time(void);
+extern uint64_t kvtophys(vm_offset_t va);
 extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 
 /* from hakios.akita_pcie.c: the chip's configuration space (through the root complex's window) and its BARs */
@@ -547,30 +558,43 @@ nvram_vars(const uint8_t *text, uint64_t length, uint8_t **out, uint32_t *alloca
 
 /* ---- the sequence ---- */
 
+/* the firmware's console: what it has written since the last look (its buffer is a ring) */
+static uint32_t console_read;
+
 static void
 console_say(uint32_t shared)
 {
-	uint32_t console = mem_rd(shared + SHARED_CONSOLE_ADDR), buf, size, widx;
+	static uint32_t console, buf, size;
+	uint32_t widx;
 
-	if (console < ram_base || console >= ram_base + ram_size) {
-		printf("wifi: %u: no console (0x%08x)\n", step, console);
-		return;
+	if (console == 0) {
+		console = mem_rd(shared + SHARED_CONSOLE_ADDR);
+		if (console < ram_base || console >= ram_base + ram_size) {
+			printf("wifi: %u: no console (0x%08x)\n", step, console);
+			console = 0;
+			return;
+		}
+		buf = mem_rd(console + CONSOLE_BUF_ADDR);
+		size = mem_rd(console + CONSOLE_BUF_SIZE);
+		printf("wifi: %u: the firmware's console at 0x%08x: buffer 0x%08x, %u bytes\n", step, console, buf, size);
+		if (buf < ram_base || size == 0 || size > 0x10000 || buf + size > ram_base + ram_size) {
+			console = 0;
+			return;
+		}
 	}
-	buf = mem_rd(console + CONSOLE_BUF_ADDR);
-	size = mem_rd(console + CONSOLE_BUF_SIZE);
 	widx = mem_rd(console + CONSOLE_WRITE_IDX);
-	printf("wifi: %u: the firmware's console at 0x%08x: buffer 0x%08x, %u bytes, written to %u\n", step, console, buf,
-	    size, widx);
-	if (buf < ram_base || size == 0 || size > 0x10000 || buf + size > ram_base + ram_size || widx >= size) {
+	if (widx >= size) {
 		return;
 	}
 	char line[160];
 	unsigned n = 0;
 
-	for (uint32_t i = 0; i < widx; i++) {
+	while (console_read != widx) {
+		uint32_t i = console_read;
 		uint32_t w = mem_rd(buf + (i & ~3u));
 		char c = (char)(w >> (8 * (i & 3)));
 
+		console_read = (i + 1) % size;
 		if (c == '\n' || c == 0 || n == sizeof(line) - 1) {
 			if (n) {
 				line[n] = 0;
@@ -587,6 +611,505 @@ console_say(uint32_t shared)
 		line[n] = 0;
 		printf("wifi: fw: %s\n", line);
 	}
+}
+
+/* ---- the message rings (msgbuf, protocol 7: brcmfmac's pcie.c and msgbuf.c, Google's bcmpcie.h) ---- */
+
+#define CFG_SBMBX               0x98            /* host -> chip mailbox interrupt (configuration space) */
+#define PCIE_H2D_MAILBOX_0      0xa20           /* the doorbell: "a ring has new items" (core rev >= 64) */
+#define PCIE_H2D_MAILBOX_1      0xa24           /* "the host is ready" */
+#define PCIE_MAILBOX_INT        0xc30
+#define PCIE_MAILBOX_MASK       0xc34
+#define SHARED_FLAG_HOSTRDY     0x10000000u
+#define SHARED_DMA_SCRATCH_LEN  52
+#define SHARED_DMA_SCRATCH_ADDR 56
+#define SHARED_DMA_RINGUPD_LEN  64
+#define SHARED_DMA_RINGUPD_ADDR 68
+#define D2H_MB_DS_ENTER_REQ     0x2u
+#define D2H_MB_DS_EXIT_NOTE     0x4u
+#define D2H_MB_FWHALT           0x10000000u
+#define H2D_MB_DS_ACK           0x2u
+
+#define MSG_GEN_STATUS          0x1
+#define MSG_RING_STATUS         0x2
+#define MSG_IOCTLPTR_REQ        0x9
+#define MSG_IOCTLPTR_REQ_ACK    0xa
+#define MSG_IOCTLRESP_BUF_POST  0xb
+#define MSG_IOCTL_CMPLT         0xc
+#define MSG_EVENT_BUF_POST      0xd
+#define MSG_WL_EVENT            0xe
+
+#define WLC_GET_VAR             262
+#define WLC_SET_VAR             263
+#define IOCTL_REQ_ID            0xfffeu
+#define IOCTL_MAX               1518            /* what one request may carry (an Ethernet frame) */
+
+#define RING_H2D_CTRL           0               /* the five common rings, in this order in the chip's table */
+#define RING_H2D_RXPOST         1
+#define RING_D2H_CTRL           2
+#define RING_D2H_TXCPL          3
+#define RING_D2H_RXCPL          4
+#define RINGS                   5
+#define CTRL_BUFS               8               /* ioctl response buffers posted, and as many for events */
+#define CTRL_BUF_SIZE           8192
+
+static const uint16_t ring_items[RINGS] = { 64, 1024, 64, 1024, 1024 };
+static const uint16_t ring_item_size[RINGS] = { 40, 32, 24, 24, 40 };
+
+static struct {
+	vm_offset_t va;                 /* the uncached view */
+	uint64_t pa;
+	uint32_t size, used;
+} dma;
+
+static struct {
+	uint8_t *ring[RINGS];
+	uint64_t ring_pa[RINGS];
+	uint16_t w[RINGS], r[RINGS];    /* ours: H2D write, D2H read */
+	volatile uint32_t *idx;         /* the index arrays the chip DMAs to and from (4 bytes each) */
+	unsigned h2d_w, h2d_r, d2h_w, d2h_r;    /* where each array starts in idx[] */
+	uint8_t *ioctl_req;
+	uint64_t ioctl_req_pa;
+	uint8_t *ctrl_buf[2 * CTRL_BUFS];       /* request ids 1..8 ioctl responses, 9..16 events */
+	uint64_t ctrl_buf_pa[2 * CTRL_BUFS];
+	uint16_t trans_id;
+	bool ioctl_done;
+	int16_t ioctl_status;
+	uint16_t ioctl_len;
+	uint32_t ioctl_buf;             /* the request id of the buffer holding the answer */
+	uint32_t shared, h2d_mb, d2h_mb, rx_dataoffset;
+	uint32_t tcm_h2d_r;             /* the chip's own array of H2D read indices (4 bytes apart) */
+	unsigned events;
+} mb;
+
+/* how far the chip has read an H2D ring: from the array it DMAs to us, or (if that has not moved) its own */
+static uint16_t
+h2d_read_index(unsigned ring)
+{
+	uint16_t r = (uint16_t)mb.idx[mb.h2d_r + ring];
+
+	if (r == mb.w[ring] || mb.tcm_h2d_r == 0) {
+		return r;
+	}
+	return (uint16_t)mem_rd(mb.tcm_h2d_r + 4 * ring);
+}
+
+/* one physically contiguous piece, its cache flushed and seen through an uncached mapping from then on */
+static bool
+dma_init(uint32_t size)
+{
+	vm_offset_t cached = 0;
+
+	size = (uint32_t)round_page(size);
+	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return false;
+	}
+	bzero((void *)cached, size);
+	for (vm_offset_t line = cached; line < cached + size; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	dma.pa = kvtophys(cached);
+	dma.va = ml_io_map_unmappable(dma.pa, size, VM_WIMG_WCOMB);
+	dma.size = size;
+	dma.used = 0;
+	return dma.va != 0;
+}
+
+static void *
+dma_take(uint32_t size, uint64_t *pa)
+{
+	uint32_t at = (dma.used + 4095) & ~4095u;
+
+	if (at + size > dma.size) {
+		return NULL;
+	}
+	dma.used = at + size;
+	*pa = dma.pa + at;
+	return (void *)(dma.va + at);
+}
+
+static inline void
+put16(uint8_t *p, uint32_t off, uint16_t v)
+{
+	*(volatile uint16_t *)(p + off) = v;
+}
+
+static inline void
+put32(uint8_t *p, uint32_t off, uint32_t v)
+{
+	*(volatile uint32_t *)(p + off) = v;
+}
+
+static inline uint16_t
+get16(const uint8_t *p, uint32_t off)
+{
+	return *(const volatile uint16_t *)(p + off);
+}
+
+static inline uint32_t
+get32(const uint8_t *p, uint32_t off)
+{
+	return *(const volatile uint32_t *)(p + off);
+}
+
+static void
+mb_data_send(uint32_t value)
+{
+	for (unsigned i = 0; i < 100 && mem_rd(mb.h2d_mb) != 0; i++) {
+		sleep_ms(10);
+	}
+	mem_wr(mb.h2d_mb, value);
+	wr(cfg, CFG_SBMBX, 1);
+}
+
+/* the chip's mailbox word: deep sleep requests answered (as brcmfmac), a halt said */
+static void
+mb_data_check(void)
+{
+	uint32_t d = mem_rd(mb.d2h_mb);
+
+	if (d == 0) {
+		return;
+	}
+	mem_wr(mb.d2h_mb, 0);
+	printf("wifi: %u: the chip's mailbox: 0x%08x%s%s%s\n", step, d, (d & D2H_MB_DS_ENTER_REQ) ? " (deep sleep asked: acked)" :
+	    "", (d & D2H_MB_DS_EXIT_NOTE) ? " (deep sleep over)" : "", (d & D2H_MB_FWHALT) ? " (THE FIRMWARE HALTED)" : "");
+	if (d & D2H_MB_DS_ENTER_REQ) {
+		mb_data_send(H2D_MB_DS_ACK);
+	}
+}
+
+/* room for one item on an H2D ring, or NULL */
+static uint8_t *
+h2d_reserve(unsigned ring)
+{
+	unsigned h = ring;              /* the H2D rings' index in the arrays */
+	uint16_t next = (uint16_t)((mb.w[ring] + 1) % ring_items[ring]);
+
+	if (next == (uint16_t)mb.idx[mb.h2d_r + h] && next == h2d_read_index(ring)) {
+		return NULL;
+	}
+	uint8_t *item = mb.ring[ring] + (uint32_t)mb.w[ring] * ring_item_size[ring];
+
+	bzero(item, ring_item_size[ring]);
+	return item;
+}
+
+static void
+h2d_commit(unsigned ring, unsigned count)
+{
+	mb.w[ring] = (uint16_t)((mb.w[ring] + count) % ring_items[ring]);
+	mb.idx[mb.h2d_w + ring] = mb.w[ring];
+	__asm__ volatile ("dsb sy" ::: "memory");
+	pcie_wr(PCIE_H2D_MAILBOX_0, 1);
+}
+
+static void
+event_say(const uint8_t *frame, uint32_t length)
+{
+	/* an Ethernet header (14), Broadcom's (10: subtype, length, version, OUI, user subtype), then the event, big-endian */
+	if (length < 24 + 24) {
+		printf("wifi: %u: an event of %u bytes\n", step, length);
+		return;
+	}
+	const uint8_t *e = frame + 24;
+	uint32_t type = (uint32_t)e[4] << 24 | (uint32_t)e[5] << 16 | (uint32_t)e[6] << 8 | e[7];
+	uint32_t status = (uint32_t)e[8] << 24 | (uint32_t)e[9] << 16 | (uint32_t)e[10] << 8 | e[11];
+	uint32_t reason = (uint32_t)e[12] << 24 | (uint32_t)e[13] << 16 | (uint32_t)e[14] << 8 | e[15];
+
+	printf("wifi: %u: event %u, status %u, reason %u\n", step, type, status, reason);
+}
+
+static void
+ctrl_buf_post(uint32_t id)
+{
+	uint8_t *item = h2d_reserve(RING_H2D_CTRL);
+
+	if (item == NULL) {
+		printf("wifi: %u: the control ring is full\n", step);
+		return;
+	}
+	item[0] = id <= CTRL_BUFS ? MSG_IOCTLRESP_BUF_POST : MSG_EVENT_BUF_POST;
+	put32(item, 4, id);
+	put16(item, 8, CTRL_BUF_SIZE);
+	put32(item, 16, (uint32_t)mb.ctrl_buf_pa[id - 1]);
+	put32(item, 20, (uint32_t)(mb.ctrl_buf_pa[id - 1] >> 32));
+	h2d_commit(RING_H2D_CTRL, 1);
+}
+
+/* what the chip has put on its control completion ring */
+static unsigned
+d2h_ctrl_poll(void)
+{
+	unsigned n = 0;
+	uint16_t w = (uint16_t)mb.idx[mb.d2h_w + (RING_D2H_CTRL - 2)];
+
+	if (w >= ring_items[RING_D2H_CTRL]) {
+		return 0;
+	}
+	while (mb.r[RING_D2H_CTRL] != w) {
+		const uint8_t *m = mb.ring[RING_D2H_CTRL] + (uint32_t)mb.r[RING_D2H_CTRL] * ring_item_size[RING_D2H_CTRL];
+		uint8_t type = m[0];
+		uint32_t id = get32(m, 4);
+
+		switch (type) {
+		case MSG_IOCTLPTR_REQ_ACK:
+			if ((int16_t)get16(m, 8) != 0) {
+				printf("wifi: %u: ioctl not taken: status %d\n", step, (int16_t)get16(m, 8));
+			}
+			break;
+		case MSG_IOCTL_CMPLT:
+			mb.ioctl_status = (int16_t)get16(m, 8);
+			mb.ioctl_len = get16(m, 12);
+			mb.ioctl_buf = id;
+			mb.ioctl_done = true;
+			break;
+		case MSG_WL_EVENT:
+			if (id > CTRL_BUFS && id <= 2 * CTRL_BUFS) {
+				event_say(mb.ctrl_buf[id - 1] + mb.rx_dataoffset, get16(m, 12));
+				mb.events++;
+				ctrl_buf_post(id);
+			}
+			break;
+		case MSG_GEN_STATUS:
+		case MSG_RING_STATUS:
+			printf("wifi: %u: %s status %d (ring %u)\n", step, type == MSG_GEN_STATUS ? "general" : "ring",
+			    (int16_t)get16(m, 8), get16(m, 10));
+			break;
+		default:
+			printf("wifi: %u: message type 0x%x on the control completion ring\n", step, type);
+		}
+		mb.r[RING_D2H_CTRL] = (uint16_t)((mb.r[RING_D2H_CTRL] + 1) % ring_items[RING_D2H_CTRL]);
+		mb.idx[mb.d2h_r + (RING_D2H_CTRL - 2)] = mb.r[RING_D2H_CTRL];
+		n++;
+	}
+	mb_data_check();
+	return n;
+}
+
+/*
+ * One ioctl: `cmd`, `in` (of `in_len`, the input) and room for `out_len` in the answer; the answer is copied into
+ * `out` (up to out_len). Returns the firmware's status (0: done), or -1000 for no answer within 2 s.
+ */
+static int
+bcm_ioctl(uint32_t cmd, const void *in, uint32_t in_len, void *out, uint32_t out_len)
+{
+	uint8_t *item;
+	uint32_t len = in_len > out_len ? in_len : out_len;
+
+	if (len > IOCTL_MAX) {
+		len = IOCTL_MAX;
+	}
+	if ((item = h2d_reserve(RING_H2D_CTRL)) == NULL) {
+		return -1001;
+	}
+	bzero(mb.ioctl_req, IOCTL_MAX);
+	memcpy(mb.ioctl_req, in, in_len > IOCTL_MAX ? IOCTL_MAX : in_len);
+	mb.trans_id++;
+	mb.ioctl_done = false;
+	item[0] = MSG_IOCTLPTR_REQ;
+	put32(item, 4, IOCTL_REQ_ID);
+	put32(item, 8, cmd);
+	put16(item, 12, mb.trans_id);
+	put16(item, 14, (uint16_t)len);
+	/* the answer's room: never less than the request (the firmware answers in place: brcmfmac sends the longer) */
+	put16(item, 16, (uint16_t)(out_len > len ? (out_len > CTRL_BUF_SIZE ? CTRL_BUF_SIZE : out_len) : len));
+	put32(item, 24, (uint32_t)mb.ioctl_req_pa);
+	put32(item, 28, (uint32_t)(mb.ioctl_req_pa >> 32));
+	h2d_commit(RING_H2D_CTRL, 1);
+
+	uint64_t t0 = mach_absolute_time();
+
+	while (!mb.ioctl_done && micros_since(t0) < 2000000) {
+		if (d2h_ctrl_poll() == 0) {
+			delay(200);
+		}
+	}
+	if (!mb.ioctl_done) {
+		return -1000;
+	}
+	if (mb.ioctl_buf >= 1 && mb.ioctl_buf <= CTRL_BUFS) {
+		if (out && out_len) {
+			uint32_t n = mb.ioctl_len < out_len ? mb.ioctl_len : out_len;
+
+			memcpy(out, mb.ctrl_buf[mb.ioctl_buf - 1] + mb.rx_dataoffset, n);
+		}
+		ctrl_buf_post(mb.ioctl_buf);
+	}
+	return mb.ioctl_status;
+}
+
+/* an iovar: its name, a NUL, the data */
+static int
+iovar_get(const char *name, void *out, uint32_t out_len)
+{
+	uint8_t req[IOCTL_MAX];
+	uint32_t n = (uint32_t)strlen(name) + 1;
+
+	bzero(req, sizeof(req));
+	memcpy(req, name, n);
+	return bcm_ioctl(WLC_GET_VAR, req, n > out_len ? n : out_len, out, out_len);
+}
+
+static int
+iovar_set(const char *name, const void *data, uint32_t len)
+{
+	uint8_t req[IOCTL_MAX];
+	uint32_t n = (uint32_t)strlen(name) + 1;
+
+	if (n + len > sizeof(req)) {
+		return -1002;
+	}
+	memcpy(req, name, n);
+	memcpy(req + n, data, len);
+	return bcm_ioctl(WLC_SET_VAR, req, n + len, NULL, n + len);
+}
+
+/* a blob (the CLM's regulatory data, the transmit caps) in chunks of 1400 bytes, as brcmfmac's brcmf_c_download_blob */
+static int
+blob_load(const char *file, const char *var, const char *status_var)
+{
+	uint64_t size = 0;
+	const uint8_t *data = hakios_image_file("fw", file, &size, NULL);
+	uint8_t chunk[12 + 1400];
+	uint32_t done = 0, status = 0xffffffffu;
+	int err = 0;
+
+	if (data == NULL || size == 0) {
+		printf("wifi: %u: no fw/%s\n", step, file);
+		return -1;
+	}
+	while (done < size && err == 0) {
+		uint32_t n = size - done > 1400 ? 1400 : (uint32_t)(size - done);
+		uint16_t flag = (uint16_t)(1u << 12);   /* the downloader's version, 1 */
+
+		if (done == 0) {
+			flag |= 0x2;            /* begin */
+		}
+		if (done + n == size) {
+			flag |= 0x4;            /* end */
+		}
+		memcpy(chunk, &flag, 2);
+		uint16_t type = 2;      /* (the CLM's type; the transmit caps are loaded the same way) */
+		uint32_t len32 = n, crc = 0;
+
+		memcpy(chunk + 2, &type, 2);
+		memcpy(chunk + 4, &len32, 4);
+		memcpy(chunk + 8, &crc, 4);
+		memcpy(chunk + 12, data + done, n);
+		err = iovar_set(var, chunk, 12 + n);
+		done += n;
+	}
+	(void)iovar_get(status_var, &status, sizeof(status));
+	printf("wifi: %u: fw/%s: %llu bytes by \"%s\": %d, \"%s\" %u%s\n", step, file, size, var, err, status_var, status,
+	    err == 0 && status == 0 ? " (loaded)" : "");
+	return err != 0 ? err : (int)status;
+}
+
+/* step 5: the rings set up, the chip told the host is ready, buffers posted for answers and events */
+static bool
+rings_up(uint32_t shared)
+{
+	uint32_t ringinfo = mem_rd(shared + SHARED_RING_INFO_ADDR), ringmem, max_sub, max_cpl, flags;
+	uint64_t pa;
+
+	mb.shared = shared;
+	mb.h2d_mb = mem_rd(shared + SHARED_H2D_MB_ADDR);
+	mb.d2h_mb = mem_rd(shared + SHARED_D2H_MB_ADDR);
+	mb.rx_dataoffset = mem_rd(shared + SHARED_RX_DATAOFFSET);
+	flags = mem_rd(shared + SHARED_FLAGS);
+	ringmem = mem_rd(ringinfo + 0);
+	mb.tcm_h2d_r = mem_rd(ringinfo + 8);
+	max_sub = mem_rd(ringinfo + 52) >> 16;          /* (max_tx_flowrings at +52, max_submission_queues +54) */
+	max_cpl = mem_rd(ringinfo + 56) & 0xffff;
+	printf("wifi: 5: ring info 0x%08x: ring memory 0x%08x, %u flow rings, %u submission, %u completion rings, %u "
+	    "virtual interfaces; TCM index arrays 0x%08x 0x%08x 0x%08x 0x%08x\n", ringinfo, ringmem, mem_rd(ringinfo + 52) & 0xffff,
+	    max_sub, max_cpl, mem_rd(ringinfo + 56) >> 16, mem_rd(ringinfo + 4), mem_rd(ringinfo + 8), mem_rd(ringinfo + 12),
+	    mem_rd(ringinfo + 16));
+	if (max_sub < 2 || max_sub > 600 || max_cpl < 3 || max_cpl > 64 || ringmem < ram_base || ringmem >= ram_base + ram_size) {
+		printf("wifi: 5: not what a ring table looks like: stopped\n");
+		return false;
+	}
+	if (!dma_init(512 * 1024)) {
+		printf("wifi: 5: no memory in one piece for the rings: stopped\n");
+		return false;
+	}
+
+	/* the index arrays: H2D write, H2D read, D2H write, D2H read, 4 bytes an entry */
+	mb.idx = dma_take((2 * max_sub + 2 * max_cpl) * 4, &pa);
+	mb.h2d_w = 0;
+	mb.h2d_r = max_sub;
+	mb.d2h_w = 2 * max_sub;
+	mb.d2h_r = 2 * max_sub + max_cpl;
+	mem_wr(ringinfo + 20, (uint32_t)pa);
+	mem_wr(ringinfo + 24, (uint32_t)(pa >> 32));
+	mem_wr(ringinfo + 28, (uint32_t)(pa + max_sub * 4));
+	mem_wr(ringinfo + 32, (uint32_t)((pa + max_sub * 4) >> 32));
+	mem_wr(ringinfo + 36, (uint32_t)(pa + 2 * max_sub * 4));
+	mem_wr(ringinfo + 40, (uint32_t)((pa + 2 * max_sub * 4) >> 32));
+	mem_wr(ringinfo + 44, (uint32_t)(pa + (2 * max_sub + max_cpl) * 4));
+	mem_wr(ringinfo + 48, (uint32_t)((pa + (2 * max_sub + max_cpl) * 4) >> 32));
+
+	/* the five common rings, each described in the chip's ring memory (16 bytes a ring) */
+	for (unsigned i = 0; i < RINGS; i++) {
+		mb.ring[i] = dma_take((uint32_t)ring_items[i] * ring_item_size[i], &mb.ring_pa[i]);
+		if (mb.ring[i] == NULL) {
+			printf("wifi: 5: no room for ring %u: stopped\n", i);
+			return false;
+		}
+		uint32_t d = ringmem + 16 * i;
+
+		mem_wr(d + 4, (uint32_t)ring_items[i] | (uint32_t)ring_item_size[i] << 16);
+		mem_wr(d + 8, (uint32_t)mb.ring_pa[i]);
+		mem_wr(d + 12, (uint32_t)(mb.ring_pa[i] >> 32));
+		mb.w[i] = mb.r[i] = 0;
+	}
+
+	/* brcmfmac's scratch and ring-update buffers */
+	{
+		void *scratch = dma_take(8, &pa);
+
+		(void)scratch;
+		mem_wr(shared + SHARED_DMA_SCRATCH_ADDR, (uint32_t)pa);
+		mem_wr(shared + SHARED_DMA_SCRATCH_ADDR + 4, (uint32_t)(pa >> 32));
+		mem_wr(shared + SHARED_DMA_SCRATCH_LEN, 8);
+		void *ringupd = dma_take(1024, &pa);
+
+		(void)ringupd;
+		mem_wr(shared + SHARED_DMA_RINGUPD_ADDR, (uint32_t)pa);
+		mem_wr(shared + SHARED_DMA_RINGUPD_ADDR + 4, (uint32_t)(pa >> 32));
+		mem_wr(shared + SHARED_DMA_RINGUPD_LEN, 1024);
+	}
+	mb.ioctl_req = dma_take(IOCTL_MAX + 2, &mb.ioctl_req_pa);
+	for (unsigned i = 0; i < 2 * CTRL_BUFS; i++) {
+		mb.ctrl_buf[i] = dma_take(CTRL_BUF_SIZE, &mb.ctrl_buf_pa[i]);
+		if (mb.ctrl_buf[i] == NULL) {
+			printf("wifi: 5: no room for the control buffers: stopped\n");
+			return false;
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	printf("wifi: 5: rings in host memory at 0x%llx (%u KB used): index arrays %u+%u+%u+%u, control %u x %u, rx post %u "
+	    "x %u, completions %u x %u / %u x %u / %u x %u\n", dma.pa, dma.used >> 10, max_sub, max_sub, max_cpl, max_cpl,
+	    ring_items[0], ring_item_size[0], ring_items[1], ring_item_size[1], ring_items[2], ring_item_size[2], ring_items[3],
+	    ring_item_size[3], ring_items[4], ring_item_size[4]);
+
+	pcie_wr(PCIE_MAILBOX_INT, pcie_rd(PCIE_MAILBOX_INT));
+	if (flags & SHARED_FLAG_HOSTRDY) {
+		pcie_wr(PCIE_H2D_MAILBOX_1, 1);
+		printf("wifi: 5: host ready (doorbell 1)\n");
+	}
+	for (uint32_t id = 1; id <= 2 * CTRL_BUFS; id++) {
+		ctrl_buf_post(id);
+	}
+	sleep_ms(50);
+	(void)d2h_ctrl_poll();
+	printf("wifi: 5: %u ioctl and %u event buffers posted; the chip has read the control ring to %u (of %u written); "
+	    "mailbox interrupts 0x%08x\n", CTRL_BUFS, CTRL_BUFS, mb.idx[mb.h2d_r + RING_H2D_CTRL], mb.w[RING_H2D_CTRL],
+	    pcie_rd(PCIE_MAILBOX_INT));
+	return true;
 }
 
 void
@@ -772,4 +1295,46 @@ akita_bcm_run(void)
 	sleep_ms(500);
 	console_say(shared);
 	printf("wifi: 4: the BCM4383's firmware runs\n");
+
+	if (!announce(5, "writes: the message rings in host memory, the chip told the host is ready, buffers posted")) {
+		return;
+	}
+	if (!rings_up(shared)) {
+		console_say(shared);
+		return;
+	}
+	console_say(shared);
+
+	if (!announce(6, "talks: the first ioctls (\"ver\", \"cur_etheraddr\"), the regulatory and transmit-cap blobs")) {
+		return;
+	}
+	{
+		char ver[256];
+		uint8_t mac[6];
+		int err;
+
+		bzero(ver, sizeof(ver));
+		err = iovar_get("ver", ver, sizeof(ver) - 1);
+		for (unsigned i = 0; i < sizeof(ver) && ver[i]; i++) {
+			if (ver[i] == '\n') {
+				ver[i] = 0;
+			}
+		}
+		printf("wifi: 6: \"ver\": %d: %s\n", err, err == 0 ? ver : "(no answer)");
+		bzero(mac, sizeof(mac));
+		err = iovar_get("cur_etheraddr", mac, sizeof(mac));
+		/* (the address is the phone's: only its first and last bytes go into the log, as Android's driver does) */
+		printf("wifi: 6: \"cur_etheraddr\": %d: %02x:xx:xx:xx:xx:%02x\n", err, mac[0], mac[5]);
+		console_say(shared);
+		if (strncmp(ver, "wl0:", 4) == 0) {
+			(void)blob_load("bcmdhd_clm.blob_4383_a3", "clmload", "clmload_status");
+			(void)blob_load("bcmdhd_txcap.blob_4383_a3", "txcapload", "txcapload_status");
+		}
+		sleep_ms(200);
+		(void)d2h_ctrl_poll();
+		console_say(shared);
+		printf("wifi: 6: control ring: written to %u; read to %u by the array in host memory, %u by the chip's own\n",
+		    mb.w[RING_H2D_CTRL], mb.idx[mb.h2d_r + RING_H2D_CTRL], mem_rd(mb.tcm_h2d_r + 4 * RING_H2D_CTRL) & 0xffff);
+		printf("wifi: 6: %u events so far; the firmware answers\n", mb.events);
+	}
 }
