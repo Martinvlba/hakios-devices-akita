@@ -19,8 +19,8 @@
  *   5  reads   the chip: the address translation for configuration and memory accesses, the chip's configuration
  *              space (vendor, device, class, the sizes of its BARs), its BARs placed where Android places them, and
  *              through BAR0 its chipcommon core's identity register (chip 0x4383, revision 2 = a3)
- * After the last step everything is left as it is (the chip powered, the link up): the next driver, the Broadcom one,
- * takes over from there; a test build restarts by itself anyway.
+ * After the last step everything is left as it is (the chip powered, the link up); with wifi=N as well the chip's own
+ * steps follow (hakios.akita_bcm.c: its firmware started). A test build restarts by itself anyway.
  *
  * What the hardware is, and where each value comes from: Google's Android kernel for this phone (google-modules/soc/gs,
  * android-gs-akita-android16: drivers/pci/controller/dwc/pcie-exynos-rc.c, pcie-exynos-zuma-rc-cal.c, the pin banks
@@ -659,6 +659,24 @@ chip(void)
 	return (id & 0xffff) == 0x4383;
 }
 
+/* ---- for the chip's driver (hakios.akita_bcm.c) ---- */
+
+volatile uint8_t *akita_pcie_config(void);
+uint64_t akita_pcie_bar(unsigned n);
+void akita_bcm_run(void);
+
+volatile uint8_t *
+akita_pcie_config(void)
+{
+	return cfg;
+}
+
+uint64_t
+akita_pcie_bar(unsigned n)
+{
+	return n == 0 ? EP_BAR0 : n == 2 ? EP_BAR2 : n == 4 ? EP_BAR4 : 0;
+}
+
 /* ---- the sequence ---- */
 
 static void
@@ -723,6 +741,7 @@ pcie_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	cfg = (volatile uint8_t *)ml_io_map(PCIE1_CFG, PCIE1_CFG_SIZE);
 	if (chip()) {
 		printf("pcie: 5: the BCM4383 answers\n");
+		akita_bcm_run();        /* wifi=N: the chip's own steps */
 	}
 }
 
