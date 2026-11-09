@@ -2391,6 +2391,41 @@ akita_mali_reached(int g, unsigned int q)
 	return groups[g].q[q].seen;
 }
 
+/*
+ * For the display (MiniIOSurfaceDrawn, hakios.akita_gpu.cpp): what every queue has been given so far, and whether the GPU
+ * has done that much. A surface handed to the panel was drawn by work submitted before its swap; until that work is done
+ * the panel must not show it (11-10, the tester's videos: half the old picture and half the new, streaks in tile order --
+ * the Mali was still drawing the surface it showed). Under HakiosGPU's lock, as every other call here.
+ */
+unsigned akita_mali_snapshot(uint64_t *snap, unsigned most);
+bool akita_mali_done(const uint64_t *snap, unsigned n);
+
+unsigned
+akita_mali_snapshot(uint64_t *snap, unsigned most)
+{
+	unsigned n = 0;
+
+	for (unsigned g = 0; g < MAX_GROUPS; g++) {
+		for (unsigned q = 0; q < MAX_QUEUES && n < most; q++, n++) {
+			snap[n] = groups[g].used && q < groups[g].queues ? groups[g].q[q].submitted : 0;
+		}
+	}
+	return n;
+}
+
+bool
+akita_mali_done(const uint64_t *snap, unsigned n)
+{
+	for (unsigned i = 0; i < n; i++) {
+		unsigned g = i / MAX_QUEUES, q = i % MAX_QUEUES;
+
+		if (snap[i] != 0 && groups[g].used && q < groups[g].queues && akita_mali_reached((int)g, q) < snap[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /* every group's queues as the firmware sees them (a wait that timed out asks for this) */
 void akita_mali_debug(void);
 void

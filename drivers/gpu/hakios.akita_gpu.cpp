@@ -58,6 +58,8 @@ void akita_mali_debug(void);
 extern "C" int mali_irq_event;
 void akita_mali_info(uint32_t *regs, uint32_t *csif);
 void akita_gpu_start(void);
+unsigned akita_mali_snapshot(uint64_t *snap, unsigned most);
+bool akita_mali_done(const uint64_t *snap, unsigned n);
 }
 
 /* ---- panthor_drm.h and drm.h, as much as is answered here ---- */
@@ -411,6 +413,48 @@ HakiosGPUUserClient::syncSignal(uint32_t handle, uint64_t point, const struct fe
 	s->point[s->points] = point;
 	s->pf[s->points] = *f;
 	s->points++;
+}
+
+/*
+ * The display asks before it puts a surface on the panel (MiniIOMobileFramebuffer's show()): is the GPU done drawing it?
+ * Here (the Mali) it waits until every queue has done what it had been given by now -- the frame's own work was submitted
+ * before its swap, so it is among it (a later frame's may be too: a frame's wait can include the next one's work). Without
+ * this the panel showed surfaces the Mali was still drawing (11-10). Upstream's Adreno driver marks each surface with its
+ * own submission (hakios.gpu.cpp); the Mali's submissions do not name their buffers, hence all of it. True if done in time.
+ */
+static uint64_t gDrawnWaits, gDrawnWaitAbs, gDrawnLate;
+
+bool
+MiniIOSurfaceDrawn(__unused MiniIOSurface *surface, uint64_t milliseconds)
+{
+	uint64_t snap[64], deadline, t0 = mach_absolute_time();
+	unsigned n;
+	bool done;
+
+	if (gLock == NULL || !akita_mali_ready()) {
+		return true;
+	}
+	clock_interval_to_deadline((uint32_t)milliseconds, kMillisecondScale, &deadline);
+	IOLockLock(gLock);
+	n = akita_mali_snapshot(snap, 64);
+	while (!(done = akita_mali_done(snap, n)) && mach_absolute_time() < deadline) {
+		/* until the GPU's JOB interrupt (a submission done) or a millisecond, the lock dropped meanwhile */
+		IOLockUnlock(gLock);
+		assert_wait_timeout((event_t)&mali_irq_event, THREAD_UNINT, 1000, NSEC_PER_USEC);
+		thread_block(THREAD_CONTINUE_NULL);
+		IOLockLock(gLock);
+	}
+	IOLockUnlock(gLock);
+	gDrawnWaitAbs += mach_absolute_time() - t0;
+	gDrawnLate += !done;
+	if (++gDrawnWaits % 1200 == 0) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(gDrawnWaitAbs, &ns);
+		IOLog("HakiosGPU: the display waited for the GPU %llu us a frame on average over %llu frames (%llu not in time)\n",
+		    ns / 1000 / gDrawnWaits, gDrawnWaits, gDrawnLate);
+	}
+	return done;
 }
 
 /* waits, the lock dropped while it sleeps; true if they are done in time */
