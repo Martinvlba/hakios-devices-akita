@@ -164,6 +164,7 @@ static uint32_t ep0_status_type;        /* its TRB: two stages (no data) or thre
 static uint8_t pending_address = 0xff;
 
 static uint32_t seen_setups, seen_bulk_out, bulk_out_bytes, seen_events, start_result = 0xdead;
+static uint32_t bulk_out_at_config;     /* seen_bulk_out when the host last configured the phone (usb_watchdog) */
 static char serial[48] = "0000000000000000000000000000000000000000";
 
 static inline uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(regs + off); }
@@ -369,6 +370,7 @@ bulk_enable(void)
 	config_ep_only(PTP_IN, 2, BULK_MPS);
 	wr(DALEPENA, rd(DALEPENA) | (1u << BULK_OUT) | (1u << BULK_IN) | (1u << PTP_OUT) | (1u << PTP_IN));
 	bulk_on = true;
+	bulk_out_at_config = seen_bulk_out;
 	bulk_start_out();
 	ptp_out_running = false;
 	ptp_in_busy = false;
@@ -725,6 +727,39 @@ controller_start(void)
 	return true;
 }
 
+/*
+ * THE USB WATCHDOG (the tester, 11-09: a phone that lost its USB link could only be got back by hand): boot-arg
+ * usb_lost_reboot=SECONDS -- no host talking usbmux to the phone for that long (the mux's bulk endpoints off: cable out,
+ * a link that never came back; or a host that configured it and never sent a byte) restarts the phone, the file systems synced (reboot_kernel). With Android's slot
+ * active that is Android, where adb reaches it again. The first enumeration gets 3 minutes; 0 (the default): off.
+ */
+extern int reboot_kernel(int howto, char *message);
+static uint32_t lost_reboot_s;
+static uint64_t last_good;
+
+static void
+usb_watchdog(uint64_t now)
+{
+	static bool fired;
+	uint64_t limit;
+
+	if (lost_reboot_s == 0 || fired) {
+		return;
+	}
+	/* (a host that has spoken usbmux since it configured the phone: a host that only configured it -- Windows' own
+	 * driver when usbipd cannot take the device, 11-09 -- is no link this side can be reached over) */
+	if (bulk_on && seen_bulk_out != bulk_out_at_config) {
+		last_good = now;
+		return;
+	}
+	nanoseconds_to_absolutetime((uint64_t)lost_reboot_s * NSEC_PER_SEC, &limit);
+	if (now > last_good && now - last_good > limit) {     /* (last_good is ahead during the first grace) */
+		fired = true;
+		printf("akita usb: usb_lost_reboot: no host for %u s: restarting (to the active slot)\n", lost_reboot_s);
+		(void)reboot_kernel(0 /* RB_AUTOBOOT */, (char *)"akita usb: the USB link was lost");
+	}
+}
+
 /* a fresh start of the controller, asked from elsewhere (the battery driver, when the cable comes back): done by the poll
  * thread, which owns the controller */
 static volatile int restart_asked;
@@ -822,6 +857,16 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 	uint64_t now, last_busy = 0, next_status = 0, next_summary, busy_window, five_s, ten_min;
 	unsigned statuses = 0;
 
+	PE_parse_boot_argn("usb_lost_reboot", &lost_reboot_s, sizeof(lost_reboot_s));
+	{
+		uint64_t grace;
+		/* (the first enumeration: 3 minutes, or the limit if longer, from here) */
+		nanoseconds_to_absolutetime((uint64_t)(180 > lost_reboot_s ? 180 - lost_reboot_s : 0) * NSEC_PER_SEC, &grace);
+		last_good = mach_absolute_time() + grace;
+	}
+	if (lost_reboot_s) {
+		printf("akita usb: usb_lost_reboot=%u: the phone restarts after that long with no host\n", lost_reboot_s);
+	}
 	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &busy_window);
 	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &five_s);
 	nanoseconds_to_absolutetime(600 * NSEC_PER_SEC, &ten_min);
@@ -853,6 +898,25 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 			statuses = 0;           /* (the status lines again, to see the new link come up) */
 		}
 		bool busy = poll_events();
+
+		usb_watchdog(mach_absolute_time());
+		/* (boot-arg usb_stop_at=SECONDS: the phone taken off the bus then, as a pulled cable -- usb_lost_reboot's test) */
+		{
+			static uint32_t stop_s = ~0u;
+			static uint64_t stop_at;
+
+			if (stop_s == ~0u) {
+				stop_s = 0;
+				PE_parse_boot_argn("usb_stop_at", &stop_s, sizeof(stop_s));
+				nanoseconds_to_absolutetime((uint64_t)stop_s * NSEC_PER_SEC, &stop_at);
+			}
+			if (stop_s && mach_absolute_time() >= stop_at) {
+				stop_s = 0;
+				printf("akita usb: usb_stop_at: off the bus (a test of usb_lost_reboot)\n");
+				bulk_disable();
+				wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
+			}
+		}
 
 		busy = tx_service() || busy;
 		busy = ptp_service() || busy;
