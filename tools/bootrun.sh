@@ -5,6 +5,15 @@
 # usb_lost_reboot=0 in BOOTARGS turns it off -- the first one counts; test_reboot_after=600 too: a test build restarts
 # after ten minutes whatever happens, test_reboot_after=0 in BOOTARGS for a longer run); THERMAL= overrides "thermal=1 dvfs=1". Never set RC or JOBS (userland/build.sh reads them).
 cd ~/akita/hackios-kernel; D=~/akita/darwin-flash; S=${LOGDIR:-$HOME/akita/logs/run}; mkdir -p $S
+# GPU=1, the default unless the job file is mali_draw_test's own: CoreAnimation on the Mali (METAL_PLUGIN=ca with the
+# iPhone 11's library from ~/ca-share), the panel at 120 Hz, zero-copy scan-out. GPU=0: iOS draws in software -- what the
+# Wi-Fi/USB runs of 11-09 did by accident, 10-25 fps, the big cores at 75 C (the tester's video of 23:12 was one).
+# (The GPU arguments take ~140 of the 495 characters: 453 with them alone; GPU=0 when a test needs the room.)
+case "${JOBFILE:-rc.jobs.maldraw}" in rc.jobs.maldraw) GPU=${GPU-0};; *) GPU=${GPU-1};; esac
+if [ "$GPU" = 1 ]; then
+  export METAL_PLUGIN=${METAL_PLUGIN-ca} EXTRA_SHARE=${EXTRA_SHARE-$HOME/ca-share}
+  case "$BOOTARGS" in *ca_metallib=*) ;; *) BOOTARGS="ca_metallib=/redwood/share/ca-share/QuartzCore-default.metallib display_hz=120 fbwidth=1080 fbheight=2340 fbscale=3 fbsubtype=2340 fb_zc=1 $BOOTARGS";; esac
+fi
 env -u RC -u JOBS BIG_IN_ROOT=1 RC_JOBS=${JOBFILE:-rc.jobs.maldraw} HAKIOS_METAL_OUT=ios-mali LOCKDOWND=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh > $S/build-boot.log 2>&1 || { echo build failed; exit 1; }
 # the safety arguments first (a long command line loses its end: the loader keeps 607 characters, ~110 of them its own),
 # unless BOOTARGS gives them itself
