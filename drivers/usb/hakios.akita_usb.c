@@ -744,7 +744,16 @@ usb_watchdog(uint64_t now)
 	}
 	/* (a host that has spoken usbmux since it configured the phone: a host that only configured it -- Windows' own
 	 * driver when usbipd cannot take the device, 11-09 -- is no link this side can be reached over) */
-	if (bulk_on && seen_bulk_out != bulk_out_at_config) {
+	/* ... and a bus that is alive: the host's start-of-frame number (DSTS SOFFN, bits 3-16, a new one every 125 us)
+	 * still moving -- a controller that lost its link without a disconnect event, or a host that went, leaves it still
+	 * while the phone believes itself configured (11-09: Windows saw only a charger, and the watchdog waited) */
+	static uint32_t last_frame, frame_still;
+	uint32_t frame = (rd(DSTS) >> 3) & 0x3fff;
+	bool moving = frame != last_frame;
+
+	last_frame = frame;
+	frame_still = moving ? 0 : frame_still + 1;
+	if (bulk_on && seen_bulk_out != bulk_out_at_config && frame_still < 2000) {     /* (2000 looks: 2 s or more) */
 		last_good = now;
 		return;
 	}
