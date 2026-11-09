@@ -128,7 +128,10 @@ struct trb {
 static vm_offset_t regs, mem;           /* mem: the non-cacheable mapping */
 static uint64_t mem_pa;
 static uint32_t evt_pos;
-static uint32_t resource[4];
+/* each physical endpoint's transfer resource (DEPCMD's), by physical number: up to 32 on DWC3. It was 4, and PTP's
+ * endpoints 6, 7 (and the interrupt one, 9) wrote past it: over in_busy/ptp_*_running/in_zlp, and over the eUSB2 link's
+ * register mappings -- the replug's re-init then wrote through 0x600000000 and panicked (11-09) */
+static uint32_t resource[32];
 static bool bulk_on;
 
 /* for the battery's charger details (hakios.akita_battery.c): a computer has configured the mux interface */
@@ -722,6 +725,78 @@ controller_start(void)
 	return true;
 }
 
+/* a fresh start of the controller, asked from elsewhere (the battery driver, when the cable comes back): done by the poll
+ * thread, which owns the controller */
+static volatile int restart_asked;
+
+/*
+ * THE eUSB2 LINK AGAIN (U-Boot's `eusb init`, cmd/hakios_eusb.c, as Google's Linux driver brings it up at every plug):
+ * when the cable goes the repeater loses power, and the link between the SoC's eUSB2 PHY and it must be made again --
+ * a restart of the controller alone left the host seeing nothing (11-09). The link control (ESS_CTL, 0x11100000) and
+ * the PHY (0x11110000); the PMU's isolation bit stays as the bootloader left it (the SoC kept its power).
+ */
+#define USBCON_PHYS             0x11100000UL
+#define EUSB_PHYS               0x11110000UL
+#define USBCON_LINKCTRL         0x04
+#define USBCON_LINK_CLKRST      0x0c
+#define USBCON_UTMI_CTRL        0x10
+#define EUSB_RST_CTRL           0x00
+#define EUSB_CMN_CTRL           0x04
+#define EUSB_PLLCFG0            0x08
+#define EUSB_PLLCFG1            0x0c
+#define EUSB_TXTUNE             0x14
+#define EUSB_TESTSE             0x20
+static vm_offset_t usbcon_regs, eusb_regs;
+
+static void
+clrset(vm_offset_t base, uint32_t off, uint32_t clr, uint32_t set)
+{
+	volatile uint32_t *r = (volatile uint32_t *)(base + off);
+
+	*r = (*r & ~clr) | set;
+}
+
+static void
+eusb_reinit(void)
+{
+	if (usbcon_regs == 0) {
+		usbcon_regs = ml_io_map(USBCON_PHYS, 0x1000);
+		eusb_regs = ml_io_map(EUSB_PHYS, 0x1000);
+	}
+	/* the link: Q-channel off, filters, a link reset, VBUS and B-session forced valid */
+	clrset(usbcon_regs, USBCON_LINKCTRL, 1u << 8, 1u << 9 | 1u << 10 | 1u << 11 | 1u << 12);
+	delay(500);
+	clrset(usbcon_regs, USBCON_LINKCTRL, 0xf0, 1u << 8 | 0xf0);
+	clrset(usbcon_regs, USBCON_LINK_CLKRST, 0, 1);
+	delay(10);
+	clrset(usbcon_regs, USBCON_LINK_CLKRST, 1, 0);
+	clrset(usbcon_regs, USBCON_UTMI_CTRL, 0, 3);
+	/* the eUSB2 PHY: held in reset, repeater mode at 19.2 MHz (PLL feedback 368), out of IDDQ, enabled, out of reset */
+	clrset(eusb_regs, EUSB_RST_CTRL, 0, 1u << 0 | 1u << 1 | 1u << 4 | 1u << 5);
+	clrset(eusb_regs, EUSB_CMN_CTRL, 7u << 4, 1u << 10);
+	clrset(eusb_regs, EUSB_PLLCFG0, 0xfffu << 8, 368u << 8);
+	clrset(eusb_regs, EUSB_PLLCFG1, 0xfu << 8, 0);
+	clrset(eusb_regs, EUSB_TXTUNE, 3u << 1, 0);
+	clrset(eusb_regs, EUSB_TESTSE, 1u << 6, 0);
+	clrset(eusb_regs, EUSB_CMN_CTRL, 1u << 0, 0);
+	delay(10);
+	clrset(eusb_regs, EUSB_RST_CTRL, 1u << 0, 0);
+	delay(10);
+	clrset(eusb_regs, EUSB_CMN_CTRL, 0, 1u << 0);
+	delay(3600);
+	clrset(eusb_regs, EUSB_RST_CTRL, 1u << 4 | 1u << 5, 0);
+	printf("akita usb: the eUSB2 link made again: RST_CTRL %#x CMN_CTRL %#x LINKCTRL %#x UTMI_CTRL %#x\n",
+	    *(volatile uint32_t *)(eusb_regs + EUSB_RST_CTRL), *(volatile uint32_t *)(eusb_regs + EUSB_CMN_CTRL),
+	    *(volatile uint32_t *)(usbcon_regs + USBCON_LINKCTRL), *(volatile uint32_t *)(usbcon_regs + USBCON_UTMI_CTRL));
+}
+
+void akita_usb_reconnect(void);
+void
+akita_usb_reconnect(void)
+{
+	restart_asked = 1;
+}
+
 static void
 akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -752,6 +827,31 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 	nanoseconds_to_absolutetime(600 * NSEC_PER_SEC, &ten_min);
 	next_summary = mach_absolute_time() + ten_min;
 	for (;;) {
+		/* (boot-arg usb_reinit_at=SECONDS: the same once, with the cable in -- a test of the way back the host can see) */
+		{
+			static uint32_t reinit_s = ~0u;
+			static uint64_t reinit_at;
+
+			if (reinit_s == ~0u) {
+				reinit_s = 0;
+				PE_parse_boot_argn("usb_reinit_at", &reinit_s, sizeof(reinit_s));
+				nanoseconds_to_absolutetime((uint64_t)reinit_s * NSEC_PER_SEC, &reinit_at);
+			}
+			if (reinit_s && mach_absolute_time() >= reinit_at) {
+				reinit_s = 0;
+				printf("akita usb: usb_reinit_at: the way back after a replug, with the cable in\n");
+				restart_asked = 1;
+			}
+		}
+		if (restart_asked) {
+			restart_asked = 0;
+			printf("akita usb: started again (the cable came back)\n");
+			bulk_disable();
+			wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);            /* (off the bus while the link is made again) */
+			eusb_reinit();
+			(void)controller_start();
+			statuses = 0;           /* (the status lines again, to see the new link come up) */
+		}
 		bool busy = poll_events();
 
 		busy = tx_service() || busy;

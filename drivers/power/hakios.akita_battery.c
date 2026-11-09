@@ -319,6 +319,47 @@ battery_read(struct hakios_battery_state *s)
 	return true;
 }
 
+/*
+ * THE eUSB2 REPEATER after a cable comes back (the USB link never did: Windows saw no device after a replug, 11-09). The
+ * repeater (address 0x3e on this bus; U-Boot's `eusb repeater` enables it) starts with its port 1 disabled, and loses
+ * what U-Boot set when the cable -- its VBUS -- goes. Looked at every read (5 s) while on a cable: its GLOBAL_CONFIG's
+ * DISABLE_P1 cleared again, and the USB controller started again (akita_usb_reconnect) so that the host sees a fresh
+ * attach.
+ */
+#define REPEATER                0x3e
+#define RPTR_GLOBAL_CONFIG      0xb2
+#define RPTR_DISABLE_P1         0x40
+extern void akita_usb_reconnect(void);
+
+static void
+usb_repeater_check(bool external, bool was_external)
+{
+	uint8_t cfg = 0;
+
+	if (!external) {
+		if (was_external) {
+			printf("akita battery: the cable went\n");
+		}
+		return;
+	}
+	if (!read_regs(REPEATER, RPTR_GLOBAL_CONFIG, &cfg, 1)) {
+		return;
+	}
+	if (cfg & RPTR_DISABLE_P1) {
+		bool ok = write_reg(REPEATER, RPTR_GLOBAL_CONFIG, (uint8_t)(cfg & ~RPTR_DISABLE_P1));
+		uint8_t now = 0;
+
+		delay(3000);
+		(void)read_regs(REPEATER, RPTR_GLOBAL_CONFIG, &now, 1);
+		printf("akita battery: the cable is back%s: the eUSB repeater's port was off (GLOBAL_CONFIG %#x), on again (%s, now %#x); "
+		    "USB started again\n", was_external ? "" : " (it had gone)", cfg, ok ? "written" : "NOT written", now);
+		akita_usb_reconnect();
+	} else if (!was_external) {
+		printf("akita battery: the cable is back; the eUSB repeater's port is on (GLOBAL_CONFIG %#x): USB started again\n", cfg);
+		akita_usb_reconnect();
+	}
+}
+
 static void
 akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -326,12 +367,15 @@ akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t reads = 0, failed = 0;
 
 	unsigned say = 0;                       /* boot-arg battery_say=N: a line every N reads (N x 5 s), for power tests */
+	bool was_external = true;
 
 	PE_parse_boot_argn("battery_say", &say, sizeof(say));
 	for (unsigned tick = 0;; tick++) {
 		if (battery_read(&s)) {
 			reads++;
 			hakios_battery_report(&s);
+			usb_repeater_check(s.external, was_external);
+			was_external = s.external;
 			if (say != 0 && tick % say == 0) {
 				/* (the coulomb counter in uAh -- its drop over minutes, unplugged, is the phone's mean draw -- and the
 				 * gauge's AvgCurrent, 0x0b, 312.5 uA a step as Current) */
