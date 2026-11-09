@@ -990,17 +990,23 @@ global_setup(void)
 		return false;
 	}
 	/*
-	 * The shader cores' power, by the host (Google's driver with firmware_hctl_core_pwr: the firmware's power-off
-	 * timer disabled, then SHADER_PWRON): left to the firmware without its whole global setup they stayed off, and
-	 * the first compute job waited at RUN_COMPUTE for cores that never came.
+	 * THE SHADER CORES' POWER (TODO 15): left to the firmware -- its power-off timer turns the cores off when the GPU
+	 * has been idle that long, and on again for work (Android's default policy; panthor's PWROFF_HYSTERESIS_US 10 ms).
+	 * (Before the global setup was whole -- progress timer, allocation -- the cores stayed off and the first compute
+	 * job waited for good; with it, since 11-09, it works.) Boot-args: mali_pwroff_us=N the idle time before the cores
+	 * go off (default 10000); mali_hctl=1 the old way, the host powers them on once and they stay on.
 	 */
 	{
-		unsigned int hctl = 1;          /* mali_hctl=0: the firmware powers the cores (Android's default policy) */
+		unsigned int hctl = 0, pwroff_us = 10000;
 
 		PE_parse_boot_argn("mali_hctl", &hctl, sizeof(hctl));
+		PE_parse_boot_argn("mali_pwroff_us", &pwroff_us, sizeof(pwroff_us));
 		if (!hctl) {
-			/* a power-off timer of ~800 us in system timestamp ticks (24.576 MHz), source "timestamp" (bit 31 0) */
-			glb_in[GLB_PWROFF_TIMER / 4] = 20000;
+			/* in units of 1024 system timestamp ticks (24.576 MHz), source "timestamp" (bit 31 0) -- panthor's
+			 * panthor_fw_conv_timeout: timeout * rate / (1e6 << 10). (Counted in plain ticks, "10 ms" was 10 s.) */
+			uint64_t ticks = ((uint64_t)pwroff_us * 24576 / 1000 + 1023) >> 10;
+
+			glb_in[GLB_PWROFF_TIMER / 4] = (uint32_t)(ticks > 0x7fffffff ? 0x7fffffff : ticks ? ticks : 1);
 			glb_in[GLB_REQ / 4] ^= GLB_REQ_CFG_PWROFF_TIMER;
 			to_gpu(glb_in, 64);
 			ring_doorbell(0);
@@ -1008,7 +1014,7 @@ global_setup(void)
 				fw_state("the power-off timer not acknowledged");
 				return false;
 			}
-			printf("mali: 6: the shader cores left to the firmware (power-off timer 20000 ticks)\n");
+			printf("mali: 6: the shader cores left to the firmware: off after %u us idle\n", pwroff_us);
 			return true;
 		}
 	}
@@ -1421,6 +1427,25 @@ uint64_t
 akita_mali_busy_abs(void)
 {
 	uint64_t since = busy_since;
+
+	/* (boot-arg mali_pwr_say: how often the shader cores were found off -- the firmware's power-off timer at work --
+	 * said every 300 looks, ~30 s at the governor's 100 ms) */
+	static int pwr_say = -1;
+	static unsigned looks, off;
+	if (pwr_say < 0) {
+		int v = 0;
+		PE_parse_boot_argn("mali_pwr_say", &v, sizeof(v));
+		pwr_say = v;
+	}
+	if (pwr_say && kept) {
+		looks++;
+		off += rd(SHADER_READY) == 0;
+		if (looks == 300) {
+			printf("mali: shader cores off in %u of %u looks (L2 ready 0x%x, tiler ready 0x%x now)\n", off, looks,
+			    rd(L2_READY), rd(TILER_READY));
+			looks = off = 0;
+		}
+	}
 
 	return busy_total + (since ? mach_absolute_time() - since : 0);
 }
