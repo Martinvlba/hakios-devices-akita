@@ -600,11 +600,7 @@ bulk_event(unsigned ep, unsigned event)
 		const uint8_t *d = (const uint8_t *)(mem + OUT_BUF_OFF);
 
 		bulk_out_bytes += got;
-		if (seen_bulk_out++ < 8) {
-			printf("akita usb: bulk OUT %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
-			    "%02x %02x %02x %02x\n", got, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10],
-			    d[11], d[12], d[13], d[14], d[15]);
-		}
+		seen_bulk_out++;
 		akita_usbmux_input(d, got);
 		bulk_start_out();
 	} else if (ep == BULK_IN && event == 1) {
@@ -832,6 +828,39 @@ akita_usb_reconnect(void)
 	restart_asked = 1;
 }
 
+/*
+ * TESTS OF THE WAY BACK, with no hands at the cable (boot-args, seconds after the start): usb_reinit_at -- the replug's
+ * re-init (the eUSB2 link, the controller) with the cable in; usb_stop_at -- the phone off the bus, as a pulled cable,
+ * for usb_lost_reboot to notice.
+ */
+static void
+usb_tests(void)
+{
+	static bool parsed;
+	static uint32_t reinit_s, stop_s;
+	static uint64_t reinit_at, stop_at;
+	uint64_t now = mach_absolute_time();
+
+	if (!parsed) {
+		parsed = true;
+		PE_parse_boot_argn("usb_reinit_at", &reinit_s, sizeof(reinit_s));
+		PE_parse_boot_argn("usb_stop_at", &stop_s, sizeof(stop_s));
+		nanoseconds_to_absolutetime((uint64_t)reinit_s * NSEC_PER_SEC, &reinit_at);
+		nanoseconds_to_absolutetime((uint64_t)stop_s * NSEC_PER_SEC, &stop_at);
+	}
+	if (reinit_s && now >= reinit_at) {
+		reinit_s = 0;
+		printf("akita usb: usb_reinit_at: the way back after a replug, with the cable in\n");
+		restart_asked = 1;
+	}
+	if (stop_s && now >= stop_at) {
+		stop_s = 0;
+		printf("akita usb: usb_stop_at: off the bus (a test of usb_lost_reboot)\n");
+		bulk_disable();
+		wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
+	}
+}
+
 static void
 akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -872,22 +901,7 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 	nanoseconds_to_absolutetime(600 * NSEC_PER_SEC, &ten_min);
 	next_summary = mach_absolute_time() + ten_min;
 	for (;;) {
-		/* (boot-arg usb_reinit_at=SECONDS: the same once, with the cable in -- a test of the way back the host can see) */
-		{
-			static uint32_t reinit_s = ~0u;
-			static uint64_t reinit_at;
-
-			if (reinit_s == ~0u) {
-				reinit_s = 0;
-				PE_parse_boot_argn("usb_reinit_at", &reinit_s, sizeof(reinit_s));
-				nanoseconds_to_absolutetime((uint64_t)reinit_s * NSEC_PER_SEC, &reinit_at);
-			}
-			if (reinit_s && mach_absolute_time() >= reinit_at) {
-				reinit_s = 0;
-				printf("akita usb: usb_reinit_at: the way back after a replug, with the cable in\n");
-				restart_asked = 1;
-			}
-		}
+		usb_tests();
 		if (restart_asked) {
 			restart_asked = 0;
 			printf("akita usb: started again (the cable came back)\n");
@@ -900,23 +914,6 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 		bool busy = poll_events();
 
 		usb_watchdog(mach_absolute_time());
-		/* (boot-arg usb_stop_at=SECONDS: the phone taken off the bus then, as a pulled cable -- usb_lost_reboot's test) */
-		{
-			static uint32_t stop_s = ~0u;
-			static uint64_t stop_at;
-
-			if (stop_s == ~0u) {
-				stop_s = 0;
-				PE_parse_boot_argn("usb_stop_at", &stop_s, sizeof(stop_s));
-				nanoseconds_to_absolutetime((uint64_t)stop_s * NSEC_PER_SEC, &stop_at);
-			}
-			if (stop_s && mach_absolute_time() >= stop_at) {
-				stop_s = 0;
-				printf("akita usb: usb_stop_at: off the bus (a test of usb_lost_reboot)\n");
-				bulk_disable();
-				wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
-			}
-		}
 
 		busy = tx_service() || busy;
 		busy = ptp_service() || busy;
@@ -935,21 +932,6 @@ akita_usb_thread(__unused void *parameter, __unused wait_result_t result)
 			next_summary = now + ten_min;
 			printf("akita usb: %u setups, %u bulk OUT transfers (%u bytes)\n", seen_setups, seen_bulk_out,
 			    bulk_out_bytes);
-		}
-		/* a trace of what a host does, for a host the USB link does not survive: usb_trace_panic=SECONDS after the start,
-		 * a panic on purpose, and the whole log in pstore (the loader's way out of a panic) */
-		{
-			static uint32_t trace_s = ~0u;
-			static uint64_t trace_at;
-
-			if (trace_s == ~0u) {
-				trace_s = 0;
-				PE_parse_boot_argn("usb_trace_panic", &trace_s, sizeof(trace_s));
-				nanoseconds_to_absolutetime((uint64_t)trace_s * NSEC_PER_SEC, &trace_at);
-			}
-			if (trace_s && now >= trace_at) {
-				panic("akita usb: usb_trace_panic=%u: the trace's time is up (%u setups seen)", trace_s, seen_setups);
-			}
 		}
 		if (now - last_busy < busy_window) {
 			delay(20);
