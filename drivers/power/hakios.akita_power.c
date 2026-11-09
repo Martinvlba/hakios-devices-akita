@@ -15,6 +15,8 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <kern/startup.h>
+#include <kern/thread_call.h>
 
 #define PMU_REBOOT_CMD          0x15460810UL
 #define PMU_PS_HOLD_CONTROL     0x15463e9cUL    /* PMU 0x15460000 + 0x3e9c */
@@ -23,6 +25,38 @@
 #define PSCI_SYSTEM_OFF         0x84000008
 #define PSCI_SYSTEM_RESET       0x84000009
 #define PSCI_SYSTEM_RESET2      0xc4000012
+
+
+/*
+ * A TEST BUILD'S TIME LIMIT (the tester, 11-09: a phone left in iOS with its USB gone needed someone at home): boot-arg
+ * test_reboot_after=SECONDS -- after that long the phone restarts, the file systems synced (reboot_kernel), into the
+ * active slot, which is kept Android's: adb reaches it again. bootrun.sh passes 600 (ten minutes); 0 or absent: off.
+ */
+extern int reboot_kernel(int howto, char *message);
+
+static void
+test_time_up(__unused thread_call_param_t a, __unused thread_call_param_t b)
+{
+	printf("akita: test_reboot_after: the test build's time is up: restarting (to the active slot)\n");
+	(void)reboot_kernel(0 /* RB_AUTOBOOT */, (char *)"akita: the test build's time limit");
+}
+
+static void
+test_limit_init(void)
+{
+	static thread_call_t call;
+	uint32_t secs = 0;
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("test_reboot_after", &secs, sizeof(secs)) || secs == 0) {
+		return;
+	}
+	call = thread_call_allocate(test_time_up, NULL);
+	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(call, deadline);
+	printf("akita: test_reboot_after=%u: the phone restarts after that many seconds\n", secs);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, test_limit_init);
 
 static uint64_t
 smc(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
