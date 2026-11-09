@@ -1611,8 +1611,8 @@ vm_kernel_free(unsigned int vm, uint64_t va, vm_offset_t memory, vm_size_t size)
 #define HEAP_INITIAL_BYTES      (64u << 20)     /* the most of a heap's initial chunks together */
 
 static struct {
-	bool used;
-	unsigned int vm, chunks, max_chunks;
+	bool used, told;                        /* (told: "at its most" said once) */
+	unsigned int vm, chunks, max_chunks, at_most;
 	uint32_t chunk_size;
 	uint64_t ctx_va, chunk_va[MAX_HEAP_CHUNKS];
 	vm_offset_t ctx, chunk[MAX_HEAP_CHUNKS];
@@ -1624,6 +1624,10 @@ akita_mali_heap_free(int h)
 {
 	if (h < 0 || h >= MAX_HEAPS || !heaps[h].used) {
 		return;
+	}
+	if (heaps[h].at_most != 0) {
+		printf("mali: tiler heap %d freed: %u chunks; asked %u time(s) more at its most\n", h, heaps[h].chunks,
+		    heaps[h].at_most);
 	}
 	for (unsigned int i = 0; i < heaps[h].chunks; i++) {
 		vm_kernel_free(heaps[h].vm, heaps[h].chunk_va[i], heaps[h].chunk[i], heaps[h].chunk_size);
@@ -2044,8 +2048,14 @@ heap_grow(uint64_t ctx_va)
 		uint32_t size = heaps[h].chunk_size;
 
 		if (i >= heaps[h].max_chunks) {
-			printf("mali: tiler heap %d: out of memory at %u chunks of %u KiB, its most; the firmware waits\n", h, i,
-			    size >> 10);
+			/* no chunk: the firmware runs the queue's tiler OOM handler (hakios-metal's incremental rendering: the lists
+			 * so far drawn, their chunks given back), or with none waits for passes in flight to give chunks back */
+			heaps[h].at_most++;
+			if (!heaps[h].told) {
+				heaps[h].told = true;
+				printf("mali: tiler heap %d: out of memory at %u chunks of %u KiB, its most: no chunk given (the queue's "
+				    "handler draws what is binned so far)\n", h, i, size >> 10);
+			}
 			return 0;
 		}
 		vms[vm].kernel_next = (vms[vm].kernel_next + size - 1) & ~(uint64_t)(size - 1);
