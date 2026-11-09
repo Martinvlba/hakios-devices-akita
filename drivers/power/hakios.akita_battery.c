@@ -325,10 +325,22 @@ akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	struct hakios_battery_state s;
 	uint32_t reads = 0, failed = 0;
 
+	unsigned say = 0;                       /* boot-arg battery_say=N: a line every N reads (N x 5 s), for power tests */
+
+	PE_parse_boot_argn("battery_say", &say, sizeof(say));
 	for (unsigned tick = 0;; tick++) {
 		if (battery_read(&s)) {
 			reads++;
 			hakios_battery_report(&s);
+			if (say != 0 && tick % say == 0) {
+				/* (the coulomb counter in uAh -- its drop over minutes, unplugged, is the phone's mean draw -- and the
+				 * gauge's AvgCurrent, 0x0b, 312.5 uA a step as Current) */
+				int32_t avg = 0;
+				(void)gauge_word(0x0b, &avg, true);
+				printf("akita battery say: %d mA (mean %d mA), %d mV, charge %d uAh, %s\n", s.current_ua / 1000,
+				    (int)(((int64_t)avg * 3125) / 10000), s.voltage_uv / 1000, s.charge_uah,
+				    s.external ? "on a charger" : "not on a charger");
+			}
 			if (tick % 60 == 0) {           /* every five minutes, and the first */
 				printf("akita battery: %d.%02d%%, %d mV, %d mA, %d.%d C, %s (CHG_DTLS %d), %d of %d mAh, "
 				    "%d cycles (%u reads, %u failed)\n", s.percent_hundredths / 100, s.percent_hundredths % 100,
