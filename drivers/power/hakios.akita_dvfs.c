@@ -32,11 +32,17 @@
  * kern.hakios.dvfs_mhz ("LITTLE=1328 MID=1065 BIG=500 GPU=160/150"), kern.hakios.dvfs_changes, dvfs_skin_caps (the
  * thermal ceilings).
  * dvfs_period_ms= (100).
+ *
+ * A finger on the glass (11-10): the GPU's row at least dvfs_touch_row (6: 659/521 MHz, and the memory's floor that row
+ * has) for dvfs_touch_ms (1000) after each touch down or move, the governor woken at once -- as Android's interaction
+ * boost. A gesture started with the GPU at 160 MHz: its first frames took 22-30 ms of GPU each until the governor's next
+ * looks (the scroll test, frames.py "the slow ones"). The thermal floors still apply. dvfs_touch_row=12: none.
  */
 #include <kern/clock.h>
 #include <kern/startup.h>
 #include <kern/thread.h>
 #include <kern/thread_call.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/host_info.h>
 #include <mach/mach_types.h>
@@ -139,10 +145,16 @@ static const uint8_t gpu_util[][3] = {
 static const uint32_t gpu_mif_min[] = { 3172000, 1716000, 1716000, 1352000, 1352000, 1352000, 845000, 845000, 0, 0, 0, 0, 0 };
 #define MIF_LEAST 421000
 static uint32_t mif_applied;
+static uint64_t mif_lower_since;        /* since when a lower MIF floor has been wanted (0: not) */
+static uint32_t mif_down_ms = 2000, mif_switches;
 static bool mif_fixed;                  /* boot-arg mif_khz: MIF left where it says */
 static uint32_t gpu_boot[2];            /* kHz, as the bootloader left them (0: not readable: the GPU left alone) */
 static int gpu_applied = -1;            /* the row last set (-1: the bootloader's clocks untouched) */
 static int gpu_want;                    /* the governor's row (fastest 0), before the thermal floor */
+extern void (*hakios_touch_interaction)(void);  /* drivers/input/hakios.input.c */
+static volatile uint64_t touch_until;   /* the interaction boost lasts until (mach_absolute_time) */
+static uint32_t touch_row = 6, touch_ms = 1000;
+static uint32_t touch_boosts;
 static unsigned gpu_low_looks;          /* looks in a row under the row's lower bound */
 static int gpu_util_pct;
 static uint64_t gpu_busy_last, gpu_time_last;
@@ -416,12 +428,28 @@ gpu_apply(void)
 	/* the memory's clock: the floor of the row the governor WANTS -- not of the row the skin's temperature lets the
 	 * GPU have: warm (40 C), the GPU held at 531 MHz took MIF down to 421 with it and Settings fell from 55 to 21 fps;
 	 * Android's devfreq governs MIF apart from the GPU's thermal cap */
+	/*
+	 * ... raised at once, lowered only once a lower floor has been wanted for mif_down_ms (2000) in a row: every GPU row
+	 * change moved MIF too (~40 DRAM frequency switches in a scroll test, 17 rows in 3 s at a gesture's start), and two
+	 * resets by watchdogs (APM, APC) came in such bursts on 11-10 -- a switch of the memory's clock is the heaviest thing
+	 * asked of ACPM; Android's MIF governor does not follow the GPU row by row either
+	 */
 	if (!mif_fixed && gpu_applied >= 0) {
 		int r = gpu_want >= 0 && gpu_want < (int)NGPUROWS ? gpu_want : gpu_applied;
 		uint32_t mif = gpu_mif_min[r] ? gpu_mif_min[r] : MIF_LEAST;
+		uint64_t now = mach_absolute_time(), hold;
 
-		if (mif != mif_applied && domain_set_khz(0, mif)) {
+		nanoseconds_to_absolutetime((uint64_t)mif_down_ms * NSEC_PER_MSEC, &hold);
+		if (mif >= mif_applied) {
+			mif_lower_since = 0;
+		} else if (mif_lower_since == 0) {
+			mif_lower_since = now;
+		}
+		if (mif != mif_applied && (mif > mif_applied || (mif_lower_since != 0 && now - mif_lower_since >= hold)) &&
+		    domain_set_khz(0, mif)) {
 			mif_applied = mif;
+			mif_switches++;
+			mif_lower_since = 0;
 		}
 	}
 }
@@ -459,6 +487,12 @@ gpu_govern(void)
 		} else {
 			gpu_low_looks = 0;
 		}
+	}
+	if (mach_absolute_time() < touch_until && gpu_want > (int)touch_row) {
+		/* a finger on the glass: at least the interaction row, whatever the looks said (scroll-boost: inside the chain
+		 * above, three low looks still stepped it down after 0.3 s) */
+		gpu_want = (int)touch_row;
+		gpu_low_looks = 0;
 	}
 	gpu_busy_last = busy;
 	gpu_time_last = now;
@@ -593,6 +627,21 @@ govern(struct cluster *c)
 	}
 }
 
+/* each touch down or move (hakios.input.c): the boost renewed; the governor woken when it starts */
+static void
+dvfs_touch(void)
+{
+	uint64_t now = mach_absolute_time(), span;
+	bool starts = now >= touch_until;
+
+	nanoseconds_to_absolutetime((uint64_t)touch_ms * NSEC_PER_MSEC, &span);
+	touch_until = now + span;
+	if (starts) {
+		touch_boosts++;
+		thread_wakeup((event_t)&touch_until);
+	}
+}
+
 static void
 akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -668,13 +717,15 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 		now = mach_absolute_time();
 		if (now >= next_log) {
 			next_log = now + minute;
-			printf("akita dvfs: %s (%d changes; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d, GPU %d %%\n", dvfs_mhz,
-			    dvfs_changes_value, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
+			printf("akita dvfs: %s (%d changes, %u touch boosts, %u MIF switches; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d, "
+			    "GPU %d %%\n", dvfs_mhz, dvfs_changes_value, touch_boosts, mif_switches, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
 			    "held to the lowest: hot", clusters[0].core_share[0], clusters[0].core_share[1],
 			    clusters[0].core_share[2], clusters[0].core_share[3], clusters[1].core_share[0],
 			    clusters[1].core_share[1], clusters[1].core_share[2], clusters[1].core_share[3], gpu_util_pct);
 		}
-		delay_for_interval(period_ms, NSEC_PER_MSEC);
+		/* (a touch wakes the governor at once: dvfs_touch) */
+		assert_wait_timeout((event_t)&touch_until, THREAD_UNINT, period_ms, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
 	}
 }
 
@@ -702,6 +753,14 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		    domain_get_khz(1));
 	}
 
+	PE_parse_boot_argn("mif_down_ms", &mif_down_ms, sizeof(mif_down_ms));
+	PE_parse_boot_argn("dvfs_touch_row", &touch_row, sizeof(touch_row));
+	PE_parse_boot_argn("dvfs_touch_ms", &touch_ms, sizeof(touch_ms));
+	if (touch_row < NGPUROWS - 1 && touch_ms > 0) {
+		hakios_touch_interaction = dvfs_touch;
+		printf("akita dvfs: a touch holds the GPU at row %u (%u/%u MHz) or faster for %u ms\n", touch_row,
+		    gpu_rows[touch_row][0] / 1000, gpu_rows[touch_row][1] / 1000, touch_ms);
+	}
 	if (kernel_thread_start(akita_dvfs_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
