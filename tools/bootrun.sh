@@ -23,7 +23,7 @@ SAFE=""; case "$BOOTARGS" in *usb_lost_reboot=*) ;; *) SAFE="usb_lost_reboot=90"
 TRA=600
 case "$BOOTARGS" in *test_reboot_after=*) ;; *) SAFE="$SAFE test_reboot_after=$TRA";; esac
 CMDLINE="debug=0x8 $SAFE cpus=9 touchscreen=1 buttons=1 fuelgauge=1 usbmux=1 usb_serial=d6ca5f8da676e44a1ed9455d72d070481d33dd9e ${THERMAL-thermal=1 dvfs=1} root_apfs=ufs_darwin ufs=2 ufs_write=1 var_hfs=ufs_darwin_data mali_keep=1 metal=1 metal_plugin=../../../redwood/lib/HakiosMetal display_flip=1 $BOOTARGS"
-[ ${#CMDLINE} -gt 495 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the loader keeps with its own (~495 of 607); shorten BOOTARGS"; exit 1; }
+[ ${#CMDLINE} -gt 490 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the kernel gets whole (490: at 491 its last character was lost, 11-10); shorten BOOTARGS"; exit 1; }
 xnuloader/mkpayload.py -o $D/test-payload.bin kernel=hakios-kernel ramdisk=userland/root.apfs resident=userland/flashboot.apfs --cmdline "$CMDLINE" >/dev/null && tools/mkubootimg.py -d akita -p $D/test-payload.bin -o $D/test.img >/dev/null || exit 1
 # to the bootloader from wherever the phone is -- and again if it turns up elsewhere meanwhile (a test build's own
 # restart, usb_lost_reboot or test_reboot_after, lands in Android: a run started then waited for fastboot for ever)

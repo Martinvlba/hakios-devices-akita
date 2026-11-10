@@ -188,6 +188,7 @@ static uint32_t anim_fps = 50, anim_ms = 250, anim_flips_last, anim_boosts;
  * every swap late, the GPU 75 % busy -- under its row's own threshold (95 %). As Android's missed-frame boosts.
  */
 static int anim_row = -1;               /* the frame boost's GPU row (-1: none, the touch row alone) */
+static uint32_t anim_mif = 1352000;     /* the memory's floor meanwhile, kHz (dvfs_anim_mif; MHz under 10000; 0 none) */
 static uint32_t anim_ring[5], anim_ring_at, anim_raised;
 static unsigned gpu_low_looks;          /* looks in a row under the row's lower bound */
 static int gpu_util_pct;
@@ -530,6 +531,16 @@ gpu_apply(void)
 		uint32_t mif = gpu_mif_min[r] ? gpu_mif_min[r] : MIF_LEAST;
 		uint64_t now = mach_absolute_time(), hold;
 
+		/*
+		 * ... and while frames flow (the frame boost on), dvfs_anim_mif (1352 MHz) at least: the idle cube at row 6's
+		 * 845 drew 86-88 frames a second, the GPU waited on memory (5.8 ms a frame of GPU time against 4.2) -- 1014: 116,
+		 * 1352 and up: 119, the panel's every refresh (11-10). Android's devfreq raises MIF by the bus's traffic, which
+		 * this port does not measure; the frames are the sign of it here
+		 */
+		if (anim_row >= 0 && now < touch_until && mif < anim_mif) {
+			mif = anim_mif;
+		}
+
 		nanoseconds_to_absolutetime((uint64_t)mif_down_ms * NSEC_PER_MSEC, &hold);
 		if (mif >= mif_applied) {
 			mif_lower_since = 0;
@@ -541,6 +552,10 @@ gpu_apply(void)
 			mif_applied = mif;
 			mif_switches++;
 			mif_lower_since = 0;
+			if (mif_switches <= 12 || mif_switches % 50 == 0) {
+				printf("akita dvfs: MIF %u MHz (switch %u%s)\n", mif / 1000, mif_switches,
+				    anim_row >= 0 && mif == anim_mif ? ", frames flowing" : "");
+			}
 		}
 	}
 }
@@ -923,13 +938,22 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		printf(" %u=%u", d, domain_get_khz(d));
 	}
 	printf("\n");
-	if (PE_parse_boot_argn("mif_khz", &khz, sizeof(khz)) && khz >= 421000 && khz <= 3744000) {
+	if (PE_parse_boot_argn("mif_khz", &khz, sizeof(khz)) && (khz < 10000 ? (khz *= 1000) : khz) >= 421000 &&
+	    khz <= 3744000) {           /* (N under 10000: MHz -- the command line is short) */
 		bool ok = domain_set_khz(0, khz);
 		mif_fixed = ok;
 		printf("akita dvfs: mif_khz=%u: MIF set %s, now %u kHz (INT %u)\n", khz, ok ? "ok" : "FAILED", domain_get_khz(0),
 		    domain_get_khz(1));
 	}
 
+	khz = 0;
+	if (PE_parse_boot_argn("int_khz", &khz, sizeof(khz)) && (khz < 10000 ? (khz *= 1000) : khz) >= 178000 &&
+	    khz <= 1066000) {
+		/* (a test, 11-10: the interconnect at the level given -- Android's devfreq governs INT by bus traffic, 178-1066
+		 * MHz; the bootloader leaves it at 356) */
+		bool ok = domain_set_khz(1, khz);
+		printf("akita dvfs: int_khz=%u: INT set %s, now %u kHz\n", khz, ok ? "ok" : "FAILED", domain_get_khz(1));
+	}
 	PE_parse_boot_argn("mif_down_ms", &mif_down_ms, sizeof(mif_down_ms));
 	PE_parse_boot_argn("dvfs_share", &share_by_power, sizeof(share_by_power));
 	if (PE_parse_boot_argn("mif_toggle_ms", &mif_toggle_ms, sizeof(mif_toggle_ms)) && mif_toggle_ms != 0) {
@@ -940,6 +964,9 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 	PE_parse_boot_argn("dvfs_touch_cpu", &touch_cpu, sizeof(touch_cpu));
 	PE_parse_boot_argn("dvfs_anim_fps", &anim_fps, sizeof(anim_fps));
 	PE_parse_boot_argn("dvfs_anim_ms", &anim_ms, sizeof(anim_ms));
+	if (PE_parse_boot_argn("dvfs_anim_mif", &anim_mif, sizeof(anim_mif)) && anim_mif < 10000) {
+		anim_mif *= 1000;
+	}
 	PE_parse_boot_argn("dvfs_touch_row", &touch_row, sizeof(touch_row));
 	PE_parse_boot_argn("dvfs_touch_ms", &touch_ms, sizeof(touch_ms));
 	if (touch_row < NGPUROWS - 1 && touch_ms > 0) {
