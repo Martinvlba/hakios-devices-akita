@@ -58,6 +58,7 @@ extern processor_t cpu_to_processor(int cpu);
 extern kern_return_t processor_info(processor_t processor, processor_flavor_t flavor, host_t *host,
     processor_info_t info, mach_msg_type_number_t *count);
 extern unsigned int real_ncpus;
+extern void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
 
 #define DVFS_CHANNEL            0
 #define FREQ_SET                0
@@ -93,7 +94,8 @@ static int skin_shift_mc;               /* thermal_test_shift=N: every skin targ
 #define NCLUSTERS (sizeof(clusters) / sizeof(clusters[0]))
 
 static uint32_t period_ms = 100;
-static uint32_t top_always;            /* dvfs_top=1 (a test): every cluster at its top step, within the thermal caps */
+static uint32_t top_always;            /* dvfs_top=1 (a test): every cluster at its top step, within the thermal caps;
+					 * 2: above them too (11-10: whether the CPUs' speed is what Spotlight waits on) */
 static int dvfs_changes_value;
 static char dvfs_mhz[96] = "";
 static int hot_cap = -1;                /* every cluster's cap while hot: -1 none, 1 the middle step, 0 the lowest */
@@ -160,7 +162,10 @@ static int gpu_applied = -1;            /* the row last set (-1: the bootloader'
 static int gpu_want;                    /* the governor's row (fastest 0), before the thermal floor */
 extern void (*hakios_touch_interaction)(void);  /* drivers/input/hakios.input.c */
 static volatile uint64_t touch_until;   /* the interaction boost lasts until (mach_absolute_time) */
-static uint32_t touch_row = 6, touch_ms = 1000;
+static uint32_t touch_row = 3, touch_ms = 1000;   /* (row 3, 900/723 MHz, since 11-10: with the display's submission gate
+						 * each frame's GPU work starts at the panel's switch and must end by the next one, so the
+						 * GPU's speed is the frame rate; Spotlight's openings, buffers over 18 ms of GPU time:
+						 * row 6 18/10/14, row 3 11/5/0. dvfs_touch_row=6: as before) */
 static uint32_t touch_boosts;
 /*
  * ... and the clusters at least these clocks meanwhile (LITTLE, MID, BIG; MHz), as Android's INTERACTION hint raises
@@ -188,6 +193,7 @@ static uint32_t anim_fps = 50, anim_ms = 250, anim_flips_last, anim_boosts;
  * every swap late, the GPU 75 % busy -- under its row's own threshold (95 %). As Android's missed-frame boosts.
  */
 static int anim_row = -1;               /* the frame boost's GPU row (-1: none, the touch row alone) */
+static int gpu_fixed_row = -1;          /* dvfs_gpu_row=N (a test, 11-10): the governor's GPU row fixed (0 the fastest) */
 static uint32_t anim_mif = 1352000;     /* the memory's floor meanwhile, kHz (dvfs_anim_mif; MHz under 10000; 0 none) */
 static uint32_t anim_ring[5], anim_ring_at, anim_raised;
 static unsigned gpu_low_looks;          /* looks in a row under the row's lower bound */
@@ -537,7 +543,9 @@ gpu_apply(void)
 		 * 1352 and up: 119, the panel's every refresh (11-10). Android's devfreq raises MIF by the bus's traffic, which
 		 * this port does not measure; the frames are the sign of it here
 		 */
-		if (anim_row >= 0 && now < touch_until && mif < anim_mif) {
+		if (now < touch_until && mif < anim_mif) {
+			/* (from the touch on, not only once frames are counted (anim_row): a gesture's first frames came with MIF at
+			 * row 6's 845 -- Spotlight's opening, 16-29 frames over 18 ms of GPU time each, 9 with MIF at 3172; 11-10) */
 			mif = anim_mif;
 		}
 
@@ -603,6 +611,9 @@ gpu_govern(void)
 	if (anim_row >= 0 && mach_absolute_time() < touch_until && gpu_want > anim_row) {
 		gpu_want = anim_row;            /* (the frame boost's row: faster while the frames come late) */
 		gpu_low_looks = 0;
+	}
+	if (gpu_fixed_row >= 0 && gpu_fixed_row < (int)NGPUROWS) {
+		gpu_want = gpu_fixed_row;       /* (dvfs_gpu_row=N, a test) */
 	}
 	gpu_busy_last = busy;
 	gpu_time_last = now;
@@ -732,6 +743,9 @@ govern(struct cluster *c)
 	{
 		unsigned thermal = c->nsteps - 1 - (unsigned)cd_state[c->cdev];        /* Android's controllers' ceiling */
 		cap = cap > thermal ? thermal : cap;
+	}
+	if (top_always == 2) {
+		cap = c->nsteps - 1;    /* (dvfs_top=2, a test, 11-10: the top step whatever the skin -- a few minutes only) */
 	}
 	want = want > cap ? cap : want;
 	if (want < c->now && ++c->lower_wanted < 3 && c->now <= cap) {
@@ -954,6 +968,21 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		bool ok = domain_set_khz(1, khz);
 		printf("akita dvfs: int_khz=%u: INT set %s, now %u kHz\n", khz, ok ? "ok" : "FAILED", domain_get_khz(1));
 	}
+	{
+		/*
+		 * boot-arg dvfs_cores=MASK (a test, 11-10): the scheduler's recommended cores (sched_perfcontrol_update_
+		 * recommended_cores; the others run idle and bound threads only). The nine cores are one cluster of one type
+		 * to this kernel (ml_processor_register: cluster 0, type 0), so a UI thread lands on a 1.2 GHz A510 as readily
+		 * as on the X3: Spotlight opened at 30-40 frames a second with SpringBoard, Spotlight and backboardd each near
+		 * a core. 0x1f0: the MID and BIG cores alone.
+		 */
+		uint32_t cores = 0;
+
+		if (PE_parse_boot_argn("dvfs_cores", &cores, sizeof(cores)) && (cores & 0x1ff) != 0) {
+			sched_perfcontrol_update_recommended_cores(cores & 0x1ff);
+			printf("akita dvfs: dvfs_cores=%#x: the scheduler recommends those cores alone\n", cores & 0x1ff);
+		}
+	}
 	PE_parse_boot_argn("mif_down_ms", &mif_down_ms, sizeof(mif_down_ms));
 	PE_parse_boot_argn("dvfs_share", &share_by_power, sizeof(share_by_power));
 	if (PE_parse_boot_argn("mif_toggle_ms", &mif_toggle_ms, sizeof(mif_toggle_ms)) && mif_toggle_ms != 0) {
@@ -964,6 +993,7 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 	PE_parse_boot_argn("dvfs_touch_cpu", &touch_cpu, sizeof(touch_cpu));
 	PE_parse_boot_argn("dvfs_anim_fps", &anim_fps, sizeof(anim_fps));
 	PE_parse_boot_argn("dvfs_anim_ms", &anim_ms, sizeof(anim_ms));
+	PE_parse_boot_argn("dvfs_gpu_row", &gpu_fixed_row, sizeof(gpu_fixed_row));
 	if (PE_parse_boot_argn("dvfs_anim_mif", &anim_mif, sizeof(anim_mif)) && anim_mif < 10000) {
 		anim_mif *= 1000;
 	}
@@ -993,6 +1023,11 @@ akita_dvfs_init(void)
 	PE_parse_boot_argn("dvfs_top", &top_always, sizeof(top_always));
 	if (PE_parse_boot_argn("dvfs_period_ms", &value, sizeof(value)) && value >= 20 && value <= 2000) {
 		period_ms = value;
+	}
+	if (PE_parse_boot_argn("skin_cool", &value, sizeof(value)) && value <= 30) {
+		/* (a test, 11-10: the skin read N degrees cooler -- whether a slow animation is the thermal caps') */
+		skin_shift_mc = -(int)value * 1000;
+		printf("akita dvfs: skin_cool=%u: the skin read %u degrees cooler (a test)\n", value, value);
 	}
 	if (PE_parse_boot_argn("thermal_test_shift", &value, sizeof(value)) && value <= 30) {
 		skin_shift_mc = (int)value * 1000;
