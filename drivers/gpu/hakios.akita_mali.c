@@ -31,6 +31,7 @@
  * More boot-args: mali_delay=SECONDS (8) after the kernel's start before step 1 runs (the small image has to be there
  * for the firmware).
  */
+#include <os/atomic_private.h>
 #include <kern/clock.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
@@ -234,6 +235,8 @@ faults(const char *when)
 
 /* ---- memory for the GPU: allocated in the kernel's pages (16 KiB), handed to the GPU in its own (4 KiB) ---- */
 
+static uint64_t gpu_memory_bytes;      /* (11-10) what gpu_memory holds now: firmware, page tables, heaps, rings */
+
 static vm_offset_t
 gpu_memory(vm_size_t size)
 {
@@ -243,7 +246,15 @@ gpu_memory(vm_size_t size)
 	    KERN_SUCCESS) {
 		return 0;
 	}
+	os_atomic_add(&gpu_memory_bytes, (uint64_t)round_page(size), relaxed);
 	return va;
+}
+
+/* the driver's own memory for the GPU (not the programs' buffers: HakiosGPU counts those) */
+uint64_t
+akita_mali_kernel_bytes(void)
+{
+	return os_atomic_load(&gpu_memory_bytes, relaxed);
 }
 
 /* the page tables: level 0 and every table under it, taken from pages of ours one 4 KiB table at a time */
@@ -1653,6 +1664,7 @@ vm_kernel_free(unsigned int vm, uint64_t va, vm_offset_t memory, vm_size_t size)
 		as_update(vm);
 	}
 	kmem_free(kernel_map, memory, round_page(size));
+	os_atomic_sub(&gpu_memory_bytes, (uint64_t)round_page(size), relaxed);
 }
 
 /*

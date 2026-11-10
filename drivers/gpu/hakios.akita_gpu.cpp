@@ -158,6 +158,7 @@ enum {
 	kSyncobjCreate = 0xbf, kSyncobjDestroy = 0xc0, kSyncobjWait = 0xc3, kSyncobjReset = 0xc4, kSyncobjSignal = 0xc5,
 	kSyncobjTimelineWait = 0xca, kSyncobjQuery = 0xcb, kSyncobjTransfer = 0xcc, kSyncobjTimelineSignal = 0xcd,
 	kHakiosSurfaceBusy = 0x7d,      /* not Linux's: a command buffer draws into an IOSurface (+1) or is done (-1) */
+	kHakiosSurfaceGate = 0x80,      /* not Linux's: wait until an IOSurface is not on the panel (before a submission) */
 	kHakiosSurface = 0x7e,          /* not Linux's: an IOSurface's memory as a buffer (as the Adreno service's) */
 	kHakiosDebug = 0x7f,            /* not Linux's: the queues' state into the kernel's log */
 };
@@ -166,7 +167,9 @@ enum {
 
 static IOLock *gLock;
 static void busyChange(uint32_t sid, int32_t delta);
-extern "C" uint32_t hakios_fb_shown_surface(void);  /* MiniIOMobileFramebuffer.cpp */        /* (the surfaces being drawn: see MiniIOSurfaceDrawn) */
+extern "C" uint32_t hakios_fb_shown_surface(void);
+extern "C" void hakios_fb_swap_state(uint32_t *presented, uint32_t *presented_surface, uint32_t *shown);
+extern "C" void *hakios_fb_shown_event(void);  /* MiniIOMobileFramebuffer.cpp: woken when the panel's surface changes */  /* MiniIOMobileFramebuffer.cpp */        /* (the surfaces being drawn: see MiniIOSurfaceDrawn) */
 
 class HakiosGPU : public IOService
 {
@@ -448,7 +451,35 @@ HakiosGPUUserClient::syncSignal(uint32_t handle, uint64_t point, const struct fe
  */
 #define BUSY_SURFACES 64
 static struct { uint32_t sid; int32_t count; } gBusy[BUSY_SURFACES];
-static uint64_t gBusyWaits, gBusyWaitAbs, gBusyStages;
+static uint64_t gBusyWaits, gBusyWaitAbs, gBusyStages, gIdleStages, gIdleGraces;
+/* when each surface's last mark went (mach_absolute_time), the last 16 surfaces so: see MiniIOSurfaceDrawn's grace */
+static struct { uint32_t sid; uint64_t at; } gReleased[16];
+static unsigned gReleasedNext;
+
+static void
+releasedNow(uint32_t sid)
+{
+	for (unsigned i = 0; i < 16; i++) {
+		if (gReleased[i].sid == sid) {
+			gReleased[i].at = mach_absolute_time();
+			return;
+		}
+	}
+	gReleased[gReleasedNext % 16].sid = sid;
+	gReleased[gReleasedNext % 16].at = mach_absolute_time();
+	gReleasedNext++;
+}
+
+static uint64_t
+releasedAt(uint32_t sid)
+{
+	for (unsigned i = 0; i < 16; i++) {
+		if (gReleased[i].sid == sid) {
+			return gReleased[i].at;
+		}
+	}
+	return 0;
+}
 
 static void
 busyChange(uint32_t sid, int32_t delta)
@@ -461,6 +492,7 @@ busyChange(uint32_t sid, int32_t delta)
 			if (gBusy[i].count <= 0) {
 				gBusy[i].sid = 0;
 				gBusy[i].count = 0;
+				releasedNow(sid);
 			}
 			thread_wakeup((event_t)gBusy);         /* (any change: the grace watch below looks for new marks too) */
 			return;
@@ -474,7 +506,11 @@ busyChange(uint32_t sid, int32_t delta)
 		static uint32_t late;
 
 		if (late++ < 30 || late % 200 == 0) {
-			IOLog("HakiosGPU: surface %u drawn into while on the panel (%u times)\n", sid, late);
+			uint32_t presented, presented_sid, shown;
+
+			hakios_fb_swap_state(&presented, &presented_sid, &shown);
+			IOLog("HakiosGPU: surface %u drawn into while on the panel (%u times): swap %u presented (surface %u), %u "
+			    "counted shown\n", sid, late, presented, presented_sid, shown);
 		}
 	}
 	if (delta > 0 && free_slot >= 0) {
@@ -496,6 +532,9 @@ busyNow(uint32_t sid)
 }
 
 static uint64_t gDrawnWaits, gDrawnWaitAbs, gDrawnLate;
+static uint64_t gBoBytes, gBoPeak;      /* (11-10) the programs' GPU buffers (kBoCreate) now, and the most at once */
+static uint32_t gBoCount;
+extern "C" uint64_t akita_mali_kernel_bytes(void);     /* hakios.akita_mali.c */
 
 bool
 MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
@@ -513,8 +552,37 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 	 * below whenever the GPU still has work at all: a frame presented before its main stage is recorded has no mark
 	 * yet (the screen recording: every half-drawn frame was recorded with the GPU busy) */
 	n = akita_mali_snapshot(snap, 64);
-	if (surface != NULL && milliseconds != 0 && (busyNow(surface->sid) || !akita_mali_done(snap, n))) {
+	static uint32_t grace_us = 0xffffffff;
+	uint64_t grace_abs, until, released = 0;
+
+	if (grace_us == 0xffffffff && !PE_parse_boot_argn("fb_busy_grace_us", &grace_us, sizeof(grace_us))) {
+		grace_us = 2500;
+	}
+	nanoseconds_to_absolutetime((uint64_t)grace_us * NSEC_PER_USEC, &grace_abs);
+	/*
+	 * ... OR WITH ITS LAST COMMAND BUFFER JUST DONE (11-10): a frame CoreAnimation presents with its first stage, that
+	 * stage already finished and the GPU idle, the next not recorded yet -- shown at once before: the screen recording
+	 * caught the widgets page alone (no strip, cube or status bar) for a refresh in a swipe, and the tester saw such
+	 * glitches during swipes and Spotlight's opening once the GPU got faster (the memoryless attachments, a higher
+	 * touch row): the faster the first stage, the wider that window. The grace then runs from that finish.
+	 */
+	bool idle_recent = false;
+	static uint32_t idle_grace = 0xffffffff;        /* fb_idle_grace=0: not done (a comparison) */
+
+	if (idle_grace == 0xffffffff && !PE_parse_boot_argn("fb_idle_grace", &idle_grace, sizeof(idle_grace))) {
+		idle_grace = 1;
+	}
+	if (idle_grace && surface != NULL && milliseconds != 0 && grace_us != 0 && !busyNow(surface->sid) &&
+	    akita_mali_done(snap, n)) {
+		released = releasedAt(surface->sid);
+		idle_recent = released != 0 && mach_absolute_time() - released < grace_abs;
+	}
+	if (surface != NULL && milliseconds != 0 && (busyNow(surface->sid) || !akita_mali_done(snap, n) || idle_recent)) {
 		uint64_t b0 = mach_absolute_time();
+
+		if (idle_recent) {
+			gIdleGraces++;
+		}
 
 		while (busyNow(surface->sid) && mach_absolute_time() < deadline) {
 			assert_wait_deadline((event_t)gBusy, THREAD_UNINT, deadline);
@@ -529,17 +597,11 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		 * may come: watched for fb_busy_grace_us (2500) more, a new mark waited for in turn. The screen recording
 		 * (rec=4) showed such frames: the home screen without its dock, the cube and the strip.
 		 */
-		static uint32_t grace_us = 0xffffffff;
-		uint64_t grace_abs, until;
-
-		if (grace_us == 0xffffffff && !PE_parse_boot_argn("fb_busy_grace_us", &grace_us, sizeof(grace_us))) {
-			grace_us = 2500;
-		}
-		nanoseconds_to_absolutetime((uint64_t)grace_us * NSEC_PER_USEC, &grace_abs);
-		until = mach_absolute_time() + grace_abs;
+		until = idle_recent ? released + grace_abs : mach_absolute_time() + grace_abs;
 		while (grace_us != 0 && mach_absolute_time() < until && mach_absolute_time() < deadline) {
 			if (busyNow(surface->sid)) {
 				gBusyStages++;
+				gIdleStages += idle_recent;
 				while (busyNow(surface->sid) && mach_absolute_time() < deadline) {
 					assert_wait_deadline((event_t)gBusy, THREAD_UNINT, deadline);
 					IOLockUnlock(gLock);
@@ -576,7 +638,11 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		    ns / 1000 / gDrawnWaits, gDrawnWaits, gDrawnLate);
 		absolutetime_to_nanoseconds(gBusyWaitAbs, &ns);
 		IOLog("HakiosGPU: ... %llu of them waited for command buffers still drawing into the surface, %llu us each; %llu "
-		    "later stages caught in the grace\n", gBusyWaits, gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages);
+		    "later stages caught in the grace (%llu of them after an idle GPU, %llu such graces)\n", gBusyWaits,
+		    gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages, gIdleStages, gIdleGraces);
+		IOLog("HakiosGPU: memory of the phone's RAM the GPU holds: %llu MB in %u buffers of programs (the most so far %llu "
+		    "MB), %llu MB the driver's own (firmware, page tables, tiler heaps); IOSurfaces apart\n", gBoBytes >> 20, gBoCount,
+		    gBoPeak >> 20, akita_mali_kernel_bytes() >> 20);
 	}
 	return done;
 }
@@ -863,6 +929,10 @@ HakiosGPUUserClient::boRelease(int i)
 	if (i < 0 || i >= MAX_BOS) {
 		return;
 	}
+	if (fBos[i].memory != NULL && fBos[i].surface == NULL) {
+		gBoBytes -= fBos[i].size;               /* (a surface's buffer is the surface's memory: not counted) */
+		gBoCount--;
+	}
 	OSSafeReleaseNULL(fBos[i].memory);
 	if (fBos[i].surface != NULL) {
 		MiniIOSurfaceDrop(fBos[i].surface);
@@ -1033,6 +1103,9 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		bzero(memory->getBytesNoCopy(), (size_t)bytes);
 		fBos[h].memory = memory;
 		fBos[h].size = bytes;
+		gBoBytes += bytes;
+		gBoCount++;
+		gBoPeak = gBoBytes > gBoPeak ? gBoBytes : gBoPeak;
 		r.boCreate.size = bytes;
 		r.boCreate.handle = (uint32_t)h + 1;
 		break;
@@ -1284,6 +1357,53 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		fBusy[at].sid = r.surfaceBusy.surface;
 		fBusy[at].count += r.surfaceBusy.delta;
 		busyChange(r.surfaceBusy.surface, r.surfaceBusy.delta);
+		break;
+	}
+	case kHakiosSurfaceGate: {
+		/*
+		 * NOT WHILE THE PANEL READS IT (11-10): a command buffer about to be submitted that draws into the surface on the
+		 * panel waits here until the panel has moved on to the next frame (25 ms at most). CoreAnimation, double
+		 * buffered, records its next frame into the surface the panel still shows -- it does not wait for SwapWait
+		 * (another thread) -- and the GPU then overwrote what the panel was reading: ~37 % of frames with the cube
+		 * turning, tearing the tester saw in every swipe (the screen recording, made as the panel begins reading a
+		 * frame, never shows it). Held at the SUBMISSION, not at the first draw as gpu_hold did: the recording of the
+		 * next frame still overlaps the GPU's work on this one, so 120 a second stays possible. The panel's switch
+		 * wakes the wait (hakios_fb_shown_event). Boot-arg gpu_gate=0: not done.
+		 */
+		static uint32_t gate = 0xffffffff, gated, timeouts;
+		static uint64_t gated_abs;
+
+		if (gate == 0xffffffff && !PE_parse_boot_argn("gpu_gate", &gate, sizeof(gate))) {
+			gate = 1;
+		}
+		if (!gate || r.surfaceBusy.surface == 0 || r.surfaceBusy.surface != hakios_fb_shown_surface()) {
+			break;
+		}
+		uint64_t t0 = mach_absolute_time(), deadline;
+
+		clock_interval_to_deadline(25, kMillisecondScale, &deadline);
+		IOLockUnlock(gLock);
+		while (r.surfaceBusy.surface == hakios_fb_shown_surface()) {
+			assert_wait_deadline(hakios_fb_shown_event(), THREAD_UNINT, deadline);
+			if (r.surfaceBusy.surface != hakios_fb_shown_surface()) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+				break;
+			}
+			if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+				timeouts++;
+				break;
+			}
+		}
+		IOLockLock(gLock);
+		gated++;
+		gated_abs += mach_absolute_time() - t0;
+		if (gated % 2000 == 1) {
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(gated_abs, &ns);
+			IOLog("HakiosGPU: %u submissions held until the panel left their surface, %llu us each, %u after 25 ms\n", gated,
+			    ns / 1000 / gated, timeouts);
+		}
 		break;
 	}
 	case kHakiosDebug:
