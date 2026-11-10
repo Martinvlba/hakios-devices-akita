@@ -1373,6 +1373,7 @@ static struct mali_vm {
 	bool used;
 	uint64_t *root;
 	uint64_t kernel_next;           /* the next free address of the kernel's half */
+	bool flush_pending;             /* pages mapped since its last update: flushed before its next submission */
 } vms[MAX_VMS];
 
 static struct mali_group {
@@ -1589,6 +1590,24 @@ akita_mali_vm_flush(int vm)
 {
 	if (vm > 0 && vm < MAX_VMS && vms[vm].used) {
 		as_update((unsigned int)vm);
+		vms[vm].flush_pending = false;
+	}
+}
+
+/*
+ * ... or before the VM's next submission (11-10): pages newly MAPPED are only reached by work submitted after them, so
+ * the update -- two whole-GPU cache flushes, the address space reprogrammed and its whole range locked meanwhile -- can
+ * wait for that submission, and a burst of binds costs one. HakiosMetal binds each buffer apart: CoreAnimation's new
+ * surfaces (an App Library page, a folder opening) came in bursts of ~30 binds in 60 ms, 60 flushes under the GPU's
+ * running work, and the panel's frame stood still 25-46 ms each time (the tester's slow-motion clip, sb_debug's counter
+ * against the log). An unmap is still flushed at once (its memory may be freed right after).
+ */
+void akita_mali_vm_flush_later(int vm);
+void
+akita_mali_vm_flush_later(int vm)
+{
+	if (vm > 0 && vm < MAX_VMS && vms[vm].used) {
+		vms[vm].flush_pending = true;
 	}
 }
 
@@ -2004,6 +2023,10 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 	from_gpu(mq->user_out, 16);
 	if (mq->insert + sizeof(cmd) - *(volatile uint64_t *)mq->user_out > mq->ring_size) {
 		return 0;                       /* the ring is full: the GPU is that far behind */
+	}
+	if (vms[groups[g].vm].flush_pending) {
+		as_update(groups[g].vm);        /* (the binds since its last update: akita_mali_vm_flush_later) */
+		vms[groups[g].vm].flush_pending = false;
 	}
 	mq->submitted++;
 	busy_update();

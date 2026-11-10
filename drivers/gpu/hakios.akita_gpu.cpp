@@ -46,6 +46,7 @@ void akita_mali_vm_free(int vm);
 bool akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags);
 void akita_mali_vm_unmap(int vm, uint64_t va, uint64_t size);
 void akita_mali_vm_flush(int vm);
+void akita_mali_vm_flush_later(int vm);
 int akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority);
 void akita_mali_group_free(int g);
 uint64_t akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size);
@@ -130,6 +131,8 @@ struct hakios_surface {
 	uint32_t width, height, pixelFormat, planes;    /* and what they are */
 };
 #define kHakiosDescribe         0xffffffffu
+/* kHakiosSurfaceBusy: HakiosMetal's mark on a surface while a command buffer that draws into it is being recorded or run */
+struct hakios_surface_busy { uint32_t surface; int32_t delta; };
 struct drm_syncobj_create { uint32_t handle, flags; };
 #define SYNCOBJ_CREATE_SIGNALED 1u
 struct drm_syncobj_destroy { uint32_t handle, pad; };
@@ -154,6 +157,7 @@ enum {
 	kBoSync, kBoQueryInfo,
 	kSyncobjCreate = 0xbf, kSyncobjDestroy = 0xc0, kSyncobjWait = 0xc3, kSyncobjReset = 0xc4, kSyncobjSignal = 0xc5,
 	kSyncobjTimelineWait = 0xca, kSyncobjQuery = 0xcb, kSyncobjTransfer = 0xcc, kSyncobjTimelineSignal = 0xcd,
+	kHakiosSurfaceBusy = 0x7d,      /* not Linux's: a command buffer draws into an IOSurface (+1) or is done (-1) */
 	kHakiosSurface = 0x7e,          /* not Linux's: an IOSurface's memory as a buffer (as the Adreno service's) */
 	kHakiosDebug = 0x7f,            /* not Linux's: the queues' state into the kernel's log */
 };
@@ -161,6 +165,8 @@ enum {
 /* ---- the service ---- */
 
 static IOLock *gLock;
+static void busyChange(uint32_t sid, int32_t delta);
+extern "C" uint32_t hakios_fb_shown_surface(void);  /* MiniIOMobileFramebuffer.cpp */        /* (the surfaces being drawn: see MiniIOSurfaceDrawn) */
 
 class HakiosGPU : public IOService
 {
@@ -241,6 +247,7 @@ class HakiosGPUUserClient : public IOUserClient
 	int fVms[MAX_CLIENT_VMS];
 	int fGroups[MAX_CLIENT_GROUPS];
 	int fHeaps[MAX_CLIENT_HEAPS];              /* the kernel's heap slots (handle: index + 1) */
+	struct { uint32_t sid; int32_t count; } fBusy[16];     /* its kHakiosSurfaceBusy marks, undone at its close */
 
 	bool done(const struct fence *f);
 	bool syncPointDone(struct syncobj *s, uint64_t point, bool *submitted);
@@ -275,6 +282,7 @@ HakiosGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
 	for (int i = 0; i < MAX_CLIENT_VMS; i++) {
 		fVms[i] = -1;
 	}
+	bzero(fBusy, sizeof(fBusy));
 	for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
 		fGroups[i] = -1;
 	}
@@ -288,6 +296,13 @@ IOReturn
 HakiosGPUUserClient::clientClose(void)
 {
 	IOLockLock(gLock);
+	for (int i = 0; i < 16; i++) {
+		if (fBusy[i].count > 0) {
+			busyChange(fBusy[i].sid, -fBusy[i].count);
+		}
+		fBusy[i].sid = 0;
+		fBusy[i].count = 0;
+	}
 	for (int i = 0; i < MAX_CLIENT_GROUPS; i++) {
 		if (fGroups[i] >= 0) {
 			akita_mali_group_free(fGroups[i]);
@@ -422,10 +437,68 @@ HakiosGPUUserClient::syncSignal(uint32_t handle, uint64_t point, const struct fe
  * this the panel showed surfaces the Mali was still drawing (11-10). Upstream's Adreno driver marks each surface with its
  * own submission (hakios.gpu.cpp); the Mali's submissions do not name their buffers, hence all of it. True if done in time.
  */
+/*
+ * SURFACES BEING DRAWN (11-10): HakiosMetal marks a surface from the first draw a command buffer records into it until
+ * that command buffer is done (or dropped), and the display waits for the marks to go before it shows the surface --
+ * Apple's display waits on the surface's own GPU writes, whenever they were submitted. Waiting only for what had been
+ * submitted when the swap came was not enough: CoreAnimation draws some frames with several command buffers and presents
+ * from the first one's scheduled handler, before the others (the backdrop blur, a 3D layer) are even recorded -- the
+ * panel showed the home page without Spotlight's blur and keyboard, or the cube's row half drawn (white bands), in the
+ * tester's slow-motion clips with sb_debug's counter. Under gLock.
+ */
+#define BUSY_SURFACES 64
+static struct { uint32_t sid; int32_t count; } gBusy[BUSY_SURFACES];
+static uint64_t gBusyWaits, gBusyWaitAbs, gBusyStages;
+
+static void
+busyChange(uint32_t sid, int32_t delta)
+{
+	int free_slot = -1;
+
+	for (int i = 0; i < BUSY_SURFACES; i++) {
+		if (gBusy[i].sid == sid && gBusy[i].count > 0) {
+			gBusy[i].count += delta;
+			if (gBusy[i].count <= 0) {
+				gBusy[i].sid = 0;
+				gBusy[i].count = 0;
+			}
+			thread_wakeup((event_t)gBusy);         /* (any change: the grace watch below looks for new marks too) */
+			return;
+		}
+		if (free_slot < 0 && gBusy[i].count == 0) {
+			free_slot = i;
+		}
+	}
+	if (delta > 0 && sid == hakios_fb_shown_surface()) {
+		/* (11-10: a command buffer starts drawing into the surface the panel shows -- CoreAnimation had it back?) */
+		static uint32_t late;
+
+		if (late++ < 30 || late % 200 == 0) {
+			IOLog("HakiosGPU: surface %u drawn into while on the panel (%u times)\n", sid, late);
+		}
+	}
+	if (delta > 0 && free_slot >= 0) {
+		gBusy[free_slot].sid = sid;
+		gBusy[free_slot].count = delta;
+		thread_wakeup((event_t)gBusy);
+	}
+}
+
+static bool
+busyNow(uint32_t sid)
+{
+	for (int i = 0; i < BUSY_SURFACES; i++) {
+		if (gBusy[i].sid == sid && gBusy[i].count > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static uint64_t gDrawnWaits, gDrawnWaitAbs, gDrawnLate;
 
 bool
-MiniIOSurfaceDrawn(__unused MiniIOSurface *surface, uint64_t milliseconds)
+MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 {
 	uint64_t snap[64], deadline, t0 = mach_absolute_time();
 	unsigned n;
@@ -436,6 +509,54 @@ MiniIOSurfaceDrawn(__unused MiniIOSurface *surface, uint64_t milliseconds)
 	}
 	clock_interval_to_deadline((uint32_t)milliseconds, kMillisecondScale, &deadline);
 	IOLockLock(gLock);
+	/* the command buffers drawing into it, recorded or running, done first (the marks: busyChange) -- and the grace
+	 * below whenever the GPU still has work at all: a frame presented before its main stage is recorded has no mark
+	 * yet (the screen recording: every half-drawn frame was recorded with the GPU busy) */
+	n = akita_mali_snapshot(snap, 64);
+	if (surface != NULL && milliseconds != 0 && (busyNow(surface->sid) || !akita_mali_done(snap, n))) {
+		uint64_t b0 = mach_absolute_time();
+
+		while (busyNow(surface->sid) && mach_absolute_time() < deadline) {
+			assert_wait_deadline((event_t)gBusy, THREAD_UNINT, deadline);
+			IOLockUnlock(gLock);
+			thread_block(THREAD_CONTINUE_NULL);
+			IOLockLock(gLock);
+		}
+		/*
+		 * ... AND A GRACE (11-10): CoreAnimation draws some frames in stages -- what a backdrop blurs is drawn and DONE
+		 * first, only then the blur and what is over it (the dock, Spotlight, the widgets page, sb_cube's windows) --
+		 * presenting with the first stage, before the next is even recorded. Marks gone while waiting, the next stage
+		 * may come: watched for fb_busy_grace_us (2500) more, a new mark waited for in turn. The screen recording
+		 * (rec=4) showed such frames: the home screen without its dock, the cube and the strip.
+		 */
+		static uint32_t grace_us = 0xffffffff;
+		uint64_t grace_abs, until;
+
+		if (grace_us == 0xffffffff && !PE_parse_boot_argn("fb_busy_grace_us", &grace_us, sizeof(grace_us))) {
+			grace_us = 2500;
+		}
+		nanoseconds_to_absolutetime((uint64_t)grace_us * NSEC_PER_USEC, &grace_abs);
+		until = mach_absolute_time() + grace_abs;
+		while (grace_us != 0 && mach_absolute_time() < until && mach_absolute_time() < deadline) {
+			if (busyNow(surface->sid)) {
+				gBusyStages++;
+				while (busyNow(surface->sid) && mach_absolute_time() < deadline) {
+					assert_wait_deadline((event_t)gBusy, THREAD_UNINT, deadline);
+					IOLockUnlock(gLock);
+					thread_block(THREAD_CONTINUE_NULL);
+					IOLockLock(gLock);
+				}
+				until = mach_absolute_time() + grace_abs;
+				continue;
+			}
+			assert_wait_deadline((event_t)gBusy, THREAD_UNINT, until);
+			IOLockUnlock(gLock);
+			thread_block(THREAD_CONTINUE_NULL);
+			IOLockLock(gLock);
+		}
+		gBusyWaits++;
+		gBusyWaitAbs += mach_absolute_time() - b0;
+	}
 	n = akita_mali_snapshot(snap, 64);
 	while (!(done = akita_mali_done(snap, n)) && mach_absolute_time() < deadline) {
 		/* until the GPU's JOB interrupt (a submission done) or a millisecond, the lock dropped meanwhile */
@@ -453,6 +574,9 @@ MiniIOSurfaceDrawn(__unused MiniIOSurface *surface, uint64_t milliseconds)
 		absolutetime_to_nanoseconds(gDrawnWaitAbs, &ns);
 		IOLog("HakiosGPU: the display waited for the GPU %llu us a frame on average over %llu frames (%llu not in time)\n",
 		    ns / 1000 / gDrawnWaits, gDrawnWaits, gDrawnLate);
+		absolutetime_to_nanoseconds(gBusyWaitAbs, &ns);
+		IOLog("HakiosGPU: ... %llu of them waited for command buffers still drawing into the surface, %llu us each; %llu "
+		    "later stages caught in the grace\n", gBusyWaits, gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages);
 	}
 	return done;
 }
@@ -573,6 +697,8 @@ IOReturn
 HakiosGPUUserClient::vmBind(struct drm_panthor_vm_bind *b)
 {
 	struct drm_panthor_vm_bind_op op;
+	bool unmapped = false;
+	static uint32_t binds, pages;
 
 	if (!ownsVm(b->vm_id) || b->ops.stride < sizeof(op) - sizeof(op.syncs)) {
 		return kIOReturnBadArgument;
@@ -592,22 +718,33 @@ HakiosGPUUserClient::vmBind(struct drm_panthor_vm_bind *b)
 			if (bo == NULL || bo->memory == NULL || op.bo_offset + op.size > bo->size || op.bo_offset & 0xfff) {
 				return kIOReturnBadArgument;
 			}
-			for (uint64_t off = 0; off < op.size; off += 0x1000) {
-				IOByteCount len;
+			/* a physically contiguous piece at a time (getPhysicalSegment once a piece, not once a page) */
+			for (uint64_t off = 0; off < op.size;) {
+				IOByteCount len = 0;
 				addr64_t phys = bo->memory->getPhysicalSegment(op.bo_offset + off, &len, kIOMemoryMapperNone);
 
-				if (off == 0) {
-					IOLog("HakiosGPU: bind of buffer %u at 0x%llx: its first page at 0x%llx\n", op.bo_handle, op.va,
-					    (unsigned long long)phys);
+				if (off == 0 && binds < 16) {
+					IOLog("HakiosGPU: bind of buffer %u at 0x%llx: its first page at 0x%llx (the first 16 said)\n",
+					    op.bo_handle, op.va, (unsigned long long)phys);
 				}
-				if (phys == 0 || !akita_mali_vm_map((int)b->vm_id, op.va + off, phys, op.flags & 7)) {
+				if (phys == 0 || len < 0x1000) {
 					return kIOReturnNoMemory;
 				}
+				for (uint64_t piece = 0; piece + 0x1000 <= len && off < op.size; piece += 0x1000, off += 0x1000) {
+					if (!akita_mali_vm_map((int)b->vm_id, op.va + off, phys + piece, op.flags & 7)) {
+						return kIOReturnNoMemory;
+					}
+					pages++;
+				}
+			}
+			if (++binds % 500 == 0) {
+				IOLog("HakiosGPU: %u binds (%u pages); a map's update waits for the next submission\n", binds, pages);
 			}
 			break;
 		}
 		case BIND_OP_TYPE_UNMAP:
 			akita_mali_vm_unmap((int)b->vm_id, op.va, op.size);
+			unmapped = true;
 			break;
 		default:
 			break;                          /* SYNC_ONLY: nothing to do here, the binds are done at once */
@@ -623,7 +760,11 @@ HakiosGPUUserClient::vmBind(struct drm_panthor_vm_bind *b)
 			}
 		}
 	}
-	akita_mali_vm_flush((int)b->vm_id);
+	if (unmapped) {
+		akita_mali_vm_flush((int)b->vm_id);             /* (at once: the memory may be freed after) */
+	} else {
+		akita_mali_vm_flush_later((int)b->vm_id);       /* (before the VM's next submission: akita_mali_submit) */
+	}
 	return kIOReturnSuccess;
 }
 
@@ -809,6 +950,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		struct drm_panthor_tiler_heap_destroy heapDestroy;
 		struct drm_gem_close gemClose;
 		struct hakios_surface surface;
+		struct hakios_surface_busy surfaceBusy;
 		struct drm_syncobj_create syncCreate;
 		struct drm_syncobj_destroy syncDestroy;
 		struct drm_syncobj_wait syncWait;
@@ -1094,6 +1236,56 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	case kHakiosSurface:
 		ret = surfaceBuffer(&r.surface);
 		break;
+	case kHakiosSurfaceBusy: {
+		int at = -1;
+
+		/* the client's own account first: it can only take back what it marked */
+		for (int i = 0; i < 16; i++) {
+			if (fBusy[i].count > 0 && fBusy[i].sid == r.surfaceBusy.surface) {
+				at = i;
+				break;
+			}
+			if (at < 0 && fBusy[i].count == 0 && r.surfaceBusy.delta > 0) {
+				at = i;
+			}
+		}
+		if (at < 0 || r.surfaceBusy.delta == 0 || r.surfaceBusy.delta > 1 || r.surfaceBusy.delta < -1 ||
+		    (r.surfaceBusy.delta < 0 && fBusy[at].count <= 0)) {
+			break;                          /* (no room, or nothing of its to take back: not marked) */
+		}
+		/*
+		 * NOT INTO THE SURFACE ON THE PANEL (11-10): a command buffer beginning to draw into the surface the panel shows
+		 * waits until the panel has moved on (25 ms at most) -- as Apple's GPU holds work for a surface the display still
+		 * scans. CoreAnimation, double buffered, begins its next frame in the surface shown (the screen recording's half
+		 * drawn frames); SwapWait need not hold it back for this (it answers at once again: fb_swapwait=0 default).
+		 */
+		static uint32_t hold = 0xffffffff;
+
+		if (hold == 0xffffffff && !PE_parse_boot_argn("gpu_hold", &hold, sizeof(hold))) {
+			hold = 0;       /* (off: with SwapWait answered once a swap's switch is set up it is not needed, and it can
+					 * stall -- CoreAnimation's thread held for the surface on the panel while the frame that would
+					 * move the panel on waits for that same thread: 12 ms a frame, 55 a second) */
+		}
+		if (hold && r.surfaceBusy.delta > 0 && r.surfaceBusy.surface == hakios_fb_shown_surface()) {
+			static uint32_t held, held_ms;
+
+			held++;
+			for (int ms = 0; ms < 25 && r.surfaceBusy.surface == hakios_fb_shown_surface(); ms++) {
+				IOLockUnlock(gLock);
+				IOSleep(1);
+				IOLockLock(gLock);
+				held_ms++;
+			}
+			if (held % 2000 == 1) {
+				IOLog("HakiosGPU: %u command buffers held until the panel left their surface, %u ms in all\n", held,
+				    held_ms);
+			}
+		}
+		fBusy[at].sid = r.surfaceBusy.surface;
+		fBusy[at].count += r.surfaceBusy.delta;
+		busyChange(r.surfaceBusy.surface, r.surfaceBusy.delta);
+		break;
+	}
 	case kHakiosDebug:
 		akita_mali_debug();
 		break;
