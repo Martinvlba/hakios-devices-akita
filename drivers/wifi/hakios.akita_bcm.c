@@ -26,7 +26,8 @@
  *              post, D2H control, tx and rx completions), the index arrays the chip DMAs its read and write indices
  *              to and from (the "DMA indices" its flags offer), brcmfmac's scratch and ring-update buffers --, all
  *              described in the chip's ring table; "host ready" (doorbell 1); 8 ioctl-answer and 8 event buffers
- *              posted on the control ring
+ *              posted on the control ring; 256 data buffers of 2 KB on the rx post ring (the firmware's SPLITRX puts
+ *              received frames' payloads into host buffers), given back on the rx completion ring and posted again
  *   6  talks   the first ioctls: "ver" (the firmware's version, the line Android logs), "cur_etheraddr" (only its
  *              first and last bytes in the log); then the regulatory database (fw/bcmdhd_clm.blob_4383_a3, "clmload")
  *              and the transmit caps (fw/bcmdhd_txcap.blob_4383_a3, "txcapload") in chunks of 1400 bytes; events
@@ -34,10 +35,15 @@
  *   7  talks   the events this driver wants ("event_msgs"), power saving off ("mpc" 0), infrastructure mode, the
  *              radio up (WLC_UP), an escan of every channel (scan parameters version 2 if "scan_ver" says so), the
  *              access points it heard: name, band, channel, signal, protection (BSSIDs shortened in the log)
- *   8  talks   the network of fw/network (a name and a passphrase, the tester's; only their lengths in the log)
- *              joined as WPA2-PSK with AES, the firmware's own supplicant ("sup_wpa", WLC_SET_WSEC_PMK with the
- *              passphrase), WLC_SET_SSID; the events awaited: set SSID, link, the supplicant's "keyed"
- * The chip is left running, polled (no interrupts yet); the chip's deep-sleep requests are acked as brcmfmac does.
+ *   8  carries en0 (drivers/net/hakios.net.c) on the chip: frames received handed to the network stack, frames sent
+ *              on a flow ring of our own (created with the first one); link up for the stack when associated and keyed.
+ *              Then the station (sys/hakios.sta.h, drivers/wifi/hakios.sta.c): Darwin's Wi-Fi side -- wifid, Settings
+ *              -- asks it for the radio's power, scans, joins and leaves; and the network of fw/network (a name and a
+ *              passphrase, the tester's; only their lengths in the log) asked of it as a standing request: WPA2-PSK
+ *              with AES by the firmware's own supplicant ("sup_wpa", WLC_SET_WSEC_PMK with the passphrase),
+ *              WLC_SET_SSID, the events awaited (11-10: keyed 7.4 s after the request, once rx buffers were posted)
+ * The chip is left running, polled (no interrupts yet: en0's thread polls); the chip's deep-sleep requests are acked as
+ * brcmfmac does.
  *
  * How the chip is reached: BAR0 (64 KB at 0x60200000) shows 4 KB of the chip's backplane at the address in its
  * configuration register 0x80 (the "BAR0 window"); BAR0 + 0x2000 is always the PCIe core's registers. BAR2 (4 MB at
@@ -57,6 +63,11 @@
 #include <pexpert/pexpert.h>
 #include <sys/random.h>
 #include <sys/systm.h>
+#include <sys/hakios.net.h>
+#include <sys/hakios.sta.h>
+#include <pexpert/device_tree.h>
+#include <sys/errno.h>
+#include <kern/locks.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
 
@@ -644,6 +655,14 @@ console_say(uint32_t shared)
 #define MSG_IOCTL_CMPLT         0xc
 #define MSG_EVENT_BUF_POST      0xd
 #define MSG_WL_EVENT            0xe
+#define MSG_FLOW_RING_CREATE    0x3
+#define MSG_FLOW_RING_CREATE_CMPLT 0x4
+#define MSG_FLOW_RING_DELETE    0x5
+#define MSG_FLOW_RING_DELETE_CMPLT 0x6
+#define MSG_TX_POST             0xf
+#define MSG_TX_STATUS           0x10
+#define MSG_RXBUF_POST          0x11
+#define MSG_RX_CMPLT            0x12
 
 #define WLC_GET_VAR             262
 #define WLC_SET_VAR             263
@@ -658,6 +677,9 @@ console_say(uint32_t shared)
 #define RINGS                   5
 #define CTRL_BUFS               8               /* ioctl response buffers posted, and as many for events */
 #define CTRL_BUF_SIZE           8192
+#define RX_BUFS                 256             /* data buffers posted on the rx post ring (brcmfmac: max_rxbufpost) */
+#define RX_BUF_SIZE             2048            /* brcmfmac's BRCMF_MSGBUF_MAX_PKT_SIZE */
+#define RX_ID_BASE              0x100           /* their request ids: RX_ID_BASE + n (the control buffers' are 1..16) */
 
 static const uint16_t ring_items[RINGS] = { 64, 1024, 64, 1024, 1024 };
 static const uint16_t ring_item_size[RINGS] = { 40, 32, 24, 24, 40 };
@@ -686,7 +708,37 @@ static struct {
 	uint32_t shared, h2d_mb, d2h_mb, rx_dataoffset;
 	uint32_t tcm_h2d_r;             /* the chip's own array of H2D read indices (4 bytes apart) */
 	unsigned events;
+	uint8_t *rx_buf;                /* RX_BUFS data buffers of RX_BUF_SIZE in one piece of their own (uncached view) */
+	uint64_t rx_buf_pa;
+	unsigned rx_posted;             /* on the rx post ring, not yet given back */
+	unsigned rx_frames, rx_eapol, rx_bad, rx_bytes;
+	uint16_t rx_types[8];           /* the first ethertypes seen, for the log */
+	unsigned rx_type_count[8];
 } mb;
+
+/*
+ * The rings' lock, from the start of the steps: once en0 is up, its thread (the completion rings, every 2-10 ms), the
+ * stack's sender and the station's thread (the ioctls of a scan or a join) all reach them. bcm_ioctl takes it itself;
+ * the long waits (a scan, a join) take it for each look and let go between.
+ */
+static lck_grp_t *wl_group;
+static lck_mtx_t *wl_lock;
+
+static inline void
+wl_take(void)
+{
+	if (wl_lock != NULL) {
+		lck_mtx_lock(wl_lock);
+	}
+}
+
+static inline void
+wl_give(void)
+{
+	if (wl_lock != NULL) {
+		lck_mtx_unlock(wl_lock);
+	}
+}
 
 /* how far the chip has read an H2D ring: from the array it DMAs to us, or (if that has not moved) its own */
 static uint16_t
@@ -701,24 +753,30 @@ h2d_read_index(unsigned ring)
 }
 
 /* one physically contiguous piece, its cache flushed and seen through an uncached mapping from then on */
-static bool
-dma_init(uint32_t size)
+static vm_offset_t
+dma_piece(uint32_t size, uint64_t *pa)
 {
 	vm_offset_t cached = 0;
 
 	size = (uint32_t)round_page(size);
 	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		return false;
+		return 0;
 	}
 	bzero((void *)cached, size);
 	for (vm_offset_t line = cached; line < cached + size; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	dma.pa = kvtophys(cached);
-	dma.va = ml_io_map_unmappable(dma.pa, size, VM_WIMG_WCOMB);
-	dma.size = size;
+	*pa = kvtophys(cached);
+	return ml_io_map_unmappable(*pa, size, VM_WIMG_WCOMB);
+}
+
+static bool
+dma_init(uint32_t size)
+{
+	dma.va = dma_piece(size, &dma.pa);
+	dma.size = (uint32_t)round_page(size);
 	dma.used = 0;
 	return dma.va != 0;
 }
@@ -770,18 +828,41 @@ mb_data_send(uint32_t value)
 	wr(cfg, CFG_SBMBX, 1);
 }
 
-/* the chip's mailbox word: deep sleep requests answered (as brcmfmac), a halt said */
+static bool fw_halted;                          /* the firmware trapped: nothing more is asked of it (no recovery yet) */
+static void fw_halt_said(void);
+
+/* the chip's mailbox word: deep sleep requests answered (as brcmfmac), a halt said -- with the firmware's console, where
+ * it prints its trap (11-10, rejoin1: it halted during the fourth handshake with a wrong passphrase) */
 static void
 mb_data_check(void)
 {
-	uint32_t d = mem_rd(mb.d2h_mb);
+	uint32_t d;
 
+	if (fw_halted) {
+		return;
+	}
+	d = mem_rd(mb.d2h_mb);
 	if (d == 0) {
 		return;
 	}
 	mem_wr(mb.d2h_mb, 0);
-	printf("wifi: %u: the chip's mailbox: 0x%08x%s%s%s\n", step, d, (d & D2H_MB_DS_ENTER_REQ) ? " (deep sleep asked: acked)" :
+	printf("wifi: %u: the chip's mailbox: 0x%08x%s%s%s\n", step, d, (d & D2H_MB_DS_ENTER_REQ) ? " (deep sleep asked)" :
 	    "", (d & D2H_MB_DS_EXIT_NOTE) ? " (deep sleep over)" : "", (d & D2H_MB_FWHALT) ? " (THE FIRMWARE HALTED)" : "");
+	if (d & D2H_MB_FWHALT) {
+		fw_halted = true;
+		/* where every ring stood: the firmware's write against our read on the completion rings, ours against its on
+		 * the submission rings (control, rx post, the flow ring) -- which one was it waiting on? */
+		printf("wifi: at the halt: D2H ctrl w %u r %u, txcpl w %u r %u, rxcpl w %u r %u; H2D ctrl w %u r %u, rxpost w %u r %u, "
+		    "flow w %u r %u; %u rx buffers posted, %u frames received, %u events\n",
+		    mb.idx[mb.d2h_w + 0], mb.r[RING_D2H_CTRL], mb.idx[mb.d2h_w + 1], mb.r[RING_D2H_TXCPL], mb.idx[mb.d2h_w + 2],
+		    mb.r[RING_D2H_RXCPL], mb.w[RING_H2D_CTRL], h2d_read_index(RING_H2D_CTRL), mb.w[RING_H2D_RXPOST],
+		    h2d_read_index(RING_H2D_RXPOST), mb.idx[mb.h2d_w + 2], mb.idx[mb.h2d_r + 2], mb.rx_posted, mb.rx_frames,
+		    mb.events);
+		printf("wifi: the firmware's console, its last words (pcie_shared flags 0x%08x):\n", mem_rd(mb.shared + SHARED_FLAGS));
+		console_say(mb.shared);
+		fw_halt_said();
+		return;
+	}
 	if (d & D2H_MB_DS_ENTER_REQ) {
 		mb_data_send(H2D_MB_DS_ACK);
 	}
@@ -813,6 +894,16 @@ h2d_commit(unsigned ring, unsigned count)
 }
 
 /* ---- events ---- */
+
+static void en0_link_update(void);
+static bool en0_attached;
+static bool en0_live;                           /* the rings and the flow ring there: en0 carries frames (step 8) */
+static void sta_heard_add(const uint8_t *b, uint32_t blen);
+static void sta_link_check(void);
+static bool sta_collect;
+static volatile int sta_phase;                  /* (the station's state: defined with the station, below) */
+static struct hakios_sta_bss sta_bss;
+static bool bss_now(struct hakios_sta_bss *x, bool locked);
 
 #define EV_SET_SSID             0
 #define EV_AUTH                 3
@@ -888,6 +979,9 @@ escan_result(const uint8_t *d, uint32_t len)
 		if (i == heard_count && heard_count < HEARD_MOST) {
 			heard[heard_count++] = h;
 		}
+		if (sta_collect) {
+			sta_heard_add(b, blen);
+		}
 		at += (blen + 3) & ~3u;
 	}
 }
@@ -896,7 +990,15 @@ static void
 event_handle(const uint8_t *frame, uint32_t length)
 {
 	if (length < EVENT_HDR + EVENT_MSG) {
-		printf("wifi: %u: an event of %u bytes\n", step, length);
+		/* (11-09: three of 54 bytes during the join -- shorter than a WLC event: from the ethertype on, to decode) */
+		char hex[3 * 64 + 1];
+		unsigned at = 0;
+
+		hex[0] = 0;
+		for (uint32_t i = 12; i < length && i < 12 + 64; i++) {
+			at += (unsigned)snprintf(hex + at, sizeof(hex) - at, " %02x", frame[i]);
+		}
+		printf("wifi: %u: an event of %u bytes; from byte 12:%s\n", step, length, hex);
 		return;
 	}
 	const uint8_t *e = frame + EVENT_HDR;
@@ -943,6 +1045,8 @@ event_handle(const uint8_t *frame, uint32_t length)
 	}
 	printf("wifi: %u: event %u%s, status %u, reason %u, flags 0x%x, %u bytes\n", step, type, name, status, reason, flags,
 	    datalen);
+	en0_link_update();
+	sta_link_check();
 }
 
 static void
@@ -961,6 +1065,151 @@ ctrl_buf_post(uint32_t id)
 	put32(item, 20, (uint32_t)(mb.ctrl_buf_pa[id - 1] >> 32));
 	h2d_commit(RING_H2D_CTRL, 1);
 }
+
+/* ---- received frames: data buffers on the rx post ring, given back on the rx completion ring ---- */
+
+/*
+ * Data buffers for received frames (brcmfmac's rxbuf_data_post): the firmware runs SPLITRX (its boot log: mode 4) --
+ * a received data frame's payload goes straight into a HOST buffer from the rx post ring. With none posted (11-09) the
+ * join associated but the WPA2 handshake never started: EAPOL's first message had nowhere to land. Posted here until
+ * RX_BUFS are out (or the ring is full); each comes back with a frame on the rx completion ring and is posted again.
+ */
+static void
+rx_post(unsigned n)
+{
+	uint8_t *item = h2d_reserve(RING_H2D_RXPOST);
+
+	if (item == NULL) {
+		return;
+	}
+	uint64_t pa = mb.rx_buf_pa + (uint64_t)n * RX_BUF_SIZE;
+
+	item[0] = MSG_RXBUF_POST;
+	put32(item, 4, RX_ID_BASE + n);
+	put16(item, 10, RX_BUF_SIZE);
+	put32(item, 24, (uint32_t)pa);
+	put32(item, 28, (uint32_t)(pa >> 32));
+	h2d_commit(RING_H2D_RXPOST, 1);
+	mb.rx_posted++;
+}
+
+/* (boot-arg wifi_rxbufs=N: fewer posted, a test -- the firmware's packet ids ran out after a few associations, 11-10) */
+static uint32_t rx_bufs = RX_BUFS;
+
+static bool
+rx_setup(void)
+{
+	PE_parse_boot_argn("wifi_rxbufs", &rx_bufs, sizeof(rx_bufs));
+	if (rx_bufs == 0 || rx_bufs > RX_BUFS) {
+		rx_bufs = RX_BUFS;
+	}
+	mb.rx_buf = (uint8_t *)dma_piece(RX_BUFS * RX_BUF_SIZE, &mb.rx_buf_pa);
+	if (mb.rx_buf == NULL) {
+		return false;
+	}
+	for (unsigned n = 0; n < rx_bufs; n++) {
+		rx_post(n);
+	}
+	return true;
+}
+
+/* one received frame (Ethernet: the firmware hands 802.3 frames): counted by ethertype, EAPOL said */
+static void
+rx_frame(const uint8_t *f, uint32_t len, uint16_t flags, uint8_t ifidx)
+{
+	uint16_t type = len >= 14 ? (uint16_t)(f[12] << 8 | f[13]) : 0;
+	unsigned i;
+
+	mb.rx_frames++;
+	mb.rx_bytes += len;
+	for (i = 0; i < 8 && mb.rx_type_count[i] != 0 && mb.rx_types[i] != type; i++) {
+	}
+	if (i < 8) {
+		mb.rx_types[i] = type;
+		mb.rx_type_count[i]++;
+	}
+	if (en0_attached && en0_live && ifidx == 0 && len >= 14 && len <= HAKIOS_NET_FRAME_MAX) {
+		hakios_net_input(f, len);
+	}
+	if (type == 0x888e) {
+		/* EAPOL: version, type (3: key), length; the key's descriptor type and its key information (which message) */
+		mb.rx_eapol++;
+		printf("wifi: %u: EAPOL frame received: %u bytes, version %u, type %u, key descriptor %u, key info 0x%04x "
+		    "(flags 0x%x, interface %u)\n", step, len, len > 14 ? f[14] : 0, len > 15 ? f[15] : 0, len > 18 ? f[18] : 0,
+		    len > 20 ? (unsigned)(f[19] << 8 | f[20]) : 0, flags, ifidx);
+	} else if (mb.rx_frames <= 8) {
+		printf("wifi: %u: frame received: %u bytes, ethertype 0x%04x (flags 0x%x, interface %u)\n", step, len, type, flags,
+		    ifidx);
+	}
+}
+
+/* what the chip has put on the rx completion ring (and the tx completion ring: nothing sent by the host yet) */
+static unsigned
+d2h_rx_poll(void)
+{
+	unsigned n = 0;
+	uint16_t w = (uint16_t)mb.idx[mb.d2h_w + (RING_D2H_RXCPL - 2)];
+
+	if (mb.rx_buf == NULL || w >= ring_items[RING_D2H_RXCPL]) {
+		return 0;
+	}
+	while (mb.r[RING_D2H_RXCPL] != w) {
+		const uint8_t *m = mb.ring[RING_D2H_RXCPL] + (uint32_t)mb.r[RING_D2H_RXCPL] * ring_item_size[RING_D2H_RXCPL];
+		uint32_t id = get32(m, 4);
+		uint16_t len = get16(m, 14), offset = get16(m, 16), flags = get16(m, 18), status = get16(m, 8);
+
+		if (m[0] == MSG_RX_CMPLT && status != 0) {
+			/* (a buffer given back without a frame: flushed by the firmware? -- counted, posted again below) */
+			static unsigned said;
+
+			if (said++ < 8) {
+				printf("wifi: rx completion with status %u (id 0x%x, %u bytes)\n", status, id, len);
+			}
+			len = 0;
+		}
+		if (m[0] == MSG_RX_CMPLT && id >= RX_ID_BASE && id < RX_ID_BASE + RX_BUFS) {
+			unsigned b = id - RX_ID_BASE;
+
+			if (offset == 0) {
+				offset = (uint16_t)mb.rx_dataoffset;
+			}
+			if (offset + (uint32_t)len <= RX_BUF_SIZE) {
+				rx_frame(mb.rx_buf + (uint32_t)b * RX_BUF_SIZE + offset, len, flags, m[1]);
+			} else {
+				mb.rx_bad++;
+			}
+			mb.rx_posted--;
+			rx_post(b);
+		} else {
+			mb.rx_bad++;
+			if (mb.rx_bad <= 4) {
+				printf("wifi: %u: rx completion ring: message type 0x%x, id 0x%x\n", step, m[0], id);
+			}
+		}
+		mb.r[RING_D2H_RXCPL] = (uint16_t)((mb.r[RING_D2H_RXCPL] + 1) % ring_items[RING_D2H_RXCPL]);
+		mb.idx[mb.d2h_r + (RING_D2H_RXCPL - 2)] = mb.r[RING_D2H_RXCPL];
+		n++;
+	}
+	return n;
+}
+
+static void
+rx_say(void)
+{
+	char types[8 * 16];
+	unsigned at = 0;
+
+	types[0] = 0;
+	for (unsigned i = 0; i < 8 && mb.rx_type_count[i] != 0; i++) {
+		at += (unsigned)snprintf(types + at, sizeof(types) - at, " 0x%04x:%u", mb.rx_types[i], mb.rx_type_count[i]);
+	}
+	printf("wifi: %u: received %u frames (%u bytes), %u EAPOL, %u bad; by ethertype:%s; %u buffers posted\n", step,
+	    mb.rx_frames, mb.rx_bytes, mb.rx_eapol, mb.rx_bad, at ? types : " none", mb.rx_posted);
+}
+
+static void flow_created(int16_t status, uint16_t ring);
+static void flow_deleted(int16_t status, uint16_t ring);
+static unsigned d2h_tx_poll(void);
 
 /* what the chip has put on its control completion ring */
 static unsigned
@@ -996,6 +1245,12 @@ d2h_ctrl_poll(void)
 				ctrl_buf_post(id);
 			}
 			break;
+		case MSG_FLOW_RING_CREATE_CMPLT:
+			flow_created((int16_t)get16(m, 8), get16(m, 10));
+			break;
+		case MSG_FLOW_RING_DELETE_CMPLT:
+			flow_deleted((int16_t)get16(m, 8), get16(m, 10));
+			break;
 		case MSG_GEN_STATUS:
 		case MSG_RING_STATUS:
 			printf("wifi: %u: %s status %d (ring %u)\n", step, type == MSG_GEN_STATUS ? "general" : "ring",
@@ -1008,6 +1263,8 @@ d2h_ctrl_poll(void)
 		mb.idx[mb.d2h_r + (RING_D2H_CTRL - 2)] = mb.r[RING_D2H_CTRL];
 		n++;
 	}
+	n += d2h_rx_poll();
+	n += d2h_tx_poll();
 	mb_data_check();
 	return n;
 }
@@ -1016,8 +1273,21 @@ d2h_ctrl_poll(void)
  * One ioctl: `cmd`, `in` (of `in_len`, the input) and room for `out_len` in the answer; the answer is copied into
  * `out` (up to out_len). Returns the firmware's status (0: done), or -1000 for no answer within 2 s.
  */
+static int bcm_ioctl_locked(uint32_t cmd, const void *in, uint32_t in_len, void *out, uint32_t out_len);
+
 static int
 bcm_ioctl(uint32_t cmd, const void *in, uint32_t in_len, void *out, uint32_t out_len)
+{
+	int err;
+
+	wl_take();
+	err = bcm_ioctl_locked(cmd, in, in_len, out, out_len);
+	wl_give();
+	return err;
+}
+
+static int
+bcm_ioctl_locked(uint32_t cmd, const void *in, uint32_t in_len, void *out, uint32_t out_len)
 {
 	uint8_t *item;
 	uint32_t len = in_len > out_len ? in_len : out_len;
@@ -1227,11 +1497,16 @@ rings_up(uint32_t shared)
 	for (uint32_t id = 1; id <= 2 * CTRL_BUFS; id++) {
 		ctrl_buf_post(id);
 	}
+	if (!rx_setup()) {
+		printf("wifi: 5: no memory in one piece for the rx buffers (%u KB): frames cannot be received\n",
+		    RX_BUFS * RX_BUF_SIZE / 1024);
+	}
 	sleep_ms(50);
 	(void)d2h_ctrl_poll();
 	printf("wifi: 5: %u ioctl and %u event buffers posted; the chip has read the control ring to %u (of %u written); "
-	    "mailbox interrupts 0x%08x\n", CTRL_BUFS, CTRL_BUFS, mb.idx[mb.h2d_r + RING_H2D_CTRL], mb.w[RING_H2D_CTRL],
-	    pcie_rd(PCIE_MAILBOX_INT));
+	    "%u rx buffers of %u bytes posted at 0x%llx, the rx post ring read to %u (of %u); mailbox interrupts 0x%08x\n",
+	    CTRL_BUFS, CTRL_BUFS, mb.idx[mb.h2d_r + RING_H2D_CTRL], mb.w[RING_H2D_CTRL], mb.rx_posted, RX_BUF_SIZE,
+	    mb.rx_buf_pa, h2d_read_index(RING_H2D_RXPOST), mb.w[RING_H2D_RXPOST], pcie_rd(PCIE_MAILBOX_INT));
 	return true;
 }
 
@@ -1274,6 +1549,27 @@ scan_all(void)
 		mask[wanted[i] / 8] |= (uint8_t)(1u << (wanted[i] % 8));
 	}
 	printf("wifi: 7: \"event_msgs\" read: %d; set: %d\n", err, iovar_set("event_msgs", mask, sizeof(mask)));
+	{
+		/*
+		 * The address: the one iBoot reports, the loader's /chosen mac-address-wifi0 (what MobileGestalt builds the
+		 * phone's identity from), set before the radio comes up -- en0's on an iPhone is that one. Else the chip makes
+		 * up a new one at every start, and configd's interfaces (NetworkInterfaces.plist, by address) see a new radio
+		 * each time. (The loader's is a fixed local one today; the phone's own is wlan_mac1 of ABL's device tree.)
+		 */
+		DTEntry chosen;
+		void const *mac = NULL;
+		unsigned int size = 0;
+
+		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+		    SecureDTGetProperty(chosen, "mac-address-wifi0", &mac, &size) == kSuccess && size == 6) {
+			const uint8_t *m = mac;
+
+			printf("wifi: 7: \"cur_etheraddr\" set to the device tree's mac-address-wifi0 (%02x:xx:xx:xx:xx:%02x): %d\n",
+			    m[0], m[5], iovar_set("cur_etheraddr", m, 6));
+		} else {
+			printf("wifi: 7: no mac-address-wifi0 in the device tree's /chosen: the chip's own address\n");
+		}
+	}
 	printf("wifi: 7: \"mpc\" 0: %d; infrastructure: %d; up: %d\n", iovar_int("mpc", 0), cmd_int(20, 1), cmd_int(2, 1));
 	err = iovar_get("scan_ver", &scan_ver, sizeof(scan_ver));
 	printf("wifi: 7: \"scan_ver\": %d, %u\n", err, scan_ver);
@@ -1390,62 +1686,901 @@ network_file(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned
 	return true;
 }
 
-/* step 8: WPA2-PSK (AES) with the firmware's supplicant: the passphrase handed over, the SSID set, the events awaited */
+/*
+ * ---- step 8: en0 on the chip ----
+ *
+ * The interface (drivers/net/hakios.net.c, sys/hakios.net.h: Ethernet to the stack, "Wi-Fi" by its subfamily) on top of
+ * this driver's rings: received frames (rx_frame, interface 0) handed to hakios_net_input; frames to send copied into
+ * buffers of our own and posted on ONE flow ring (a station sends everything to its access point: brcmfmac's STA flow
+ * hash, one ring per priority -- one for all here), created with the first frame's destination as brcmfmac does;
+ * TX_STATUS gives the buffer back. Link up for the stack once associated AND keyed (configd starts DHCP then). The
+ * stack's sender and the interface's thread (its poll: the completion rings) take wl_lock; the one-shot steps before
+ * are done by then. The address: the chip's own for now (it changes each start: the phone's is wlan_mac1 of the device
+ * tree, to set with "cur_etheraddr" before the radio comes up -- a phone identifier, never in git).
+ */
+#define FLOW_ITEMS              512             /* brcmfmac's BRCMF_H2D_TXFLOWRING_MAX_ITEM and ITEMSIZE */
+#define FLOW_ITEM_SIZE          48
+#define FLOW_H2D_INDEX          2               /* the first flow ring: H2D ring 2 (after control and rx post) */
+#define TX_BUFS                 128
+#define TX_BUF_SIZE             2048
+#define TX_ID_BASE              0x1000
+
+static struct {
+	uint8_t *ring, *buf;
+	uint64_t ring_pa, buf_pa;
+	uint16_t w;
+	int state;                      /* 0 none, 1 asked, 2 ready, 3 being deleted, -1 refused */
+	uint32_t busy[TX_BUFS / 32];
+	unsigned sent, done, dropped, outstanding;
+	uint8_t address[6];
+} tx;
+static bool en0_link_said;
+
+static void flow_create(const uint8_t *da);
+static void flow_delete(void);
+
 static void
-join_network(void)
+en0_link_update(void)
 {
-	uint8_t name[32], pass[64], pmk[2 + 2 + 256 + 2], params[52];
-	unsigned name_len = sizeof(name), pass_len = sizeof(pass);
+	static const uint8_t everyone[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	bool up = link_up && keyed;
+
+	/* the network left or lost: its flow ring deleted, as brcmfmac deletes a peer's (a new one at the next join);
+	 * boot-arg wifi_flow_keep=1: kept for the next network (a test) */
+	static int flow_keep = -1;
+
+	if (flow_keep < 0) {
+		uint32_t keep = 0;
+
+		PE_parse_boot_argn("wifi_flow_keep", &keep, sizeof(keep));
+		flow_keep = keep != 0;
+	}
+	if (!up && en0_live && tx.state == 2 && !flow_keep) {
+		flow_delete();
+	}
+	/*
+	 * The flow ring made as soon as frames can pass, not by the first frame (which was dropped while it was being
+	 * made, and the ones right after it: sta5, the first DHCP request lost -- the service published 21 s after the
+	 * address). A station's frames all go to its access point: any destination will do (brcmfmac: the first frame's).
+	 */
+	if (up && en0_live && tx.state == 0) {
+		flow_create(everyone);
+	}
+	if (en0_attached && en0_live && up != en0_link_said) {
+		en0_link_said = up;
+		hakios_net_link_state(up);
+		printf("wifi: en0: link %s\n", up ? "UP (associated, keys set): frames pass" : "down");
+	}
+}
+
+static void
+flow_created(int16_t status, uint16_t ring)
+{
+	tx.state = status == 0 ? 2 : -1;
+	printf("wifi: en0: flow ring %u %s (status %d)\n", ring, status == 0 ? "created" : "REFUSED", status);
+}
+
+/* FLOW_RING_DELETE (brcmfmac's msgbuf_tx_flowring_delete_req: the ring's id at +8, a reason at +10) */
+static void
+flow_delete(void)
+{
+	uint8_t *item = h2d_reserve(RING_H2D_CTRL);
+
+	if (item == NULL) {
+		return;
+	}
+	item[0] = MSG_FLOW_RING_DELETE;
+	item[1] = 0;
+	put16(item, 8, FLOW_H2D_INDEX);
+	tx.state = 3;
+	h2d_commit(RING_H2D_CTRL, 1);
+	printf("wifi: en0: flow ring %u to be deleted (the link is down)\n", FLOW_H2D_INDEX);
+}
+
+/* the ring gone: our side of it emptied (frames never sent are given back), ready for a new one at the next join */
+static void
+flow_deleted(int16_t status, uint16_t ring)
+{
+	tx.w = 0;
+	mb.idx[mb.h2d_w + FLOW_H2D_INDEX] = 0;
+	bzero(tx.busy, sizeof(tx.busy));
+	tx.outstanding = 0;
+	tx.state = 0;
+	printf("wifi: en0: flow ring %u deleted (status %d)\n", ring, status);
+	en0_link_update();                      /* (up again meanwhile: a new ring at once) */
+}
+
+/* the flow ring's room for one more (its read index: the array the chip DMAs, else the chip's own) */
+static uint8_t *
+flow_reserve(void)
+{
+	uint16_t next = (uint16_t)((tx.w + 1) % FLOW_ITEMS), r = (uint16_t)mb.idx[mb.h2d_r + FLOW_H2D_INDEX];
+
+	if (next == r && (mb.tcm_h2d_r == 0 || next == (uint16_t)mem_rd(mb.tcm_h2d_r + 4 * FLOW_H2D_INDEX))) {
+		return NULL;
+	}
+	uint8_t *item = tx.ring + (uint32_t)tx.w * FLOW_ITEM_SIZE;
+
+	bzero(item, FLOW_ITEM_SIZE);
+	return item;
+}
+
+static void
+flow_create(const uint8_t *da)
+{
+	uint8_t *item = h2d_reserve(RING_H2D_CTRL);
+
+	if (item == NULL) {
+		return;
+	}
+	item[0] = MSG_FLOW_RING_CREATE;
+	item[1] = 0;                                    /* interface 0 */
+	memcpy(item + 8, da, 6);
+	memcpy(item + 14, tx.address, 6);
+	item[20] = 0;                                   /* tid: best effort */
+	put16(item, 22, FLOW_H2D_INDEX);
+	put16(item, 28, FLOW_ITEMS);
+	put16(item, 30, FLOW_ITEM_SIZE);
+	put32(item, 32, (uint32_t)tx.ring_pa);
+	put32(item, 36, (uint32_t)(tx.ring_pa >> 32));
+	tx.state = 1;
+	h2d_commit(RING_H2D_CTRL, 1);
+	printf("wifi: en0: flow ring %u asked for (%u x %u bytes at 0x%llx)\n", FLOW_H2D_INDEX, FLOW_ITEMS, FLOW_ITEM_SIZE,
+	    tx.ring_pa);
+}
+
+static bool
+en0_transmit(mbuf_t packet, size_t length)
+{
+	uint8_t head[14], *item, *buf;
+	unsigned b;
+	bool ok = false;
+
+	if (!en0_live || length < 14 || length > TX_BUF_SIZE || mbuf_copydata(packet, 0, 14, head) != 0) {
+		return false;
+	}
+	lck_mtx_lock(wl_lock);
+	if (tx.state == 0 && link_up) {
+		flow_create(head);                      /* (the first frame waits for the ring: dropped, the stack retries) */
+	}
+	if (tx.state != 2) {
+		goto out;
+	}
+	for (b = 0; b < TX_BUFS && (tx.busy[b / 32] & (1u << (b % 32))); b++) {
+	}
+	if (b == TX_BUFS || (item = flow_reserve()) == NULL) {
+		goto out;
+	}
+	buf = tx.buf + (uint32_t)b * TX_BUF_SIZE;
+	if (mbuf_copydata(packet, 0, length, buf) != 0) {
+		goto out;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	tx.busy[b / 32] |= 1u << (b % 32);
+	item[0] = MSG_TX_POST;
+	item[1] = 0;
+	put32(item, 4, TX_ID_BASE + b);
+	memcpy(item + 8, buf, 14);
+	item[22] = 0x01;                                /* an 802.3 frame, priority 0 */
+	item[23] = 1;                                   /* one segment */
+	put32(item, 32, (uint32_t)(tx.buf_pa + (uint64_t)b * TX_BUF_SIZE + 14));
+	put32(item, 36, (uint32_t)((tx.buf_pa + (uint64_t)b * TX_BUF_SIZE + 14) >> 32));
+	put16(item, 42, (uint16_t)(length - 14));
+	tx.w = (uint16_t)((tx.w + 1) % FLOW_ITEMS);
+	mb.idx[mb.h2d_w + FLOW_H2D_INDEX] = tx.w;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	pcie_wr(PCIE_H2D_MAILBOX_0, 1);
+	tx.sent++;
+	tx.outstanding++;
+	ok = true;
+out:
+	if (!ok) {
+		tx.dropped++;
+	}
+	lck_mtx_unlock(wl_lock);
+	return ok;
+}
+
+/* the tx completion ring: each sent frame's buffer given back */
+static unsigned
+d2h_tx_poll(void)
+{
+	unsigned n = 0;
+	uint16_t w = (uint16_t)mb.idx[mb.d2h_w + (RING_D2H_TXCPL - 2)];
+
+	if (tx.buf == NULL || w >= ring_items[RING_D2H_TXCPL]) {
+		return 0;
+	}
+	while (mb.r[RING_D2H_TXCPL] != w) {
+		const uint8_t *m = mb.ring[RING_D2H_TXCPL] + (uint32_t)mb.r[RING_D2H_TXCPL] * ring_item_size[RING_D2H_TXCPL];
+		uint32_t id = get32(m, 4);
+
+		if (m[0] == MSG_TX_STATUS && id >= TX_ID_BASE && id < TX_ID_BASE + TX_BUFS) {
+			unsigned b = id - TX_ID_BASE;
+
+			if (tx.busy[b / 32] & (1u << (b % 32))) {
+				tx.busy[b / 32] &= ~(1u << (b % 32));
+				tx.outstanding--;
+			}
+			tx.done++;
+		}
+		mb.r[RING_D2H_TXCPL] = (uint16_t)((mb.r[RING_D2H_TXCPL] + 1) % ring_items[RING_D2H_TXCPL]);
+		mb.idx[mb.d2h_r + (RING_D2H_TXCPL - 2)] = mb.r[RING_D2H_TXCPL];
+		n++;
+	}
+	return n;
+}
+
+/* the interface's thread, every 2-10 ms: the completion rings (events, received frames, sent ones); a line every 30 s */
+static unsigned
+en0_poll(void)
+{
+	static uint64_t said_at;
+	unsigned n;
+
+	if (!en0_live) {
+		return 0;                       /* (en0 from the start: the steps poll the rings themselves until step 8) */
+	}
+	lck_mtx_lock(wl_lock);
+	n = d2h_ctrl_poll();
+	{
+		/* the signal of the network joined, every 5 s (wifid's bars, RSSI) */
+		static uint64_t looked_at;
+		static struct hakios_sta_bss now;
+
+		if (sta_phase == HAKIOS_STA_JOINED && micros_since(looked_at) > 5000000) {
+			looked_at = mach_absolute_time();
+			if (bss_now(&now, true) && memcmp(now.bssid, sta_bss.bssid, 6) == 0) {
+				sta_bss.rssi = now.rssi;
+			}
+		}
+	}
+	if (micros_since(said_at) > 30000000) {
+		said_at = mach_absolute_time();
+		printf("wifi: en0: %u frames sent (%u done, %u dropped, %u out), %u received (%u bytes); link %s, keys %s\n",
+		    tx.sent, tx.done, tx.dropped, tx.outstanding, mb.rx_frames, mb.rx_bytes, link_up ? "up" : "down",
+		    keyed ? "set" : "not set");
+	}
+	lck_mtx_unlock(wl_lock);
+	return n;
+}
+
+static struct hakios_net_link en0_link = {
+	.name = "BCM4383",
+	.unit = 0,
+	.wireless = true,
+	.up = false,
+	.transmit = en0_transmit,
+	.poll = en0_poll,
+};
+
+/*
+ * EN0 FROM THE START (wifi=8 or more; boot-arg wifi_early_en0=0: at step 8 instead): hakios_net_init calls this as it
+ * makes the interfaces there are, long before the radio's firmware is up -- an iPhone's en0 is there before configd
+ * starts, and configd makes its network services of the interfaces it finds (11-10, sta1/sta2: with en0 coming at
+ * ~87 s, configd's store had no network service at all and no global IPv4). The address the device tree's (step 7
+ * gives the chip the same); the link down, nothing polled or sent until step 8 has the rings and the flow ring
+ * (en0_live).
+ */
+void hakios_akita_wifi_early(void);
+
+void
+hakios_akita_wifi_early(void)
+{
+	uint32_t early = 1;
+	DTEntry chosen;
+	void const *mac = NULL;
+	unsigned int size = 0;
+
+	if (!PE_parse_boot_argn("wifi", &steps, sizeof(steps)) || steps < 8 ||
+	    (PE_parse_boot_argn("wifi_early_en0", &early, sizeof(early)) && early == 0)) {
+		return;
+	}
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	    SecureDTGetProperty(chosen, "mac-address-wifi0", &mac, &size) != kSuccess || size != 6) {
+		printf("wifi: en0: no mac-address-wifi0 in the device tree: en0 comes at step 8\n");
+		return;
+	}
+	if (wl_lock == NULL) {
+		wl_group = lck_grp_alloc_init("akita_wifi", LCK_GRP_ATTR_NULL);
+		wl_lock = lck_mtx_alloc_init(wl_group, LCK_ATTR_NULL);
+	}
+	memcpy(tx.address, mac, 6);
+	memcpy(en0_link.address, mac, 6);
+	if (!hakios_net_attach(&en0_link)) {
+		printf("wifi: en0: taken already\n");
+		return;
+	}
+	en0_attached = true;
+	printf("wifi: en0 there from the start (the device tree's address), the radio behind it from step 8\n");
+}
+
+static void
+en0_attach(void)
+{
+	uint8_t mac[6];
+
+	bzero(mac, sizeof(mac));
+	if (iovar_get("cur_etheraddr", mac, sizeof(mac)) != 0) {
+		printf("wifi: 8: no address from the chip: stopped\n");
+		return;
+	}
+	tx.ring = (uint8_t *)dma_piece(FLOW_ITEMS * FLOW_ITEM_SIZE, &tx.ring_pa);
+	tx.buf = (uint8_t *)dma_piece(TX_BUFS * TX_BUF_SIZE, &tx.buf_pa);
+	if (tx.ring == NULL || tx.buf == NULL) {
+		printf("wifi: 8: no memory in one piece for the flow ring and the send buffers: stopped\n");
+		return;
+	}
+	if (en0_attached) {
+		if (memcmp(tx.address, mac, 6) != 0) {
+			printf("wifi: 8: the chip's address is not en0's (%02x:..:%02x, en0 %02x:..:%02x)\n", mac[0], mac[5], tx.address[0],
+			    tx.address[5]);
+		}
+	} else {
+		memcpy(tx.address, mac, 6);
+		memcpy(en0_link.address, mac, 6);
+		if (!hakios_net_attach(&en0_link)) {
+			printf("wifi: 8: en0 is taken already: stopped\n");
+			return;
+		}
+		en0_attached = true;
+	}
+	lck_mtx_lock(wl_lock);
+	en0_live = true;
+	en0_link_update();
+	lck_mtx_unlock(wl_lock);
+	printf("wifi: 8: en0 on the BCM4383 (address %02x:xx:xx:xx:xx:%02x), %u send buffers; link %s\n", tx.address[0],
+	    tx.address[5], TX_BUFS, link_up && keyed ? "up" : "down until joined");
+}
+
+/*
+ * ---- the station: what Darwin's Wi-Fi side asks for (sys/hakios.sta.h, through drivers/wifi/hakios.sta.c) ----
+ *
+ * The same thing the WCN6750's station does on redwood, for this chip: the radio on and off (WLC_UP, WLC_DOWN), a scan
+ * (the escan of step 7, for a name or some channels if asked, every access point kept with its information elements --
+ * wifid reads a network's protection out of them), a join (the firmware's own supplicant, as step 8 did: WPA2-PSK with
+ * the passphrase -- or a PMK, handed over as its 64 hex digits, which the firmware takes for a key -- or an open
+ * network), a leave (WLC_DISASSOC). All called on hakios.sta.c's thread, one at a time; the rings' lock taken for each
+ * look, not across a whole scan or join (en0's frames keep coming meanwhile). A join's outcome as apple80211.c reads it:
+ * 0; EAUTH when the access point took us but the keys were never set (a wrong passphrase); ETIMEDOUT; ENOENT for no
+ * such network; EIO otherwise. A network lost by itself (deauthenticated, the link down) is said with hakios_sta_lost.
+ */
+#define STA_HEARD_MOST          64
+
+static struct hakios_sta_bss *sta_heard;
+static unsigned sta_heard_count;
+/* (sta_collect, declared above: an escan of the station's, its results kept whole) */
+static volatile int sta_phase = HAKIOS_STA_OFF;
+static struct hakios_sta_bss sta_bss;           /* the network joined or being joined */
+static int sta_last_error;
+static bool sta_leaving;                        /* a leave asked: the link going down is not a loss */
+static bool radio_up;
+
+static unsigned
+chan_to_freq(unsigned ch, uint16_t band)
+{
+	return band == 0 ? (ch == 14 ? 2484 : 2407 + 5 * ch) : band == 0x8000 ? 5950 + 5 * ch : 5000 + 5 * ch;
+}
+
+/* one access point of an escan's result (a bss_info: control channel at 88 when n_cap at 81, IEs at 116/120) */
+static void bss_fill(struct hakios_sta_bss *x, const uint8_t *b, uint32_t blen);
+
+static void
+sta_heard_add(const uint8_t *b, uint32_t blen)
+{
+	struct hakios_sta_bss *x = NULL;
+	int16_t rssi = (int16_t)get16(b, 78);
+	unsigned i;
+
+	for (i = 0; i < sta_heard_count; i++) {
+		if (memcmp(sta_heard[i].bssid, b + 8, 6) == 0) {
+			if (rssi <= sta_heard[i].rssi) {
+				return;
+			}
+			x = &sta_heard[i];
+			break;
+		}
+	}
+	if (x == NULL) {
+		if (sta_heard_count >= STA_HEARD_MOST) {
+			return;
+		}
+		x = &sta_heard[sta_heard_count++];
+	}
+	bss_fill(x, b, blen);
+}
+
+/* a bss_info (escan result, WLC_GET_BSS_INFO) as the station's record */
+static void
+bss_fill(struct hakios_sta_bss *x, const uint8_t *b, uint32_t blen)
+{
+	uint16_t chanspec = get16(b, 72), ie_off = get16(b, 116);
+	uint32_t ie_len = get32(b, 120);
+
+	bzero(x, sizeof(*x));
+	memcpy(x->bssid, b + 8, 6);
+	x->ssid_length = b[18] > 32 ? 32 : b[18];
+	memcpy(x->ssid, b + 19, x->ssid_length);
+	x->frequency = (uint16_t)chan_to_freq(b[81] != 0 ? b[88] : (chanspec & 0xff), chanspec & 0xc000);
+	x->rssi = (int16_t)get16(b, 78);
+	x->beacon_interval = get16(b, 14);
+	x->capability = get16(b, 16);
+	if (ie_off >= 90 && ie_off <= blen && ie_len <= blen - ie_off && ie_len <= HAKIOS_STA_ELEMENTS_MOST) {
+		memcpy(x->elements, b + ie_off, ie_len);
+		x->elements_length = (uint16_t)ie_len;
+	}
+}
+
+/* the network joined, as the chip has it now (WLC_GET_BSS_INFO: a length, then its bss_info); LOCKED: the rings' lock held */
+static bool
+bss_now(struct hakios_sta_bss *x, bool locked)
+{
+	static uint8_t buf[2048];               /* (one for the station's thread and en0's poll: used under the lock only) */
+	uint32_t blen;
 	int err;
 
-	bzero(name, sizeof(name));
-	bzero(pass, sizeof(pass));
-	if (!network_file(name, &name_len, pass, &pass_len)) {
-		return;
+	if (!locked) {
+		bool ok;
+
+		wl_take();
+		ok = bss_now(x, true);
+		wl_give();
+		return ok;
 	}
-	printf("wifi: 8: \"wpa_auth\" WPA2-PSK: %d; \"auth\" open: %d; \"wsec\" AES: %d; \"sup_wpa\" 1: %d\n",
-	    iovar_int("wpa_auth", 0x80), iovar_int("auth", 0), iovar_int("wsec", 4), iovar_int("sup_wpa", 1));
+	bzero(buf, sizeof(buf));
+	put32(buf, 0, sizeof(buf));
+	err = bcm_ioctl_locked(136, buf, 4, buf, sizeof(buf));
+	blen = get32(buf, 4 + 4);
+	if (err != 0 || blen < 128 || blen > sizeof(buf) - 4) {
+		return false;
+	}
+	bss_fill(x, buf + 4, blen);
+	return true;
+}
 
-	/* WLC_SET_WSEC_PMK: the passphrase itself (flag 1); this firmware's structure has room for 256 bytes and a TLV length */
-	bzero(pmk, sizeof(pmk));
-	put16(pmk, 0, (uint16_t)pass_len);
-	put16(pmk, 2, 1);
-	memcpy(pmk + 4, pass, pass_len);
-	err = bcm_ioctl(268, pmk, sizeof(pmk), NULL, sizeof(pmk));
-	bzero(pmk, sizeof(pmk));
-	bzero(pass, sizeof(pass));
-	bzero(mb.ioctl_req, IOCTL_MAX);
-	printf("wifi: 8: the passphrase handed over: %d\n", err);
+/* frequency -> a 20 MHz chanspec (2.4 GHz 0x0000, 5 GHz 0xc000, 6 GHz 0x8000; bandwidth 20 0x1000) */
+static uint16_t
+freq_to_chanspec(unsigned f)
+{
+	if (f >= 2412 && f <= 2484) {
+		return (uint16_t)(0x1000 | (f == 2484 ? 14 : (f - 2407) / 5));
+	}
+	if (f >= 5955 && f <= 7115) {
+		return (uint16_t)(0x8000 | 0x1000 | (f - 5950) / 5);
+	}
+	return (uint16_t)(0xc000 | 0x1000 | ((f - 5000) / 5 & 0xff));
+}
 
-	/* WLC_SET_SSID: the name, any BSSID, every channel */
-	bzero(params, sizeof(params));
-	put32(params, 0, name_len);
-	memcpy(params + 4, name, name_len);
-	memset(params + 36, 0xff, 6);
-	put32(params, 44, 0);
-	join_status = -1;
-	psk_status = -1;
-	link_up = keyed = false;
+/* an escan (scan parameters v2), its results awaited; WHAT NULL: every channel, every network (step 7) */
+static int
+escan_run(const struct hakios_sta_scan *what)
+{
+	uint8_t p[8 + 72 + 2 * 64];
+	uint8_t *v = p + 8;
+	unsigned nch = 0;
+	int err;
+
+	bzero(p, sizeof(p));
+	put32(p, 0, 2);
+	put16(p, 4, 1);                 /* start */
+	put16(p, 6, 0x1234);
+	put16(v, 0, 2);
+	if (what != NULL && what->ssid_length != 0 && what->ssid_length <= 32) {
+		put32(v, 4, what->ssid_length);
+		memcpy(v + 8, what->ssid, what->ssid_length);
+	}
+	memset(v + 40, 0xff, 6);        /* any BSSID */
+	v[46] = 2;                      /* any BSS type */
+	put32(v, 48, what != NULL && what->passive ? 1 : 0);
+	put32(v, 52, 0xffffffffu);
+	put32(v, 56, what != NULL && what->dwell_ms && !what->passive ? what->dwell_ms : 0xffffffffu);
+	put32(v, 60, what != NULL && what->dwell_ms && what->passive ? what->dwell_ms : 0xffffffffu);
+	put32(v, 64, 0xffffffffu);
+	for (unsigned i = 0; what != NULL && i < what->frequency_count && i < 64; i++) {
+		put16(v, 72 + 2 * nch, freq_to_chanspec(what->frequencies[i]));
+		nch++;
+	}
+	put32(v, 68, nch);
+	put16(v, 2, (uint16_t)(72 + 2 * nch));
+	wl_take();
+	heard_count = 0;
+	sta_heard_count = 0;
+	sta_collect = sta_heard != NULL;
+	escan_done = false;
+	escan_status = -1;
+	wl_give();
+	err = iovar_set("escan", p, 8 + 72 + 2 * nch);
+	if (err != 0) {
+		sta_collect = false;
+		return EIO;
+	}
 	uint64_t t0 = mach_absolute_time();
 
-	err = bcm_ioctl(26, params, sizeof(params), NULL, sizeof(params));
-	printf("wifi: 8: join asked: %d\n", err);
-	if (err != 0) {
-		return;
-	}
-	while (!keyed && micros_since(t0) < 20000000 && (join_status <= 0)) {
-		if (d2h_ctrl_poll() == 0) {
+	while (!escan_done && micros_since(t0) < 15000000) {
+		unsigned n;
+
+		wl_take();
+		n = d2h_ctrl_poll();
+		wl_give();
+		if (n == 0) {
 			sleep_ms(5);
 		}
 	}
-	printf("wifi: 8: after %llu ms: join %d, link %s, supplicant %d: %s\n", micros_since(t0) / 1000, join_status,
-	    link_up ? "up" : "down", psk_status, keyed ? "JOINED, the keys set" : "not joined");
-	/* a while longer, to see whether the access point keeps us */
-	for (unsigned i = 0; i < 100; i++) {
-		(void)d2h_ctrl_poll();
-		sleep_ms(50);
+	sta_collect = false;
+	return escan_done ? (escan_status == 0 ? 0 : EIO) : ETIMEDOUT;
+}
+
+/* boot-arg wifi_soft_power=1: the radio never WLC_DOWN (off = out of the network only), a test -- does WLC_DOWN drop the
+ * rx buffers we posted (11-10: the firmware ran out of packet ids seconds after every re-join)? */
+static int soft_power = -1;
+
+static bool
+soft(void)
+{
+	if (soft_power < 0) {
+		uint32_t v = 0;
+
+		PE_parse_boot_argn("wifi_soft_power", &v, sizeof(v));
+		soft_power = v != 0;
 	}
-	printf("wifi: 8: 5 s later: link %s, keys %s\n", link_up ? "up" : "down", keyed ? "set" : "not set");
+	return soft_power;
+}
+
+static int
+sta_power(bool on)
+{
+	int err;
+
+	if (on == radio_up) {
+		return 0;
+	}
+	if (!on) {
+		sta_leaving = true;
+		(void)cmd_int(52, 0);           /* WLC_DISASSOC */
+	}
+	err = soft() ? 0 : cmd_int(on ? 2 : 3, 1);     /* WLC_UP / WLC_DOWN */
+	sta_leaving = false;
+	if (err != 0) {
+		return EIO;
+	}
+	radio_up = on;
+	sta_phase = on ? HAKIOS_STA_IDLE : HAKIOS_STA_OFF;
+	printf("wifi: station: the radio %s\n", on ? "on" : "off");
+	return 0;
+}
+
+static int
+sta_scan(const struct hakios_sta_scan *what)
+{
+	int err, was = sta_phase;
+
+	if (fw_halted) {
+		return EIO;
+	}
+	if (!radio_up) {
+		return ENETDOWN;
+	}
+	if (was == HAKIOS_STA_IDLE) {
+		sta_phase = HAKIOS_STA_SCANNING;
+	}
+	err = escan_run(what);
+	if (sta_phase == HAKIOS_STA_SCANNING) {
+		sta_phase = was;
+	}
+	printf("wifi: station: a scan%s%s: %d, %u access points\n", what->ssid_length ? " for a name" : "",
+	    what->frequency_count ? " on some channels" : "", err, sta_heard_count);
+	return err;
+}
+
+static void
+sta_heard_each(void (*each)(const struct hakios_sta_bss *bss, void *context), void *context)
+{
+	for (unsigned i = 0; i < sta_heard_count; i++) {
+		each(&sta_heard[i], context);
+	}
+}
+
+/*
+ * Out of the network, and the radio down and up again: a new association right after a WLC_DISASSOC made the firmware
+ * run out of packet ids ("lb_alloc: hnd_pktid_free_cnt 0") and trap, three times on 11-10 (a wrong passphrase, a second
+ * join of the same network); off and on first, the way the radio's switch goes, it joins every time (toggle1).
+ */
+static void
+sta_radio_cycle(void)
+{
+	sta_leaving = true;
+	(void)cmd_int(52, 0);                   /* WLC_DISASSOC */
+	for (unsigned i = 0; i < 100 && link_up; i++) {
+		wl_take();
+		(void)d2h_ctrl_poll();
+		wl_give();
+		sleep_ms(10);
+	}
+	if (!soft()) {
+		(void)cmd_int(3, 1);            /* WLC_DOWN */
+		(void)cmd_int(2, 1);            /* WLC_UP */
+	}
+	sta_leaving = false;
+}
+
+static struct hakios_sta_join sta_joined_with;  /* the request the network joined came from (to know a repeat of it) */
+
+static int
+sta_join(const struct hakios_sta_join *j)
+{
+	uint8_t pmk[2 + 2 + 256 + 2], params[52];
+	bool psk = j->security == HAKIOS_STA_WPA2_PSK, any_bssid = true;
+	int err, result;
+
+	if (fw_halted) {
+		return EIO;
+	}
+	if (!radio_up) {
+		return ENETDOWN;
+	}
+	if (j->ssid_length == 0 || j->ssid_length > 32) {
+		return EINVAL;
+	}
+	/* the network we are on, asked for again with the same key (the standing request at every power-on, wifid's own
+	 * join of it): nothing to do -- leaving and joining again is what made the firmware trap (toggle1) */
+	if (sta_phase == HAKIOS_STA_JOINED && link_up && keyed && memcmp(j, &sta_joined_with, sizeof(*j)) == 0) {
+		printf("wifi: station: join of the network we are on, with the same key: nothing to do\n");
+		return 0;
+	}
+	if (sta_phase == HAKIOS_STA_JOINED || link_up) {
+		sta_radio_cycle();
+	}
+	sta_phase = HAKIOS_STA_JOINING;
+	bzero(&sta_bss, sizeof(sta_bss));
+	memcpy(sta_bss.ssid, j->ssid, j->ssid_length);
+	sta_bss.ssid_length = j->ssid_length;
+	for (unsigned i = 0; i < 6; i++) {
+		any_bssid = any_bssid && j->bssid[i] == 0;
+	}
+	err = iovar_int("wpa_auth", psk ? 0x80 : 0) | iovar_int("auth", 0) | iovar_int("wsec", psk ? 4 : 0) |
+	    iovar_int("sup_wpa", psk ? 1 : 0);
+	if (err == 0 && psk) {
+		/* WLC_SET_WSEC_PMK: the passphrase (flag 1), or the PMK as 64 hex digits (the firmware takes those for a key) */
+		bzero(pmk, sizeof(pmk));
+		if (j->passphrase_length >= 8 && j->passphrase_length <= 63) {
+			put16(pmk, 0, j->passphrase_length);
+			memcpy(pmk + 4, j->passphrase, j->passphrase_length);
+		} else {
+			static const char hex[] = "0123456789abcdef";
+
+			put16(pmk, 0, 64);
+			for (unsigned i = 0; i < 32; i++) {
+				pmk[4 + 2 * i] = (uint8_t)hex[j->pmk[i] >> 4];
+				pmk[4 + 2 * i + 1] = (uint8_t)hex[j->pmk[i] & 15];
+			}
+		}
+		put16(pmk, 2, 1);
+		err = bcm_ioctl(268, pmk, sizeof(pmk), NULL, sizeof(pmk));
+		bzero(pmk, sizeof(pmk));
+		wl_take();
+		bzero(mb.ioctl_req, IOCTL_MAX);
+		wl_give();
+	}
+	if (err != 0) {
+		sta_phase = HAKIOS_STA_IDLE;
+		sta_last_error = EIO;
+		return EIO;
+	}
+	bzero(params, sizeof(params));
+	put32(params, 0, j->ssid_length);
+	memcpy(params + 4, j->ssid, j->ssid_length);
+	if (any_bssid) {
+		memset(params + 36, 0xff, 6);
+	} else {
+		memcpy(params + 36, j->bssid, 6);
+	}
+	wl_take();
+	join_status = -1;
+	psk_status = -1;
+	link_up = keyed = false;
+	wl_give();
+	uint64_t t0 = mach_absolute_time();
+
+	err = bcm_ioctl(26, params, sizeof(params), NULL, sizeof(params));     /* WLC_SET_SSID */
+	if (err != 0) {
+		sta_phase = HAKIOS_STA_IDLE;
+		sta_last_error = EIO;
+		return EIO;
+	}
+	/* until the keys are set (or, open, the link is up), the join fails, or 20 s */
+	while (micros_since(t0) < 20000000) {
+		unsigned n;
+
+		wl_take();
+		n = d2h_ctrl_poll();
+		wl_give();
+		if ((psk && keyed) || (!psk && link_up && join_status == 0) || join_status > 0) {
+			break;
+		}
+		/* the supplicant gave up (PSK_SUP 7 timeout, 8 failed -- reason 14: the access point deauthenticated us): over
+		 * now, not after the firmware's own retries -- at the second retry with a wrong passphrase it ran out of packet
+		 * ids ("lb_alloc: hnd_pktid_free_cnt 0") and trapped (rejoin2) */
+		if (psk && psk_status >= 7) {
+			break;
+		}
+		if (n == 0) {
+			sleep_ms(5);
+		}
+	}
+	if ((psk && keyed) || (!psk && link_up && join_status == 0)) {
+		result = 0;
+	} else if (join_status == 2) {
+		result = ENOENT;
+	} else if (join_status == 0 && psk && !keyed) {
+		result = EAUTH;                 /* associated, the 4-way handshake never ended: the passphrase */
+	} else if (join_status == 3 || join_status < 0) {
+		result = ETIMEDOUT;
+	} else {
+		result = EIO;
+	}
+	if (result != 0) {
+		sta_radio_cycle();              /* (out, and the radio fresh for whatever is joined next) */
+		sta_phase = HAKIOS_STA_IDLE;
+		sta_last_error = result;
+		bzero(&sta_joined_with, sizeof(sta_joined_with));
+	} else {
+		sta_joined_with = *j;
+		uint8_t bssid[6];
+
+		bzero(bssid, sizeof(bssid));
+		(void)bcm_ioctl(23, NULL, 0, bssid, 6); /* WLC_GET_BSSID */
+		memcpy(sta_bss.bssid, bssid, 6);
+		for (unsigned i = 0; i < sta_heard_count; i++) {
+			if (memcmp(sta_heard[i].bssid, bssid, 6) == 0) {
+				sta_bss = sta_heard[i];
+				break;
+			}
+		}
+		/* the network as the chip has it (WLC_GET_BSS_INFO: channel, signal, beacon, IEs) -- a join at the start comes
+		 * before any scan of the station's, and wifid and configd read them (sta3: CHANNEL 858992977, RSSI 0) */
+		{
+			static struct hakios_sta_bss now;
+
+			if (bss_now(&now, false)) {
+				sta_bss = now;
+			}
+		}
+		if (sta_bss.frequency == 0) {
+			uint32_t cs = 0;
+
+			if (iovar_get("chanspec", &cs, sizeof(cs)) == 0 && cs != 0) {
+				unsigned centre = cs & 0xff, sb = (cs >> 8) & 7, bw = cs & 0x3800, ch = centre;
+
+				ch = bw == 0x1800 ? centre - 2 + 4 * sb : bw == 0x2000 ? centre - 6 + 4 * sb : bw == 0x2800 ? centre - 14 +
+				    4 * sb : centre;
+				sta_bss.frequency = (uint16_t)chan_to_freq(ch, cs & 0xc000);
+			}
+		}
+
+		sta_last_error = 0;
+		sta_phase = HAKIOS_STA_JOINED;
+	}
+	printf("wifi: station: join (%s, a name of %u bytes) after %llu ms: %d (set SSID %d, link %s, supplicant %d); %u MHz, "
+	    "%d dBm\n", psk ? "WPA2-PSK" : "open", j->ssid_length, micros_since(t0) / 1000, result, join_status,
+	    link_up ? "up" : "down", psk_status, sta_bss.frequency, sta_bss.rssi);
+	return result;
+}
+
+static int
+sta_leave(void)
+{
+	if (fw_halted) {
+		return 0;
+	}
+	sta_radio_cycle();                      /* (out, the radio down and up: the next join comes after a fresh start) */
+	bzero(&sta_joined_with, sizeof(sta_joined_with));
+	if (radio_up) {
+		sta_phase = HAKIOS_STA_IDLE;
+	}
+	printf("wifi: station: left the network\n");
+	return 0;
+}
+
+static void
+sta_state(struct hakios_sta_state *st)
+{
+	st->phase = (enum hakios_sta_phase)sta_phase;
+	st->bss = sta_bss;
+	st->last_error = sta_last_error;
+}
+
+/* the channels: 2.4 GHz 1-13; 5 GHz 36-64 (52-64 radar), 100-144 (radar), 149-165 -- the EU's (the CLM decides what it sends) */
+static unsigned
+sta_channels(struct hakios_sta_channel *c, unsigned most)
+{
+	static const uint8_t five[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
+		                        144, 149, 153, 157, 161, 165 };
+	unsigned n = 0;
+
+	for (unsigned ch = 1; ch <= 13 && n < most; ch++, n++) {
+		c[n].frequency = (uint16_t)(2407 + 5 * ch);
+		c[n].flags = 0;
+	}
+	for (unsigned i = 0; i < sizeof(five) && n < most; i++, n++) {
+		c[n].frequency = (uint16_t)(5000 + 5 * five[i]);
+		c[n].flags = five[i] >= 52 && five[i] <= 144 ? HAKIOS_STA_CHANNEL_PASSIVE | HAKIOS_STA_CHANNEL_RADAR : 0;
+	}
+	return n;
+}
+
+static struct hakios_sta_ops sta_ops_bcm = {
+	.power = sta_power,
+	.scan = sta_scan,
+	.heard = sta_heard_each,
+	.join = sta_join,
+	.leave = sta_leave,
+	.state = sta_state,
+	.channels = sta_channels,
+};
+
+/* the firmware halted (mb_data_check, the rings' lock held): the link down, the station's radio off */
+static void
+fw_halt_said(void)
+{
+	link_up = keyed = false;
+	en0_link_update();
+	if (sta_phase == HAKIOS_STA_JOINED) {
+		hakios_sta_lost(EIO);
+	}
+	sta_phase = HAKIOS_STA_OFF;
+	radio_up = false;
+}
+
+/* the link's events, under the rings' lock (event_handle): a network joined and lost by itself is said */
+static void
+sta_link_check(void)
+{
+	if (sta_phase == HAKIOS_STA_JOINED && !sta_leaving && (!link_up || !keyed)) {
+		sta_phase = radio_up ? HAKIOS_STA_IDLE : HAKIOS_STA_OFF;
+		sta_last_error = ECONNRESET;
+		printf("wifi: station: the network is lost (link %s, keys %s)\n", link_up ? "up" : "down", keyed ? "set" : "not set");
+		hakios_sta_lost(ECONNRESET);
+	}
+}
+
+/* step 8, after en0: the station attached (Darwin's Wi-Fi side can ask from now on), the network of fw/network joined
+ * through it as a standing request -- again whenever the radio comes back on -- as redwood's join_given does */
+static void
+station_start(void)
+{
+	static struct hakios_sta_join what;
+	unsigned name_len = sizeof(what.ssid), pass_len = sizeof(what.passphrase);
+	struct hakios_sta_state *st;
+	int err;
+
+	if ((sta_heard = kalloc_data(STA_HEARD_MOST * sizeof(*sta_heard), Z_WAITOK | Z_ZERO)) == NULL) {
+		printf("wifi: 8: no memory for what a scan hears: no station\n");
+		return;
+	}
+	radio_up = true;                        /* (WLC_UP at step 7) */
+	sta_phase = HAKIOS_STA_IDLE;
+	memcpy(sta_ops_bcm.address, tx.address, 6);
+	hakios_sta_attach(&sta_ops_bcm);
+	printf("wifi: 8: the station attached: Darwin's Wi-Fi side (wifid, Settings) can ask for scans and networks\n");
+	bzero(&what, sizeof(what));
+	if (!network_file(what.ssid, &name_len, what.passphrase, &pass_len)) {
+		return;
+	}
+	what.ssid_length = (uint8_t)name_len;
+	what.passphrase_length = (uint8_t)pass_len;
+	what.security = HAKIOS_STA_WPA2_PSK;
+	err = hakios_sta_ask_join_standing(&what);
+	bzero(&what, sizeof(what));
+	for (unsigned waited = 0; err == 0 && hakios_sta_busy() && waited < 300; waited++) {
+		sleep_ms(100);
+	}
+	if ((st = kalloc_data(sizeof(*st), Z_WAITOK | Z_ZERO)) != NULL) {
+		hakios_sta_state(st);
+		printf("wifi: 8: the network of fw/network %s (%d, %d)\n", st->phase == HAKIOS_STA_JOINED ? "IS JOINED" :
+		    "is NOT joined", err, st->last_error);
+		kfree_data(st, sizeof(*st));
+	}
+	rx_say();
 }
 
 void
@@ -1459,6 +2594,10 @@ akita_bcm_run(void)
 
 	if (!PE_parse_boot_argn("wifi", &steps, sizeof(steps)) || steps == 0) {
 		return;
+	}
+	if (wl_lock == NULL) {                  /* (made already when en0 came at the start) */
+		wl_group = lck_grp_alloc_init("akita_wifi", LCK_GRP_ATTR_NULL);
+		wl_lock = lck_mtx_alloc_init(wl_group, LCK_ATTR_NULL);
 	}
 	cfg = akita_pcie_config();
 	bar0 = (volatile uint8_t *)ml_io_map(akita_pcie_bar(0), BAR0_SIZE);
@@ -1680,9 +2819,12 @@ akita_bcm_run(void)
 	scan_all();
 	console_say(shared);
 
-	if (!announce(8, "talks: the network of fw/network joined, WPA2-PSK by the firmware's own supplicant")) {
+	if (!announce(8, "carries: en0 on the chip, the station Darwin's Wi-Fi side talks to, the network of fw/network joined")) {
 		return;
 	}
-	join_network();
+	en0_attach();
+	if (en0_attached) {
+		station_start();
+	}
 	console_say(shared);
 }
