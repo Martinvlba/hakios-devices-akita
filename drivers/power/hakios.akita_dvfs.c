@@ -148,6 +148,13 @@ static uint32_t mif_applied;
 static uint64_t mif_lower_since;        /* since when a lower MIF floor has been wanted (0: not) */
 static uint32_t mif_down_ms = 2000, mif_switches;
 static bool mif_fixed;                  /* boot-arg mif_khz: MIF left where it says */
+/*
+ * boot-arg mif_toggle_ms=N (a test, 11-10): MIF switched between 845 and 3172 MHz every N ms, the governor kept off it --
+ * whether a switch of the memory's clock while DPP0 reads a frame breaks the panel's stream (the full-width bands of
+ * noise one DSC slice row tall that the tester's slow-motion clips show at the cube's height, ~0.4 a second)
+ */
+static uint32_t mif_toggle_ms, mif_toggles;
+static uint64_t mif_toggle_next;
 static uint32_t gpu_boot[2];            /* kHz, as the bootloader left them (0: not readable: the GPU left alone) */
 static int gpu_applied = -1;            /* the row last set (-1: the bootloader's clocks untouched) */
 static int gpu_want;                    /* the governor's row (fastest 0), before the thermal floor */
@@ -155,6 +162,33 @@ extern void (*hakios_touch_interaction)(void);  /* drivers/input/hakios.input.c 
 static volatile uint64_t touch_until;   /* the interaction boost lasts until (mach_absolute_time) */
 static uint32_t touch_row = 6, touch_ms = 1000;
 static uint32_t touch_boosts;
+/*
+ * ... and the clusters at least these clocks meanwhile (LITTLE, MID, BIG; MHz), as Android's INTERACTION hint raises
+ * their minimum: the governor looks every 100 ms at the busiest core, so a gesture that began on an idle cluster had
+ * its first frames drawn at 400-900 MHz (with coreduetd spinning, MID never idled and hid it). The thermal and hot
+ * caps still apply. dvfs_touch_cpu=0: the GPU's boost alone.
+ */
+static const uint32_t touch_cpu_mhz[3] = { 1197, 1572, 1557 };
+static uint32_t touch_cpu = 1;
+/*
+ * FRAMES FLOWING KEEP IT UP TOO (11-10): while the panel gets dvfs_anim_fps (50) frames a second or more, the touch
+ * boost is held (dvfs_anim_ms, 250, after the last such look) -- an animation nobody touches (a page settling, an app
+ * opening, sb_cube's cube) was drawn at the clocks of a still screen: the GPU's governor stays at 531 MHz at 87 % busy
+ * (its next row only above 94 %) and the clusters at 700-1400 MHz, and the frames took 9 ms each (64-85 a second).
+ * Android holds its render path up the same way (SurfaceFlinger's and the top application's clamps). A still screen
+ * (the Clock icon's ten redraws a second) does not. dvfs_anim_fps=0: not done.
+ */
+extern uint32_t akita_display_flip_count(void);
+extern uint32_t akita_display_refresh(void);
+static uint32_t anim_fps = 50, anim_ms = 250, anim_flips_last, anim_boosts;
+/*
+ * ... and while it lasts its GPU row goes FASTER WHEN THE FRAMES COME LATE (11-10): under 90 % of the panel's rate with
+ * the GPU 60 % busy or more, a row up every third look; on time with the GPU under 50 %, a row back, never below the
+ * touch row. The widgets page (a full-screen blur under the cube) took 11 ms of GPU a frame at 659 MHz: 70 a second,
+ * every swap late, the GPU 75 % busy -- under its row's own threshold (95 %). As Android's missed-frame boosts.
+ */
+static int anim_row = -1;               /* the frame boost's GPU row (-1: none, the touch row alone) */
+static uint32_t anim_ring[5], anim_ring_at, anim_raised;
 static unsigned gpu_low_looks;          /* looks in a row under the row's lower bound */
 static int gpu_util_pct;
 static uint64_t gpu_busy_last, gpu_time_last;
@@ -247,6 +281,26 @@ static struct controller ctls[] = {
 static int cd_state[NCDEV];             /* the result: each cooling device's state (0 none) */
 static uint64_t pid_last;               /* when the controllers last ran */
 
+/*
+ * THE POWER EACH COOLING DEVICE USES (11-10), estimated, to share a controller's budget as Android does with its power
+ * rails (ODPM, which this kernel does not read). Android's allocatePowerToCdev gives a device that uses less than its
+ * share by weight -- and that this controller is not throttling -- what it uses, and shares the rest by weight among
+ * the others, whose budget then follows what they really use (raised while they use less). By weight alone, as before,
+ * an idle GPU kept a quarter of SOC's budget and the clusters' shares were full-load powers: at 37-39 C of skin MID was
+ * held to 910 MHz within two minutes of scrolling while LITTLE and the GPU used next to nothing and one MID core did
+ * SpringBoard's work (its main thread then stalled 25-138 ms in UIKit: the tester's "frames freeze"). The estimate is
+ * Linux IPA's (cpufreq_cooling's requested power): the power of the step a device is at (state2power: the whole cluster
+ * at full load) times its busy share (a cluster's: its cores' average), averaged over the looks since the controllers
+ * last ran. A device's request then comes from the full-load power its share allows at the load it had (IPA's
+ * power2state): share / load, the load taken as 20 % at least. Under full load on every device nothing changes: the
+ * total budget is Android's as before. dvfs_share=0: by weight alone (a test).
+ */
+static uint64_t est_mw_acc[NCDEV], est_load_acc[NCDEV];
+static uint32_t est_looks;              /* looks summed since the controllers last ran */
+static int est_mw[NCDEV], est_load[NCDEV];     /* what the controllers use: mW and busy percent (0 for FCC: unknown) */
+static bool est_known;
+static uint32_t share_by_power = 1;
+
 /* the HAL's getSeverityFromThresholds (hot side): up at a threshold, down only under it less its hysteresis */
 static int
 severity_of(const struct controller *c, int mc)
@@ -319,15 +373,39 @@ pid_update(struct controller *c, int mc)
 	budget = budget < c->min_power ? c->min_power : budget > c->max_power ? c->max_power : budget;
 	c->prev_budget = (int)budget;
 
-	int total_weight = 0;
+	int total_weight = 0, rest_weight;
+	int64_t rest = budget;
+	bool own[4] = { false, false, false, false };
+	bool by_power = share_by_power && est_known;
+
 	for (int b = 0; b < c->nbind; b++) {
 		total_weight += c->bind[b].weight;
+	}
+	rest_weight = total_weight;
+	if (by_power) {
+		/* Android's low_power_device_check: a device under its share, not throttled by this controller, gets what it uses */
+		for (int b = 0; b < c->nbind; b++) {
+			int cd = c->bind[b].cdev;
+
+			if (cd != CD_FCC && c->request[b] == 0 && est_mw[cd] < budget * c->bind[b].weight / total_weight) {
+				own[b] = true;
+				rest -= est_mw[cd];
+				rest_weight -= c->bind[b].weight;
+			}
+		}
 	}
 	for (int b = 0; b < c->nbind; b++) {
 		const struct binding *d = &c->bind[b];
 		int cd = d->cdev, cur = c->request[b];
-		int64_t mine = budget * d->weight / total_weight;
+		int64_t mine;
 
+		if (own[b]) {
+			continue;               /* (its request stays 0: released) */
+		}
+		mine = rest_weight > 0 ? rest * d->weight / rest_weight : 0;
+		if (by_power && cd != CD_FCC) {
+			mine = mine * 100 / (est_load[cd] < 20 ? 20 : est_load[cd]);    /* at the load it had: IPA's power2state */
+		}
 		mine = mine > cd_power[cd][0] ? cd_power[cd][0] : mine < 0 ? 0 : mine;
 		if (d->release_step != ANY_STEP) {                      /* no faster release than its step */
 			int step = d->release_step;
@@ -384,6 +462,15 @@ android_thermal_step(void)
 		return false;
 	}
 	pid_last = now;
+	if (est_looks > 0) {
+		for (int d = 0; d < NCDEV; d++) {
+			est_mw[d] = (int)(est_mw_acc[d] / est_looks);
+			est_load[d] = (int)(est_load_acc[d] / est_looks);
+			est_mw_acc[d] = est_load_acc[d] = 0;
+		}
+		est_looks = 0;
+		est_known = true;
+	}
 	for (unsigned i = 0; i < NCTLS; i++) {
 		struct controller *c = &ctls[i];
 
@@ -406,6 +493,10 @@ android_thermal_step(void)
 			if (ctls[i].severity) {
 				printf(" %s %d mW", ctls[i].name, ctls[i].prev_budget);
 			}
+		}
+		if (share_by_power && est_known) {
+			printf("; used LITTLE %d MID %d BIG %d GPU %d mW at %d %d %d %d %%", est_mw[CD_LITTLE], est_mw[CD_MID],
+			    est_mw[CD_BIG], est_mw[CD_GPU], est_load[CD_LITTLE], est_load[CD_MID], est_load[CD_BIG], est_load[CD_GPU]);
 		}
 		printf(")\n");
 	}
@@ -492,6 +583,10 @@ gpu_govern(void)
 		/* a finger on the glass: at least the interaction row, whatever the looks said (scroll-boost: inside the chain
 		 * above, three low looks still stepped it down after 0.3 s) */
 		gpu_want = (int)touch_row;
+		gpu_low_looks = 0;
+	}
+	if (anim_row >= 0 && mach_absolute_time() < touch_until && gpu_want > anim_row) {
+		gpu_want = anim_row;            /* (the frame boost's row: faster while the frames come late) */
 		gpu_low_looks = 0;
 	}
 	gpu_busy_last = busy;
@@ -603,6 +698,14 @@ govern(struct cluster *c)
 	while (want < c->nsteps - 1 && c->steps[want] < target) {
 		want++;
 	}
+	if (touch_cpu && mach_absolute_time() < touch_until) {
+		unsigned floor = 0;
+
+		while (floor < c->nsteps - 1 && c->steps[floor] < touch_cpu_mhz[c - clusters]) {
+			floor++;
+		}
+		want = want > floor ? want : floor;
+	}
 	if (top_always) {
 		want = c->nsteps - 1;
 	}
@@ -625,6 +728,32 @@ govern(struct cluster *c)
 		dvfs_changes_value++;
 		describe();
 	}
+}
+
+/* each look, after the governors: the power each device used at its step and load, summed for the controllers */
+static void
+power_look(void)
+{
+	for (unsigned i = 0; i < NCLUSTERS; i++) {
+		struct cluster *c = &clusters[i];
+		int sum = 0, load;
+
+		if (c->first_cpu >= real_ncpus) {
+			continue;               /* (its cores not started: at its lowest step, idle) */
+		}
+		for (uint32_t k = 0; k < c->ncpus && c->first_cpu + k < real_ncpus; k++) {
+			sum += c->core_share[k];
+		}
+		load = sum / (int)c->ncpus;     /* (state2power is the whole cluster's) */
+		load = load > 100 ? 100 : load < 0 ? 0 : load;
+		est_mw_acc[c->cdev] += (uint64_t)cd_power[c->cdev][c->nsteps - 1 - c->now] * (uint64_t)load / 100;
+		est_load_acc[c->cdev] += (uint64_t)load;
+	}
+	int row = gpu_applied >= 0 && gpu_applied < cd_states[CD_GPU] ? gpu_applied : cd_states[CD_GPU] - 1;
+	int util = gpu_util_pct > 100 ? 100 : gpu_util_pct < 0 ? 0 : gpu_util_pct;
+	est_mw_acc[CD_GPU] += (uint64_t)cd_power[CD_GPU][row] * (uint64_t)util / 100;
+	est_load_acc[CD_GPU] += (uint64_t)util;
+	est_looks++;
 }
 
 /* each touch down or move (hakios.input.c): the boost renewed; the governor woken when it starts */
@@ -684,6 +813,43 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 		int hot = akita_thermal_hottest_c();
 		uint64_t now;
 
+		if (anim_fps != 0) {
+			uint32_t f = akita_display_flip_count(), d = f - anim_flips_last;
+
+			anim_flips_last = f;
+			anim_ring[anim_ring_at++ % 5] = d;
+			if (d * 1000 >= anim_fps * period_ms) {
+				uint64_t t = mach_absolute_time(), span;
+
+				nanoseconds_to_absolutetime((uint64_t)anim_ms * NSEC_PER_MSEC, &span);
+				if (t >= touch_until) {
+					anim_boosts++;
+				}
+				if (t + span > touch_until) {
+					touch_until = t + span;
+				}
+				if (tick % 3 == 0) {
+					uint32_t sum = 0, hz = akita_display_refresh(), fps;
+
+					for (int k = 0; k < 5; k++) {
+						sum += anim_ring[k];
+					}
+					fps = sum * 1000 / (5 * period_ms);
+					if (anim_row < 0) {
+						anim_row = (int)touch_row;
+					}
+					if (hz >= 50 && fps * 10 < hz * 9 && gpu_util_pct >= 60 && anim_row > 0) {
+						anim_row--;
+						anim_raised++;
+					} else if ((hz < 50 || fps * 100 >= hz * 97) && gpu_util_pct < 50 && anim_row < (int)touch_row) {
+						anim_row++;
+					}
+				}
+			} else if (mach_absolute_time() >= touch_until) {
+				anim_row = -1;
+			}
+		}
+
 		if (tick % (2000 / period_ms ? 2000 / period_ms : 1) == 0 && android_thermal_step()) {
 			gpu_apply();
 			if (cd_state[CD_FCC] != fcc_applied) {
@@ -714,11 +880,22 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 				describe();
 			}
 		}
+		power_look();
 		now = mach_absolute_time();
+		if (mif_toggle_ms != 0 && now >= mif_toggle_next) {
+			uint64_t step;
+
+			nanoseconds_to_absolutetime((uint64_t)mif_toggle_ms * NSEC_PER_MSEC, &step);
+			mif_toggle_next = now + step;
+			if (domain_set_khz(0, mif_toggles & 1 ? 845000 : 3172000)) {
+				mif_toggles++;
+				mif_switches++;
+			}
+		}
 		if (now >= next_log) {
 			next_log = now + minute;
-			printf("akita dvfs: %s (%d changes, %u touch boosts, %u MIF switches; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d, "
-			    "GPU %d %%\n", dvfs_mhz, dvfs_changes_value, touch_boosts, mif_switches, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
+			printf("akita dvfs: %s (%d changes, %u touch boosts, %u frame boosts (row %d, %u raised), %u MIF switches; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d, "
+			    "GPU %d %%\n", dvfs_mhz, dvfs_changes_value, touch_boosts, anim_boosts, anim_row, anim_raised, mif_switches, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
 			    "held to the lowest: hot", clusters[0].core_share[0], clusters[0].core_share[1],
 			    clusters[0].core_share[2], clusters[0].core_share[3], clusters[1].core_share[0],
 			    clusters[1].core_share[1], clusters[1].core_share[2], clusters[1].core_share[3], gpu_util_pct);
@@ -754,6 +931,15 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 	}
 
 	PE_parse_boot_argn("mif_down_ms", &mif_down_ms, sizeof(mif_down_ms));
+	PE_parse_boot_argn("dvfs_share", &share_by_power, sizeof(share_by_power));
+	if (PE_parse_boot_argn("mif_toggle_ms", &mif_toggle_ms, sizeof(mif_toggle_ms)) && mif_toggle_ms != 0) {
+		mif_fixed = true;               /* (the governor's floors left out: the test switches MIF alone) */
+		printf("akita dvfs: mif_toggle_ms=%u: MIF switched between 845 and 3172 MHz every %u ms (a test)\n", mif_toggle_ms,
+		    mif_toggle_ms);
+	}
+	PE_parse_boot_argn("dvfs_touch_cpu", &touch_cpu, sizeof(touch_cpu));
+	PE_parse_boot_argn("dvfs_anim_fps", &anim_fps, sizeof(anim_fps));
+	PE_parse_boot_argn("dvfs_anim_ms", &anim_ms, sizeof(anim_ms));
 	PE_parse_boot_argn("dvfs_touch_row", &touch_row, sizeof(touch_row));
 	PE_parse_boot_argn("dvfs_touch_ms", &touch_ms, sizeof(touch_ms));
 	if (touch_row < NGPUROWS - 1 && touch_ms > 0) {
