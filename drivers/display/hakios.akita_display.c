@@ -126,10 +126,38 @@ micros(uint64_t since)
  * request does not carry DPP0's address: seen on the phone). A buffer queued while another still waits replaces it (the
  * newest frame is the one shown; the other is counted as dropped). With two buffers, flip() waits until it is shown.
  * No frame done in 50 ms: switched anyway, counted.
+ *
+ * IDMA_SFR_UPDATE_FORCE takes effect AT ONCE: written while DPP0 reads a frame, the DMA switches in the middle of it
+ * (the tester's videos, 11-10: thin white lines across the whole width in bursts at every flip, two pictures in one
+ * frame). Frame done stays set until cleared, so a thread that wakes late finds an old one and wrote into the next
+ * read. So now (11-10): the switch only while DPP0 is idle -- RDMA_ENABLE's IDMA_OP_STATUS (bit 2, Google's
+ * OP_STATUS_BUSY) clear, and for a frame done not seen arrive, the time since it (from the beat) inside the idle gap
+ * measure_hz found. Measured (11-10, flip1): DPP0 reads a frame in 4.76 ms and idles 3.6 ms before the next at 120 Hz
+ * (11.9 ms at 60), and OP_STATUS follows it exactly; wake-ups from a deadline come up to 1.1 ms late (flip2), and a
+ * beat kept by timing alone drifts more than a millisecond now and then (flip3). So (flip_pending) the switch goes by
+ * what DPP0 is seen doing: busy, then idle within the gap less 300 us of that -- provably between two reads -- and
+ * never while it reads (flip2's "forced after 4 put off" and flip3's beat-timed waits did so); at once on arrival only
+ * when idle and the beat was caught exactly within two refreshes (scanout() wakes the thread: the frame on the panel
+ * up to a refresh sooner); forced only when nothing was read for 50 ms. The beat (vblank_time) is kept by looking at
+ * frame done just after it is due, and every 8th refresh catching it as it comes (a spin: delay() of a few us SLEEPS
+ * on this kernel, cpu_idle_latency is 0); the thread above the kernel's normal priority. display_say=0: no
+ * statistics line (every 30 s while flipping).
  */
 #define RDMA_IRQ        0x004
 #define FRAME_DONE      (1u << 16)
+#define IDMA_OP_STATUS  (1u << 2)       /* RDMA_ENABLE: DPP0's DMA busy reading a frame */
 #define NO_BUFFER       (~0u)
+/* the pipeline's error flags (health_check, below) */
+#define RDMA_ERR_BITS   ((1u << 17) | (1u << 19) | (1u << 21) | (1u << 22) | (1u << 24) | (1u << 26))
+#define DSIM_INTSRC     0x050
+#define DSIM_ERR_BITS   ((1u << 19) | (1u << 23) | (1u << 27))     /* (not 22, abnormal command state: every frame, at 60 Hz too) */
+#define DECON_INT_PEND_EXTRA 0x074
+#define DECON_ERR_BITS  ((1u << 0) | (1u << 4) | (1u << 12))
+static volatile uint32_t *dsim_regs;
+static uint32_t health_on = 1;                 /* display_health=0: the error flags not read (a hang's suspect, 11-10) */
+
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
+    thread_t *new_thread);
 
 static const uint64_t buffer_phys[3] = { FB_FRONT, FB_BACK, FB_BACK + 0xa00000 };     /* the third: 0xfc200000 */
 /*
@@ -145,8 +173,15 @@ static volatile uint32_t scan_stride;          /* ... and its rows' bytes */
 static volatile uint64_t scanned_phys;         /* what DPP0 reads now */
 static uint32_t nbuffers = 3;
 static volatile uint32_t shown_index, queued = NO_BUFFER;
-static uint32_t flips, flips_late, flips_dropped;
+static uint32_t flips, flips_dropped;
 static uint64_t flip_wait_us;
+/* the switch's timing (display_say): */
+static volatile bool op_status_works;          /* measure_hz saw DPP0 go busy and idle at every refresh */
+static volatile uint32_t read_us, idle_us;     /* measure_hz: DPP0 reading a frame; the least gap from frame done to the next read */
+static uint32_t flips_forced, flips_raced, flips_stale, flips_fresh, flips_at_once;
+static uint32_t fd_after_hist[5];              /* frame done -> base written: < 100, 300, 1000, 3000 us, more */
+static uint64_t fd_after_max_us, wake_late_max_us, spin_us_total;
+static uint32_t say_flips = 1;
 static lck_grp_t *flip_group;
 static lck_mtx_t *flip_lock;
 
@@ -183,7 +218,18 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	thread_t thread;
 	flip_group = lck_grp_alloc_init("akita_display", LCK_GRP_ATTR_NULL);
 	flip_lock = lck_mtx_alloc_init(flip_group, LCK_ATTR_NULL);
-	if (kernel_thread_start(flipper, NULL, &thread) != KERN_SUCCESS) {
+	PE_parse_boot_argn("display_say", &say_flips, sizeof(say_flips));
+	PE_parse_boot_argn("display_health", &health_on, sizeof(health_on));
+	if (health_on) {
+		dsim_regs = (volatile uint32_t *)ml_io_map(0x19440000ULL, 0x1000);     /* DSIM0 (its error flags: health_check) */
+		printf("akita_display: error flags as found: DPP0 RDMA_IRQ %#x, DSIM0 INTSRC %#x, DECON0 INT_PEND_EXTRA %#x\n",
+		    rdma[RDMA_IRQ / 4], dsim_regs[DSIM_INTSRC / 4], decon[DECON_INT_PEND_EXTRA / 4]);
+		rdma[RDMA_IRQ / 4] = RDMA_ERR_BITS;
+		dsim_regs[DSIM_INTSRC / 4] = DSIM_ERR_BITS;
+		decon[DECON_INT_PEND_EXTRA / 4] = DECON_ERR_BITS;
+	}
+	/* 93 (BASEPRI_PREEMPT_HIGH): above the kernel's own threads (81) and every user thread but real-time ones */
+	if (kernel_thread_start_priority(flipper, NULL, 93, &thread) != KERN_SUCCESS) {
 		printf("akita_display: no flips: the flipping thread could not start\n");
 		return -1;
 	}
@@ -225,7 +271,7 @@ display_flip(unsigned index)
 		flips_dropped++;
 	}
 	queued = index;
-	thread_wakeup((event_t)&queued);
+	thread_wakeup((event_t)&vblank_at);             /* (the flipper: at once if DPP0 idles now) */
 	if (nbuffers == 2) {
 		while (shown_index != index) {
 			assert_wait((event_t)&shown_index, THREAD_UNINT);
@@ -242,104 +288,350 @@ display_flip(unsigned index)
  * -- DECON0 sends a frame at each of the panel's TE, 60 or 120 a second (display_hz=) -- each one timestamped, the rate
  * measured over the last second, and a queued buffer switched to right there, in the rest of the refresh before the
  * next TE starts a read. No interrupt is wired: the thread sleeps until just before the frame done it expects (the last
- * one plus a period, less 1.5 ms) and then looks every 50 us; a frame done missed for 50 ms is counted, and a queued
- * buffer is switched anyway.
+ * one plus a period, plus 0.2 ms -- or from 1.2 ms before it, every 8th refresh and until one is caught as it comes);
+ * a switch waiting is flip_pending's. The switch's rule (dpp_idle) and why: above, at RDMA_IRQ.
  */
 /* vblank_at: mach_absolute_time of the last frame done; vblank_hz: refreshes in the last second (declared above) */
 static uint64_t vblank_count;
 
+static uint64_t
+abs_us(uint64_t abs)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns / 1000;
+}
+
+/* a busy wait of ABS (mach_absolute_time units): delay() of a few us would sleep */
+static void
+spin_abs(uint64_t abs)
+{
+	uint64_t t0 = mach_absolute_time();
+
+	while (mach_absolute_time() - t0 < abs) {
+		__asm__ volatile ("yield");
+	}
+}
+
+/*
+ * May the base be switched now, SINCE_FD after the frame done (FRESH: seen arrive by the poll)? Not while DPP0 reads
+ * (its OP_STATUS, when measure_hz found it working); not when the frame done was found already set and the time since
+ * it (from the beat) is past the idle gap less 300 us.
+ */
+static bool
+dpp_idle(bool fresh, uint64_t since_fd_abs)
+{
+	if (op_status_works && (rdma[RDMA_ENABLE / 4] & IDMA_OP_STATUS)) {
+		return false;
+	}
+	if (fresh) {
+		return true;
+	}
+	/* (no gap measured: 800 us assumed) */
+	return abs_us(since_fd_abs) + 300 < (idle_us > 300 ? idle_us : 800);
+}
+
+/*
+ * The pipeline's own error flags, sampled at every frame done (the tester's thin white lines, 11-10: transient, at fixed
+ * heights, in bursts with CoreAnimation's GPU work -- what a display DMA starved of memory bandwidth does; MIF drops to
+ * 421 MHz at idle on this port, Android's display votes a floor through its BTS): DPP0's RDMA_IRQ error bits (deadlock
+ * 17, read slave error 19, config error 21, recovery 22, MO conflict 24, AXI address error 26), DSIM0's INTSRC
+ * (underrun 19, invalid SFR 23, PH FIFO overflow 27; not 22, abnormal command state, set at every frame since the
+ * bootloader, 60 Hz too) and DECON0's INT_PEND_EXTRA (time out 0, resource conflict 4, DSIM late start 12) -- each
+ * counted and cleared (write 1 to clear); the first 16 said with the time. flip3 (11-10, swipes and idle, 140 s): none
+ * at all -- the display DMA is not starved.
+ */
+static uint32_t err_rdma, err_dsim_underrun, err_dsim_other, err_decon, errs_said;
+
+static void
+health_check(void)
+{
+	if (!health_on) {
+		return;
+	}
+	uint32_t r = rdma[RDMA_IRQ / 4] & RDMA_ERR_BITS, d = dsim_regs ? dsim_regs[DSIM_INTSRC / 4] & DSIM_ERR_BITS : 0;
+	uint32_t e = decon[DECON_INT_PEND_EXTRA / 4] & DECON_ERR_BITS;
+
+	if ((r | d | e) == 0) {
+		return;
+	}
+	if (r) {
+		rdma[RDMA_IRQ / 4] = r;
+		err_rdma++;
+	}
+	if (d) {
+		dsim_regs[DSIM_INTSRC / 4] = d;
+		if (d & (1u << 19)) {
+			err_dsim_underrun++;
+		}
+		if (d & ~(1u << 19)) {
+			err_dsim_other++;
+		}
+	}
+	if (e) {
+		decon[DECON_INT_PEND_EXTRA / 4] = e;
+		err_decon++;
+	}
+	if (errs_said < 16) {
+		uint64_t ns;
+
+		errs_said++;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		printf("akita_display: pipeline error at %llu.%03llu s (flip %u): DPP0 RDMA_IRQ %#x, DSIM0 INTSRC %#x, DECON0 "
+		    "INT_PEND_EXTRA %#x\n", ns / NSEC_PER_SEC, ns / NSEC_PER_MSEC % 1000, flips, r, d, e);
+	}
+}
+
+static void
+say_flipper(void)
+{
+	printf("akita_display: errors: DPP0 %u, DSIM0 underruns %u (other %u), DECON0 %u\n", err_rdma, err_dsim_underrun,
+	    err_dsim_other, err_decon);
+	printf("akita_display: %u flips (%u at once in DPP0's idle gap, %u at a read's end seen, %u by the beat alone); "
+	    "%u forced (no read for 50 ms), %u raced (DPP0 busy right after the write); frame done -> write <100 us %u, <300 "
+	    "%u, <1 ms %u, <3 ms %u, more %u, longest %llu us; woke up to %llu us late; %llu us spun; %u frame dones caught in "
+	    "the last second, %u replaced before shown\n", flips, flips_at_once, flips_fresh, flips_stale, flips_forced,
+	    flips_raced, fd_after_hist[0], fd_after_hist[1], fd_after_hist[2], fd_after_hist[3], fd_after_hist[4],
+	    fd_after_max_us, wake_late_max_us, spin_us_total, vblank_caught_hz, flips_dropped);
+	fd_after_max_us = wake_late_max_us = 0;
+}
+
+/* the queued surface or buffer onto the panel (flip_lock held); RACE_CHECK: count a read that started meanwhile */
+static void
+do_switch(void)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");        /* (the frame's last writes out of the write buffers) */
+	if (scan_phys != 0) {
+		/* a surface scanned out where it is (zero copy): its address and its rows' stride */
+		rdma[RDMA_BASEADDR / 4] = (uint32_t)scan_phys;
+		rdma[RDMA_SRC_WIDTH_REG / 4] = scan_stride / 4;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
+		scanned_phys = scan_phys;
+		scan_phys = 0;
+		thread_wakeup((event_t)&scanned_phys);
+	} else {
+		uint32_t index = queued;                /* (the newest, if another came while waiting) */
+
+		queued = NO_BUFFER;
+		rdma[RDMA_BASEADDR / 4] = (uint32_t)buffer_phys[index];
+		rdma[RDMA_SRC_WIDTH_REG / 4] = FB_WIDTH;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
+		scanned_phys = buffer_phys[index];
+		shown_index = index;
+		thread_wakeup((event_t)&shown_index);
+	}
+	if (op_status_works && (rdma[RDMA_ENABLE / 4] & IDMA_OP_STATUS)) {
+		flips_raced++;
+	}
+	flips++;
+}
+
+/* the last frame done seen arrive (not estimated): the beat's phase is only trusted for 12 refreshes after one */
+static volatile uint64_t vblank_sync_at;
+
+/* the frame done last due before NOW by the beat (0: no recent beat -- four refreshes without one, or none seen
+ * arrive for 12: flip2 showed the phase drifting off when only estimated, and switches "in the gap" landed in a read) */
+static uint64_t
+beat_fd(uint64_t now, uint64_t period)
+{
+	uint64_t at = vblank_at;
+
+	if (at == 0 || period == 0 || now < at || now - at > 4 * period || now - vblank_sync_at > 12 * period) {
+		return 0;
+	}
+	return at + (now - at) / period * period;
+}
+
+static void
+flip_count(uint64_t now, uint64_t fd_at, uint32_t *kind)
+{
+	uint64_t after = abs_us(now - fd_at);
+
+	fd_after_hist[after < 100 ? 0 : after < 300 ? 1 : after < 1000 ? 2 : after < 3000 ? 3 : 4]++;
+	if (after > fd_after_max_us) {
+		fd_after_max_us = after;
+	}
+	(*kind)++;
+}
+
+/*
+ * A queued switch, made only where DPP0 is provably idle with time left before its next read -- never while it reads,
+ * whatever the beat says (flip3: the beat's phase drifts more than a millisecond now and then, and a switch timed by it
+ * landed in reads): DPP0 seen BUSY at B and then IDLE at I with I - B < the idle gap less 300 us means its frame done
+ * was in (B, I] and the next read is at least a gap after B -- switched at I. Looked at every ~1 ms asleep (wake-ups
+ * come up to ~1.1 ms late here: I - B stays near 2 ms), spinning instead when the beat puts the read's end within
+ * 1.5 ms (2 ms of spin at most a switch). At once on arrival only when idle and the beat was caught exactly within
+ * the last two refreshes. Nothing read for 50 ms (no TE: nothing to tear): switched anyway, counted as forced.
+ */
+static void
+flip_pending(uint64_t period)
+{
+	uint64_t t0 = mach_absolute_time(), now, fd, last_busy = 0, spun = 0, step, near, safe, give_up, spin_most;
+	bool done = false, first = true;
+
+	nanoseconds_to_absolutetime(5 * NSEC_PER_USEC, &step);
+	nanoseconds_to_absolutetime(1500 * NSEC_PER_USEC, &near);
+	nanoseconds_to_absolutetime(((idle_us > 600 ? idle_us : 900) - 300) * NSEC_PER_USEC, &safe);
+	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &give_up);
+	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &spin_most);
+	while (!done) {
+		bool busy, spin = false;
+
+		now = mach_absolute_time();
+		busy = op_status_works && (rdma[RDMA_ENABLE / 4] & IDMA_OP_STATUS) != 0;
+		lck_mtx_lock(flip_lock);
+		if (scan_phys == 0 && queued == NO_BUFFER) {
+			lck_mtx_unlock(flip_lock);
+			return;                         /* (nothing queued after all) */
+		}
+		if (busy) {
+			last_busy = now;
+			fd = beat_fd(now, period);
+			spin = spun < spin_most && (fd == 0 || fd + period < now + near);
+		} else if (last_busy != 0 && now - last_busy < safe) {
+			/* a read seen end: its frame done in (last_busy, now] */
+			rdma[RDMA_IRQ / 4] = FRAME_DONE;
+			vblank_at = now;
+			if (now - last_busy < step * 8) {
+				vblank_sync_at = now;   /* (caught as it came: the beat exact) */
+			}
+			vblank_count++;
+			flip_count(now, last_busy, &flips_fresh);
+			do_switch();
+			done = true;
+		} else if (first && op_status_works && now - vblank_sync_at < 2 * period && (fd = beat_fd(now, period)) != 0 &&
+		    dpp_idle(false, now - fd)) {
+			flip_count(now, fd, &flips_at_once);
+			do_switch();
+			done = true;
+		} else {
+			/* idle, not provably in the gap: the next read awaited (its start, then its end) */
+			last_busy = 0;
+			fd = beat_fd(now, period);
+			spin = spun < spin_most && fd != 0 && fd + period > now && fd + period < now + near / 2;
+		}
+		if (!done && (now - t0 > give_up || !op_status_works)) {
+			/* (OP_STATUS not trusted: by the beat alone, as before 11-10) */
+			if (op_status_works || (fd = beat_fd(now, period)) == 0 || dpp_idle(false, now - fd) || now - t0 > give_up) {
+				if (op_status_works || now - t0 > give_up) {
+					flips_forced++;
+				} else {
+					flip_count(now, fd, &flips_stale);
+				}
+				do_switch();
+				done = true;
+			}
+		}
+		lck_mtx_unlock(flip_lock);
+		first = false;
+		if (done) {
+			break;
+		}
+		if (spin) {
+			spin_abs(step);
+			spun += step;
+		} else {
+			assert_wait_timeout((event_t)&flip_pending, THREAD_UNINT, 1000, NSEC_PER_USEC);
+			thread_block(THREAD_CONTINUE_NULL);
+		}
+	}
+	spin_us_total += abs_us(spun);
+	health_check();
+}
+
 static void
 flipper(__unused void *arg, __unused wait_result_t wr)
 {
-	uint64_t second_start = mach_absolute_time(), period_abs, margin_abs, window_abs;
-	uint32_t in_second = 0;
+	uint64_t second_start = mach_absolute_time(), say_at = second_start, period_abs, window_abs, after_abs, catch_abs;
+	uint64_t ahead_abs, step_abs, say_abs, last_count = 0, short_abs;
+	uint32_t said_flips = 0, beat = 0;
+	bool need_sync = true;
 
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / 60, &period_abs);
 	vblank_period = period_abs;
-	nanoseconds_to_absolutetime(700 * NSEC_PER_USEC, &margin_abs);
 	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &window_abs);
+	nanoseconds_to_absolutetime(200 * NSEC_PER_USEC, &after_abs);
+	nanoseconds_to_absolutetime(1200 * NSEC_PER_USEC, &ahead_abs);
+	nanoseconds_to_absolutetime(2600 * NSEC_PER_USEC, &catch_abs);
+	nanoseconds_to_absolutetime(500 * NSEC_PER_USEC, &short_abs);
+	nanoseconds_to_absolutetime(5 * NSEC_PER_USEC, &step_abs);
+	nanoseconds_to_absolutetime(30 * NSEC_PER_SEC, &say_abs);
 	rdma[RDMA_IRQ / 4] = FRAME_DONE;
 	for (;;) {
-		uint64_t now = mach_absolute_time(), t0;
-		uint32_t index;
-		bool seen = false;
+		uint64_t now = mach_absolute_time(), t0, next, at;
+		bool seen = false, fresh = false, precise;
+		wait_result_t w = THREAD_TIMED_OUT;
 
-		/* asleep until a quarter of a refresh (1.5 ms at least) before the frame done that is due; the period is
-		 * measure_hz's, not guessed from the gaps seen here */
 		while (vblank_paused) {
 			assert_wait_timeout((event_t)&vblank_paused, THREAD_UNINT, 5, NSEC_PER_MSEC);
 			thread_block(THREAD_CONTINUE_NULL);
 			now = mach_absolute_time();
 		}
 		period_abs = vblank_period;
-		margin_abs = period_abs / 4;
-		{
-			uint64_t least;
-			nanoseconds_to_absolutetime(1500 * NSEC_PER_USEC, &least);
-			if (margin_abs < least) margin_abs = least;
+		if (scan_phys != 0 || queued != NO_BUFFER) {
+			flip_pending(period_abs);
+			continue;
 		}
-		if (vblank_at != 0 && vblank_at + period_abs > now + margin_abs) {
-			assert_wait_deadline((event_t)&vblank_at, THREAD_UNINT, vblank_at + period_abs - margin_abs);
-			thread_block(THREAD_CONTINUE_NULL);
+
+		/* the beat, no switch waiting: asleep until just after the frame done due, the bit looked at (a frame done not
+		 * yet there is caught as it comes, within 0.5 ms); every 8th refresh, and until one succeeds, from 1.2 ms before
+		 * it (wake-ups come up to ~1.1 ms late) -- the phase kept exact; woken by a queued switch */
+		next = vblank_at != 0 && period_abs != 0 ? (now > vblank_at ? vblank_at + ((now - vblank_at) / period_abs + 1) *
+		    period_abs : vblank_at + period_abs) : now;
+		precise = need_sync || (++beat & 7) == 0 || vblank_at == 0;
+		at = precise ? next - ahead_abs : next + after_abs;
+		if (at > now) {
+			assert_wait_deadline((event_t)&vblank_at, THREAD_UNINT, at);
+			w = thread_block(THREAD_CONTINUE_NULL);
+			if (w == THREAD_AWAKENED) {
+				continue;               /* (a switch queued) */
+			}
 		}
 		t0 = mach_absolute_time();
 		while (mach_absolute_time() - t0 < window_abs) {
 			if (rdma[RDMA_IRQ / 4] & FRAME_DONE) {
 				seen = true;
+				fresh = mach_absolute_time() != t0 && mach_absolute_time() - t0 > step_abs;
 				break;
 			}
-			delay(50);
+			if (mach_absolute_time() - t0 < (precise ? catch_abs : short_abs)) {
+				spin_abs(step_abs);
+			} else {
+				delay(50);
+			}
 		}
 		now = mach_absolute_time();
 		rdma[RDMA_IRQ / 4] = FRAME_DONE;
+		spin_us_total += abs_us((now - t0) < catch_abs ? now - t0 : catch_abs);
 		if (seen) {
-			vblank_at = now;
+			/* when it was: now if seen arrive, else the beat's (the last one due before now) */
+			if (fresh) {
+				vblank_at = vblank_sync_at = now;
+				need_sync = false;
+			} else {
+				vblank_at = vblank_at == 0 || period_abs == 0 || now < vblank_at + period_abs ? now :
+				    vblank_at + (now - vblank_at) / period_abs * period_abs;
+				need_sync = need_sync || precise;
+			}
 			vblank_count++;
-			in_second++;
-		} else {
-			flips_late += queued != NO_BUFFER;
 		}
+		health_check();
 		{
 			uint64_t ns;
 			absolutetime_to_nanoseconds(now - second_start, &ns);
 			if (ns >= NSEC_PER_SEC) {
-				vblank_caught_hz = (uint32_t)((uint64_t)in_second * NSEC_PER_SEC / ns);
+				vblank_caught_hz = (uint32_t)((vblank_count - last_count) * NSEC_PER_SEC / ns);
+				last_count = vblank_count;
 				second_start = now;
-				in_second = 0;
 			}
 		}
-		lck_mtx_lock(flip_lock);
-		if (scan_phys != 0) {
-			/* a surface scanned out where it is (zero copy): its address and its rows' stride */
-			__asm__ volatile("dsb sy" ::: "memory");
-			rdma[RDMA_BASEADDR / 4] = (uint32_t)scan_phys;
-			rdma[RDMA_SRC_WIDTH_REG / 4] = scan_stride / 4;
-			__asm__ volatile("dsb sy" ::: "memory");
-			rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
-			scanned_phys = scan_phys;
-			scan_phys = 0;
-			thread_wakeup((event_t)&scanned_phys);
-			flips++;
-		}
-		if (queued == NO_BUFFER) {
-			lck_mtx_unlock(flip_lock);
-			continue;
-		}
-		__asm__ volatile("dsb sy" ::: "memory");        /* (the frame's last writes out of the write buffers) */
-		index = queued;                                 /* (the newest, if another came while waiting) */
-		queued = NO_BUFFER;
-		rdma[RDMA_BASEADDR / 4] = (uint32_t)buffer_phys[index];
-		rdma[RDMA_SRC_WIDTH_REG / 4] = FB_WIDTH;
-		__asm__ volatile("dsb sy" ::: "memory");
-		rdma[RDMA_ENABLE / 4] |= SFR_UPDATE_FORCE;
-		scanned_phys = buffer_phys[index];
-		shown_index = index;
-		thread_wakeup((event_t)&shown_index);
-		lck_mtx_unlock(flip_lock);
-		if (++flips % 600 == 0) {
-			printf("akita_display: %u flips; the panel at %u Hz, %u frame dones caught in the last second (%llu in all); %u "
-			    "frames replaced by a newer before being shown, %u flips without a frame done in 50 ms\n", flips, vblank_hz,
-			    vblank_caught_hz, vblank_count, flips_dropped, flips_late);
+		if (say_flips && flips != said_flips && now - say_at >= say_abs) {
+			say_at = now;
+			said_flips = flips;
+			say_flipper();
 		}
 	}
 }
@@ -374,9 +666,30 @@ display_scanout(uint64_t phys, uint32_t row_bytes)
 	scan_stride = row_bytes;
 	scan_phys = phys;
 	lck_mtx_unlock(flip_lock);
+	thread_wakeup((event_t)&vblank_at);             /* (the flipper: at once if DPP0 idles now) */
 }
 
 static uint64_t display_scanned(void) { return scanned_phys; }
+
+/* until DPP0 reads BASE (true), or US microseconds (false): woken by the flipper's switch, no polling */
+static bool
+display_wait_scanned(uint64_t base, uint32_t us)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
+	while (scanned_phys != base) {
+		assert_wait_deadline((event_t)&scanned_phys, THREAD_UNINT, deadline);
+		if (scanned_phys == base) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			break;
+		}
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
+			break;
+		}
+	}
+	return scanned_phys == base;
+}
 
 /*
  * What the panel shows, for a picture of it (hakios.akita_usbmux.c's port 6): what DPP0 reads -- its base address, its
@@ -469,32 +782,59 @@ dsim_dcs(const uint8_t *b, uint32_t n)
 }
 
 /*
- * The panel's true rate: the vblank thread paused, frame done's edges counted for half a second by polling every 20 us
- * (no sleeping in between, so none is missed); the period set from it for the vblank thread
+ * The panel's true rate: the vblank thread paused, frame done's edges counted for half a second by polling every ~2 us
+ * (a spin: no sleeping in between, so none is missed); the period set from it for the vblank thread. Also DPP0's DMA
+ * watched (RDMA_ENABLE's OP_STATUS): how long it reads a frame, and the least gap from a frame done to the next read --
+ * the time the base may be switched in (the flipper's rule: op_status_works, idle_us).
  */
 static uint32_t
 measure_hz(void)
 {
-	uint64_t t0, first = 0, last = 0;
-	uint32_t edges = 0;
+	uint64_t t0, first = 0, last = 0, step, busy_at = 0, fd_seen = 0, busy_sum = 0, idle_least = ~0ULL, idle_most = 0;
+	uint32_t edges = 0, reads = 0, gaps = 0;
+	bool busy;
 
 	vblank_paused = true;
 	delay(20000);                           /* (the thread out of its poll) */
+	nanoseconds_to_absolutetime(2 * NSEC_PER_USEC, &step);
 	rdma[RDMA_IRQ / 4] = FRAME_DONE;
+	busy = (rdma[RDMA_ENABLE / 4] & IDMA_OP_STATUS) != 0;
 	t0 = mach_absolute_time();
 	while (micros(t0) < 500000) {
+		uint64_t now = mach_absolute_time();
+		bool b = (rdma[RDMA_ENABLE / 4] & IDMA_OP_STATUS) != 0;
+
+		if (b && !busy) {                       /* a read starts */
+			busy_at = now;
+			if (fd_seen != 0) {
+				uint64_t gap = now - fd_seen;
+				if (gap < idle_least) idle_least = gap;
+				if (gap > idle_most) idle_most = gap;
+				gaps++;
+				fd_seen = 0;
+			}
+		} else if (!b && busy && busy_at != 0) {  /* a read ends */
+			busy_sum += now - busy_at;
+			reads++;
+		}
+		busy = b;
 		if (rdma[RDMA_IRQ / 4] & FRAME_DONE) {
-			uint64_t now = mach_absolute_time();
+			now = mach_absolute_time();
 			rdma[RDMA_IRQ / 4] = FRAME_DONE;
 			if (edges++ == 0) first = now;
 			last = now;
+			fd_seen = now;
 		}
-		delay(20);
+		spin_abs(step);
 	}
 	if (edges >= 2) {
 		vblank_period = (last - first) / (edges - 1);
-		vblank_at = last;
+		vblank_at = vblank_sync_at = last;
 	}
+	/* OP_STATUS trusted when it went busy and idle about once a refresh */
+	op_status_works = edges >= 10 && reads + 3 >= edges && reads <= edges + 3 && gaps + 3 >= edges;
+	read_us = reads ? (uint32_t)abs_us(busy_sum / reads) : 0;
+	idle_us = gaps ? (uint32_t)abs_us(idle_least) : 0;
 	vblank_paused = false;
 	thread_wakeup((event_t)&vblank_paused);
 	{
@@ -502,6 +842,9 @@ measure_hz(void)
 		absolutetime_to_nanoseconds(vblank_period, &ns);
 		vblank_hz = ns ? (uint32_t)((NSEC_PER_SEC + ns / 2) / ns) : 0;
 	}
+	printf("akita_display: %u frame dones in 0.5 s (%u Hz); DPP0 read %u frames, %u us each, the gap from frame done to "
+	    "the next read %u-%llu us (%u seen): OP_STATUS %s\n", edges, vblank_hz, reads, read_us, idle_us,
+	    gaps ? abs_us(idle_most) : 0, gaps, op_status_works ? "trusted" : "NOT trusted (the switch goes by the beat alone)");
 	return vblank_hz;
 }
 
@@ -542,10 +885,12 @@ struct hakios_display_ops {
 	uint64_t (*slot)(unsigned i, uint64_t *size);
 	void (*scanout)(uint64_t phys, uint32_t row_bytes);
 	uint64_t (*scanned)(void);
+	bool (*wait_scanned)(uint64_t base, uint32_t us);
 };
 extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
 static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown, display_refresh_hz,
-	                                                     display_vblank_time, display_slot, display_scanout, display_scanned };
+	                                                     display_vblank_time, display_slot, display_scanout, display_scanned,
+	                                                     display_wait_scanned };
 
 /*
  * The DPP's scaler, tried on its own (display_scale=1, without display_flip; display_scale_delay= seconds, 60): DPP0 made
