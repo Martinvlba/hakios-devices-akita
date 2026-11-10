@@ -788,13 +788,29 @@ usb_watchdog(uint64_t now)
 	/* ... and a bus that is alive: the host's start-of-frame number (DSTS SOFFN, bits 3-16, a new one every 125 us)
 	 * still moving -- a controller that lost its link without a disconnect event, or a host that went, leaves it still
 	 * while the phone believes itself configured (11-09: Windows saw only a charger, and the watchdog waited) */
-	static uint32_t last_frame, frame_still;
+	/* ... unless that number does not move here at all: 11-10, DSTS read 0x82d4e0 at every status line from the
+	 * enumeration on while the host sent hundreds of packets -- the condition never held, and EVERY test run restarted
+	 * 180 s after the watchdog was armed (~200 s of uptime; the reset reason "APC Watchdog Early" is reboot_kernel's).
+	 * Host packets arriving while it stands still for 2000 looks: it is no sign of a live bus on this controller and is
+	 * left out (the rule before it: configured, and the host has sent usbmux data since) */
+	static uint32_t last_frame, frame_still, out_at_still;
+	static bool sof_useless;
 	uint32_t frame = (rd(DSTS) >> 3) & 0x3fff;
 	bool moving = frame != last_frame;
 
 	last_frame = frame;
-	frame_still = moving ? 0 : frame_still + 1;
-	if (bulk_on && seen_bulk_out != bulk_out_at_config && frame_still < 2000) {     /* (2000 looks: 2 s or more) */
+	if (moving) {
+		frame_still = 0;
+		out_at_still = seen_bulk_out;
+	} else {
+		frame_still++;
+	}
+	if (!sof_useless && frame_still >= 2000 && seen_bulk_out != out_at_still) {
+		sof_useless = true;
+		printf("akita usb: the start-of-frame number stands still (DSTS %#x) while the host sends: not a sign of the bus "
+		    "for usb_lost_reboot\n", rd(DSTS));
+	}
+	if (bulk_on && seen_bulk_out != bulk_out_at_config && (sof_useless || frame_still < 2000)) {   /* (2000 looks: 2 s or more) */
 		last_good = now;
 		return;
 	}
