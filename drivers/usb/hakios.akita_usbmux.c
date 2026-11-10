@@ -252,6 +252,50 @@ done:
 	lck_mtx_unlock(mux_lock);
 }
 
+/*
+ * Port 7 (11-10): the screen recording (boot-arg rec=N, MiniIOMobileFramebuffer.cpp) as it lies -- its header
+ * ("RWREC003": width, height, frames, the oldest, when it began) and the frames -- the recording paused while it goes;
+ * then the connection is closed. devices/akita/tools/usbmux-rec.py on the host, tools/recording.py makes the video.
+ */
+extern uint64_t loader_recording[3];            /* { physical address, bytes, kernel address }: loader_return.c */
+extern volatile uint32_t hakios_rec_paused;
+
+static void
+rec_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+	const uint8_t *base;
+	uint64_t length;
+
+	hakios_rec_paused = 1;
+	delay_for_interval(100, NSEC_PER_MSEC);         /* (a frame being recorded finished) */
+	base = (const uint8_t *)(uintptr_t)loader_recording[2];
+	length = loader_recording[1];
+	if (base == NULL || length == 0) {
+		static const char none[] = "no recording: boot-arg rec=N (2 to 8, one pixel of every N kept)\n";
+		screen_send(c, none, sizeof(none) - 1);
+	} else {
+		printf("akita usbmux: the screen recording, %llu MB\n", length >> 20);
+		for (uint64_t at = 0; at < length && c->open;) {
+			uint32_t n = (uint32_t)(length - at < MAX_DATA ? length - at : MAX_DATA);
+
+			if (!screen_send(c, base + at, n)) {
+				break;
+			}
+			at += n;
+		}
+	}
+	hakios_rec_paused = 0;
+	delay_for_interval(200, NSEC_PER_MSEC);
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_FIN | TH_ACK, c->tx_seq, c->rx_next, NULL, 0, false);
+		send_tcp(c, TH_RST, c->tx_seq + 1, c->rx_next, NULL, 0, false);
+	}
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
 #define PMU_REBOOT_CMD          0x15460810UL    /* Android's tree: pixel-reboot, syscon PMU 0x15460000, reboot-cmd-offset 0x810 */
 #define REBOOT_BOOTLOADER       0xfc
 #define TENSOR_SMC_PMU_SEC_REG  0x82000504
@@ -392,7 +436,7 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 		return;
 	}
-	if (phone_port == 1 || phone_port == 5 || phone_port == 6) {
+	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {
 			if (!conns[i].used) {
@@ -411,9 +455,11 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 			return;
 		}
 		printf("akita usbmux: host port %u: the %s\n", host_port,
-		    phone_port == 1 ? "console log" : phone_port == 5 ? "kernel message buffer" : "screen");
+		    phone_port == 1 ? "console log" : phone_port == 5 ? "kernel message buffer" : phone_port == 7 ? "screen recording" :
+		    "screen");
 		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
-		if (kernel_thread_start(phone_port == 1 ? klog_thread : phone_port == 5 ? dmesg_thread : screen_thread, c,
+		if (kernel_thread_start(phone_port == 1 ? klog_thread : phone_port == 5 ? dmesg_thread : phone_port == 7 ? rec_thread :
+		    screen_thread, c,
 		    &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}

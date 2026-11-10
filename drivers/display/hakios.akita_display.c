@@ -16,6 +16,7 @@
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
@@ -174,6 +175,19 @@ static volatile uint64_t scanned_phys;         /* what DPP0 reads now */
 static uint32_t nbuffers = 3;
 static volatile uint32_t shown_index, queued = NO_BUFFER;
 static uint32_t flips, flips_dropped;
+/* (for a frame counter in user space: inject_sb.c's cube, sb_cube=1 -- the panel's real rate, not what was drawn) */
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, display_flips, CTLFLAG_RD | CTLFLAG_LOCKED, &flips, 0,
+    "surfaces put on the panel since boot");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, display_dropped, CTLFLAG_RD | CTLFLAG_LOCKED, &flips_dropped, 0,
+    "surfaces replaced by a newer one before they reached the panel");
+/* (for the governor: frames reaching the panel keep the clocks up as a touch does, hakios.akita_dvfs.c) */
+uint32_t akita_display_flip_count(void);
+uint32_t
+akita_display_flip_count(void)
+{
+	return flips;
+}
 static uint64_t flip_wait_us;
 /* the switch's timing (display_say): */
 static volatile bool op_status_works;          /* measure_hz saw DPP0 go busy and idle at every refresh */
@@ -645,6 +659,9 @@ display_refresh_hz(void)
 	return hz >= 112 && hz <= 128 ? 120 : hz >= 55 && hz <= 65 ? 60 : hz;
 }
 static uint64_t display_vblank_time(void) { return vblank_at; }
+/* (for the governor's frame boost: the panel's measured rate, hakios.akita_dvfs.c) */
+uint32_t akita_display_refresh(void);
+uint32_t akita_display_refresh(void) { return vblank_hz; }
 
 /* a scan-out slot's physical address and size (0 past the last) */
 static uint64_t
