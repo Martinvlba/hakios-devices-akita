@@ -1,0 +1,7 @@
+# devices/akita/drivers/camera/conf: the Pixel 8a's camera side (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_TORCH
+	file    bsd/dev/hakios.akita_torch.c
+	help    the Pixel 8a's flashlight: the LM3644 flash driver on zuma's hsi2c@10980000 (USI14 of PERIC0, brought up here),
+	help    a look (torch=1), lit once (torch=2), Darwin's through /dev/hakios-torch (torch=3); never above torch_max_ma
+	help    (100), off after torch_max_s (30), on a fault or a warm skin

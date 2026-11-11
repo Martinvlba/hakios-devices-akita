@@ -1,0 +1,6 @@
+# devices/akita/drivers/haptic/conf: the Pixel 8a's vibration motor (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_HAPTIC
+	file    bsd/dev/hakios.akita_haptic.c
+	help    the Pixel 8a's vibration motor: the CS40L26A on zuma's hsi2c@10C80000 (USI0 of PERIC1, brought up here); a look
+	help    so far (haptic=1): out of reset, its ids and the DSP's state read
