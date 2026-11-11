@@ -155,6 +155,9 @@ micros(uint64_t since)
 #define DECON_INT_PEND_EXTRA 0x074
 #define DECON_ERR_BITS  ((1u << 0) | (1u << 4) | (1u << 12))
 static volatile uint32_t *dsim_regs;
+#define DSIM0           0x19440000ULL
+static volatile uint32_t *dsim;                 /* DSIM0, for the panel's commands (dsim_dcs) */
+static uint32_t panel_on = 1, max_nits = 800;  /* display_panel=, display_max_nits= (panel_commands) */
 static uint32_t health_on = 1;                 /* display_health=0: the error flags not read (a hang's suspect, 11-10) */
 
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
@@ -201,6 +204,7 @@ static lck_mtx_t *flip_lock;
 
 static void flipper(void *arg, wait_result_t wr);
 static void panel_set_hz(uint32_t hz);
+static void panel_commands(void);
 static uint32_t display_refresh_hz(void);
 static uint64_t display_slot(unsigned i, uint64_t *size);
 static void display_scanout(uint64_t phys, uint32_t row_bytes);
@@ -234,8 +238,12 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	flip_lock = lck_mtx_alloc_init(flip_group, LCK_ATTR_NULL);
 	PE_parse_boot_argn("display_say", &say_flips, sizeof(say_flips));
 	PE_parse_boot_argn("display_health", &health_on, sizeof(health_on));
+	PE_parse_boot_argn("display_panel", &panel_on, sizeof(panel_on));
+	PE_parse_boot_argn("display_max_nits", &max_nits, sizeof(max_nits));
+	max_nits = max_nits < 100 ? 100 : max_nits > 1400 ? 1400 : max_nits;
+	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);     /* (the panel's commands: panel_commands) */
 	if (health_on) {
-		dsim_regs = (volatile uint32_t *)ml_io_map(0x19440000ULL, 0x1000);     /* DSIM0 (its error flags: health_check) */
+		dsim_regs = dsim;       /* DSIM0 (its error flags: health_check) */
 		printf("akita_display: error flags as found: DPP0 RDMA_IRQ %#x, DSIM0 INTSRC %#x, DECON0 INT_PEND_EXTRA %#x\n",
 		    rdma[RDMA_IRQ / 4], dsim_regs[DSIM_INTSRC / 4], decon[DECON_INT_PEND_EXTRA / 4]);
 		rdma[RDMA_IRQ / 4] = RDMA_ERR_BITS;
@@ -553,6 +561,7 @@ flip_pending(uint64_t period)
 		}
 	}
 	spin_us_total += abs_us(spun);
+	panel_commands();
 	health_check();
 }
 
@@ -631,6 +640,7 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 				need_sync = need_sync || precise;
 			}
 			vblank_count++;
+			panel_commands();
 		}
 		health_check();
 		{
@@ -746,7 +756,6 @@ akita_display_snapshot(const uint8_t **pixels, uint64_t *phys, uint32_t *width, 
  * TE), F7 0F (the update), the test key off. In command mode the panel's TE then comes at that rate, and DECON0's
  * hardware trigger with it: nothing else changes on this side.
  */
-#define DSIM0           0x19440000ULL
 #define DSIM_PKTHDR     0x058
 #define DSIM_PAYLOAD    0x05c
 #define DSIM_FIFOCTRL   0x068
@@ -755,8 +764,6 @@ akita_display_snapshot(const uint8_t **pixels, uint64_t *phys, uint32_t *width, 
 #define FIFO_PL_EMPTY   (1u << 8)
 #define PKT_GO_EN       (1u << 16)
 #define PKT_GO_RDY      (1u << 17)
-
-static volatile uint32_t *dsim;
 
 static bool
 dsim_fifo_empty(uint32_t which)
@@ -874,7 +881,6 @@ panel_set_hz(uint32_t hz)
 	uint32_t before = measure_hz();
 	bool ok;
 
-	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);
 	printf("akita_display: the panel to %u Hz (it refreshes at %u now); DSIM0 CMD_CONFIG %#x FIFOCTRL %#x\n", hz, before,
 	    dsim[DSIM_CMD_CONFIG / 4], dsim[DSIM_FIFOCTRL / 4]);
 	/* right after a frame done: the rest of the refresh is free for commands */
@@ -893,6 +899,105 @@ panel_set_hz(uint32_t hz)
 	    vblank_hz, dsim[DSIM_FIFOCTRL / 4]);
 }
 
+/*
+ * The panel's BRIGHTNESS and POWER as iOS asks for them (MiniIOMobileFramebuffer: CoreBrightness's IOMFBBrightnessLevel,
+ * backboardd's RequestPowerChange -- the screen locked, auto-lock): wanted here from any thread, sent by the vblank thread
+ * right after a frame done (the rest of the refresh is free for commands, as panel_set_hz sends them), the newest only.
+ *   Brightness: DCS 0x51 and the 12-bit level, high byte first (panel-google-ak3b.c, ak3b_set_brightness): 209 (2 nits)
+ *   to 3175 (800 nits), 3176-4095 the panel's HBM (to 1400 nits) -- ak3b_brightness_capability. iOS asks in nits (16.16);
+ *   the level is put between the table's ends linearly, and kept to display_max_nits= (800: no HBM unless asked).
+ *   Power: off is DCS 0x28 (display off) alone -- the panel stays out of sleep and its TE goes on, so DECON0's frames,
+ *   this thread, the flips and the GPU's submission gate see no difference; nothing is lit. On is 0x29. (Google's off adds
+ *   sleep in, 0x10, and its on the whole init sequence again: more saved, more to go wrong -- not yet.)
+ * display_panel=0: neither sent (the panel as the bootloader left it).
+ */
+static volatile uint32_t want_level, sent_level;       /* the panel's level; 0: none asked for yet */
+static volatile uint32_t want_on = 1, sent_on = 1;
+static uint32_t levels_sent, levels_said, panel_fails;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, display_level, CTLFLAG_RD | CTLFLAG_LOCKED, (uint32_t *)&sent_level, 0,
+    "the panel's brightness level last sent (209-4095; 0: the bootloader's)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, display_on, CTLFLAG_RD | CTLFLAG_LOCKED, (uint32_t *)&sent_on, 0,
+    "the panel lit (1) or not (0)");
+
+static uint32_t
+nits_to_level(uint32_t nits16)
+{
+	uint64_t n = nits16, lo = 2ull << 16, mid = 800ull << 16, top = (uint64_t)max_nits << 16;
+
+	n = n < lo ? lo : n > top ? top : n;
+	if (n <= mid) {
+		return 209 + (uint32_t)((n - lo) * (3175 - 209) / (mid - lo));
+	}
+	return 3176 + (uint32_t)((n - mid) * (4095 - 3176) / ((1400ull << 16) - mid));
+}
+
+static void
+display_brightness(uint32_t nits16)
+{
+	static uint64_t said_at;
+	static uint32_t said_level;
+	uint64_t now = mach_absolute_time();
+	uint32_t level = nits_to_level(nits16);
+
+	/* 1 nit or less is never a setting -- the slider's least is ~2 -- but CoreBrightness's while the backlight's factor
+	 * is 0: 1 at a boot and a wake, 0 at a lock, the real value coming ~0.7 s later (the brightness bridge, inject.c):
+	 * applied, they left the panel at its least for that long (and a boot's for good, before the bridge's replay). Not
+	 * applied: the panel keeps its level through the dark and lights at it again. */
+	if (nits16 <= 0x10000) {
+		return;
+	}
+	want_level = level;
+	/* the first 40, then at most one a second while it changes (a ramp sends ~60 a second) */
+	if (level != said_level && (levels_said < 40 || abs_us(now - said_at) >= 1000000)) {
+		levels_said++;
+		said_at = now;
+		said_level = level;
+		printf("akita_display: brightness %u.%02u nits asked -> level %u\n", nits16 >> 16, (nits16 & 0xffff) * 100 >> 16,
+		    level);
+	}
+}
+
+static void
+display_power(bool on)
+{
+	want_on = on ? 1 : 0;
+	printf("akita_display: the panel to be %s\n", on ? "lit" : "dark");
+}
+
+static void
+panel_commands(void)
+{
+	uint32_t level = want_level, on = want_on;
+	bool ok;
+
+	if (!panel_on || dsim == NULL || (level == sent_level && on == sent_on)) {
+		return;
+	}
+	if (!on && sent_on) {
+		const uint8_t off = 0x28;
+		ok = dsim_dcs(&off, 1);
+		sent_on = 0;
+		panel_fails += !ok;
+		printf("akita_display: the panel dark (display off %s)\n", ok ? "sent" : "NOT sent");
+	}
+	if (level != 0 && level != sent_level) {
+		const uint8_t b[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
+		ok = dsim_dcs(b, sizeof(b));
+		sent_level = level;
+		levels_sent++;
+		if (!ok && panel_fails++ < 10) {
+			printf("akita_display: brightness level %u NOT sent (FIFOCTRL %#x)\n", level, dsim[DSIM_FIFOCTRL / 4]);
+		}
+	}
+	if (on && !sent_on) {
+		const uint8_t lit = 0x29;
+		ok = dsim_dcs(&lit, 1);
+		sent_on = 1;
+		panel_fails += !ok;
+		printf("akita_display: the panel lit (display on %s, level %u)\n", ok ? "sent" : "NOT sent", sent_level);
+	}
+}
+
 struct hakios_display_ops {
 	int (*buffers)(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *height, uint32_t *row_bytes);
 	void (*flip)(unsigned index);
@@ -903,11 +1008,13 @@ struct hakios_display_ops {
 	void (*scanout)(uint64_t phys, uint32_t row_bytes);
 	uint64_t (*scanned)(void);
 	bool (*wait_scanned)(uint64_t base, uint32_t us);
+	void (*brightness)(uint32_t nits16);
+	void (*power)(bool on);
 };
 extern const struct hakios_display_ops *hakios_display_ops;     /* MiniIOMobileFramebuffer's */
 static const struct hakios_display_ops akita_display_ops = { display_buffers, display_flip, display_shown, display_refresh_hz,
 	                                                     display_vblank_time, display_slot, display_scanout, display_scanned,
-	                                                     display_wait_scanned };
+	                                                     display_wait_scanned, display_brightness, display_power };
 
 /*
  * The DPP's scaler, tried on its own (display_scale=1, without display_flip; display_scale_delay= seconds, 60): DPP0 made
