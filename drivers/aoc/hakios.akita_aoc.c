@@ -887,7 +887,16 @@ aoc_boot(void)
 			if (PE_parse_boot_argn("aocplay", &aocplay, sizeof(aocplay)) && aocplay != 0) {
 				aoc_play();
 			}
-			if (PE_parse_boot_argn("aocsound", &aocsound, sizeof(aocsound)) && aocsound != 0) {
+			if (!PE_parse_boot_argn("aocsound", &aocsound, sizeof(aocsound))) {
+				uint32_t speaker = 0;
+
+				/* (speaker=1 -- the speakers wanted, drivers/audio -- means Darwin's sound there: aocsound=1 implied,
+				 * 11 characters of a command line that has few to spare) */
+				if (PE_parse_boot_argn("speaker", &speaker, sizeof(speaker)) && speaker != 0) {
+					aocsound = 1;
+				}
+			}
+			if (aocsound != 0) {
 				thread_t t;
 
 				PE_parse_boot_argn("aocsound_gain", &aocsound_gain, sizeof(aocsound_gain));

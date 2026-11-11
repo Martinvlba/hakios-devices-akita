@@ -2781,21 +2781,23 @@ sta_join(const struct hakios_sta_join *j)
 	err = iovar_int("wpa_auth", psk ? 0x80 : 0) | iovar_int("auth", 0) | iovar_int("wsec", psk ? 4 : 0) |
 	    iovar_int("sup_wpa", psk ? 1 : 0);
 	if (err == 0 && psk) {
-		/* WLC_SET_WSEC_PMK: the passphrase (flag 1), or the PMK as 64 hex digits (the firmware takes those for a key) */
+		/*
+		 * WLC_SET_WSEC_PMK (wsec_pmk_t: key_len, flags, key): the passphrase with WSEC_PASSPHRASE (1: the firmware
+		 * hashes it with the SSID), or a PMK as its 32 raw bytes with flags 0 -- what bcmdhd's wl_cfg80211 does with
+		 * the PMK a supplicant hands it. wifid joins from Settings with the PMK it derived (32 bytes, "kind 6"): this
+		 * driver sent it as 64 hex digits WITH flag 1, so the firmware hashed the digits as if they were a passphrase,
+		 * got another key, and the handshake failed -- "incorrect password" for the right one (the tester, 11-11).
+		 */
 		bzero(pmk, sizeof(pmk));
 		if (j->passphrase_length >= 8 && j->passphrase_length <= 63) {
 			put16(pmk, 0, j->passphrase_length);
+			put16(pmk, 2, 1);               /* WSEC_PASSPHRASE */
 			memcpy(pmk + 4, j->passphrase, j->passphrase_length);
 		} else {
-			static const char hex[] = "0123456789abcdef";
-
-			put16(pmk, 0, 64);
-			for (unsigned i = 0; i < 32; i++) {
-				pmk[4 + 2 * i] = (uint8_t)hex[j->pmk[i] >> 4];
-				pmk[4 + 2 * i + 1] = (uint8_t)hex[j->pmk[i] & 15];
-			}
+			put16(pmk, 0, 32);
+			put16(pmk, 2, 0);
+			memcpy(pmk + 4, j->pmk, 32);
 		}
-		put16(pmk, 2, 1);
 		err = bcm_ioctl(268, pmk, sizeof(pmk), NULL, sizeof(pmk));
 		bzero(pmk, sizeof(pmk));
 		wl_take();
