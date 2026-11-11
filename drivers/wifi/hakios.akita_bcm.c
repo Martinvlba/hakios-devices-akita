@@ -58,6 +58,7 @@
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/sched_prim.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
@@ -81,6 +82,7 @@ extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 /* from hakios.akita_pcie.c: the chip's configuration space (through the root complex's window) and its BARs */
 volatile uint8_t *akita_pcie_config(void);
 uint64_t akita_pcie_bar(unsigned n);
+bool akita_pcie_restart(void);                     /* the chip power-cycled, its link again (bcm_recover) */
 void akita_bcm_run(void);
 
 #define FW_NAME                 "fw_bcmdhd.bin_4383_a3"
@@ -577,6 +579,7 @@ nvram_vars(const uint8_t *text, uint64_t length, uint8_t **out, uint32_t *alloca
 
 /* the firmware's console: what it has written since the last look (its buffer is a ring) */
 static uint32_t console_read;
+static bool console_forget;                     /* a new firmware (bcm_recover): its console is somewhere else */
 
 static void
 console_say(uint32_t shared)
@@ -584,6 +587,11 @@ console_say(uint32_t shared)
 	static uint32_t console, buf, size;
 	uint32_t widx;
 
+	if (console_forget) {
+		console_forget = false;
+		console = 0;
+		console_read = 0;
+	}
 	if (console == 0) {
 		console = mem_rd(shared + SHARED_CONSOLE_ADDR);
 		if (console < ram_base || console >= ram_base + ram_size) {
@@ -646,6 +654,15 @@ console_say(uint32_t shared)
 #define SHARED_HOST_SCB_SIZE    72
 #define SHARED_FLAGS2           80
 #define SHARED_HOST_CAP         84
+#define SHARED_HOST_TRAP_ADDR   88              /* sh_addr_t: where the firmware writes its extended trap data */
+/* host_cap (bcmpcie.h HOSTCAP_*): what Android's dhd_set_host_cap() offers this firmware, less in-band device wake */
+#define HOSTCAP_H2D_ENABLE_HOSTRDY      0x00000400
+#define HOSTCAP_DS_NO_OOB_DW            0x00001000
+#define HOSTCAP_EXTENDED_TRAP_DATA      0x00020000
+#define HOSTCAP_UR_FW_NO_TRAP           0x00800000
+#define HOSTCAP_EDL_RING                0x10000000
+#define EXT_TRAP_DATA_MAXLEN            4096    /* BCMPCIE_EXT_TRAP_DATA_MAXLEN */
+static uint8_t *trap_data;                      /* the extended trap data, when the firmware has written some */
 #define D2H_MB_DS_ENTER_REQ     0x2u
 #define D2H_MB_DS_EXIT_NOTE     0x4u
 #define D2H_MB_FWHALT           0x10000000u
@@ -788,6 +805,11 @@ dma_piece(uint32_t size, uint64_t *pa)
 static bool
 dma_init(uint32_t size)
 {
+	if (dma.va != 0 && dma.size >= round_page(size)) {     /* (a recovery: the same piece again, cleared) */
+		bzero((void *)dma.va, dma.size);
+		dma.used = 0;
+		return true;
+	}
 	dma.va = dma_piece(size, &dma.pa);
 	dma.size = (uint32_t)round_page(size);
 	dma.used = 0;
@@ -841,7 +863,12 @@ mb_data_send(uint32_t value)
 	wr(cfg, CFG_SBMBX, 1);
 }
 
-static bool fw_halted;                          /* the firmware trapped: nothing more is asked of it (no recovery yet) */
+static bool fw_halted;                          /* the firmware trapped: nothing more is asked of it until bcm_recover */
+static volatile bool recovering;                /* bcm_recover at work: the station refuses work */
+static thread_call_t recover_call;
+static uint32_t recover_max = 3;                /* boot-arg wifi_recover=N: at most N recoveries in 5 minutes (0: none) */
+static void bcm_recover(thread_call_param_t p0, thread_call_param_t p1);
+static bool bcm_steps(void);
 static void fw_halt_said(void);
 
 /* the chip's mailbox word: deep sleep requests answered (as brcmfmac), a halt said -- with the firmware's console, where
@@ -873,6 +900,17 @@ mb_data_check(void)
 		    mb.events);
 		printf("wifi: the firmware's console, its last words (pcie_shared flags 0x%08x):\n", mem_rd(mb.shared + SHARED_FLAGS));
 		console_say(mb.shared);
+		if (recover_call != NULL && recover_max != 0) {
+			recovering = true;
+			thread_call_enter(recover_call);        /* (outside this lock: the chip started again from scratch) */
+		}
+		if (trap_data != NULL && *(volatile uint32_t *)trap_data != 0) {
+			printf("wifi: its extended trap data (the first 64 bytes):");
+			for (int i = 0; i < 16; i++) {
+				printf(" %08x", ((volatile uint32_t *)trap_data)[i]);
+			}
+			printf("\n");
+		}
 		fw_halt_said();
 		return;
 	}
@@ -1096,9 +1134,8 @@ rx_post(unsigned n)
 		return;
 	}
 	uint64_t pa = mb.rx_buf_pa + (uint64_t)n * RX_BUF_SIZE;
-
 	item[0] = MSG_RXBUF_POST;
-	put32(item, 4, RX_ID_BASE + n);
+	put32(item, 4, RX_ID_BASE + n);	/* (a fresh id each time -- RX_ID_BASE + g * 256 + n -- delivered one frame and no more, 11-11) */
 	put16(item, 10, RX_BUF_SIZE);
 	put32(item, 24, (uint32_t)pa);
 	put32(item, 28, (uint32_t)(pa >> 32));
@@ -1116,7 +1153,14 @@ rx_setup(void)
 	if (rx_bufs == 0 || rx_bufs > RX_BUFS) {
 		rx_bufs = RX_BUFS;
 	}
-	mb.rx_buf = (uint8_t *)dma_piece(RX_BUFS * RX_BUF_SIZE, &mb.rx_buf_pa);
+	static uint8_t *rx_area;                /* (one piece for the run: a recovery posts the same buffers again) */
+	static uint64_t rx_area_pa;
+
+	if (rx_area == NULL) {
+		rx_area = (uint8_t *)dma_piece(RX_BUFS * RX_BUF_SIZE, &rx_area_pa);
+	}
+	mb.rx_buf = rx_area;
+	mb.rx_buf_pa = rx_area_pa;
 	if (mb.rx_buf == NULL) {
 		return false;
 	}
@@ -1220,6 +1264,247 @@ rx_say(void)
 	    mb.rx_frames, mb.rx_bytes, mb.rx_eapol, mb.rx_bad, at ? types : " none", mb.rx_posted);
 }
 
+/*
+ * ---- the firmware's debug info rings (bcmdhd's dhd_prot_init_info_rings; 11-11 night, TODO 35f) ----
+ * The firmware keeps its event-log records (the console's "EL: <tag> <fmt>", its statistics) for the host, which
+ * takes them through a pair of rings Android creates at the start: an H2D "debug buffer submit" ring (type 5) of
+ * buffers posted for them, and a D2H "debug buffer completion" ring (type 4) where they come back filled. This driver
+ * made neither -- and the firmware leaked them: its heap and packet ids ran out ~130 s after its start (THE TRAP).
+ * Here both are made (bcmdhd's ids: the last H2D slot, max_sub - 1; the spare D2H slot, max_cpl - 1, which the
+ * submit ring names as its completion ring by bcmdhd's global number max_sub + it), buffers posted, and every
+ * completion posted again at once -- the records themselves are not read.
+ * BUT this firmware supports the EDL ring (flags2 PCIE_SHARED2_EDL_RING) and then logs only there, as Android builds
+ * bcmdhd (EWP_EDL): with the info rings made it sent nothing through them and leaked the same (info1). So by DEFAULT
+ * (wifi_inforing=3) the EDL ring: one D2H ring of type 7, 256 items of 2 KB in a piece of its own, which the firmware
+ * fills (host_cap HOSTCAP_EDL_RING) and this driver reads past -- THE LEAK STOPS: its free packet ids flat for minutes
+ * (edl1). wifi_inforing=1: the info rings (2: their first buffers said); 4: the EDL ring, its first items said;
+ * 0: neither.
+ */
+#define MSG_INFO_BUF_POST       0x19
+#define MSG_INFO_BUF_CMPLT      0x1a
+#define MSG_H2D_RING_CREATE     0x1b
+#define MSG_D2H_RING_CREATE     0x1c
+#define MSG_H2D_RING_CREATE_CMPLT 0x1d
+#define MSG_D2H_RING_CREATE_CMPLT 0x1e
+#define INFO_ITEMS              32              /* H2DRING_DYNAMIC_INFO_MAX_ITEM, D2HRING_DYNAMIC_INFO_MAX_ITEM */
+#define INFO_SUB_SIZE           40              /* H2DRING_INFO_BUFPOST_ITEMSIZE */
+#define INFO_CPL_SIZE           24              /* D2HRING_INFO_BUFCMPLT_ITEMSIZE */
+#define INFO_BUFS               16
+#define INFO_BUF_SIZE           2048
+#define INFO_ID_BASE            0x3000
+static struct { unsigned max_sub, max_cpl; } ring_counts;
+static struct {
+	uint8_t *sub, *cpl, *buf;
+	uint64_t sub_pa, cpl_pa, buf_pa;
+	unsigned h2d, d2h;              /* their places in the index arrays */
+	uint16_t w, r;
+	int d2h_status, h2d_status;     /* 1 asked, then the firmware's status (0 made) */
+	unsigned completions, bytes;
+	bool up;
+	uint32_t mode;
+	bool edl;                       /* wifi_inforing=3: the EDL ring instead (one D2H ring the firmware writes into) */
+} info;
+#define EDL_ITEMS               256             /* D2HRING_EDL_MAX_ITEM */
+#define EDL_ITEM_SIZE           2048            /* D2HRING_EDL_ITEMSIZE */
+static uint8_t *edl_ring;                       /* (its own piece, 512 KB, kept across recoveries) */
+static uint64_t edl_ring_pa;
+
+static void
+info_buf_post(uint32_t n)
+{
+	uint8_t *item = info.sub + (uint32_t)info.w * INFO_SUB_SIZE;
+	uint64_t pa = info.buf_pa + (uint64_t)n * INFO_BUF_SIZE;
+
+	bzero(item, INFO_SUB_SIZE);
+	item[0] = MSG_INFO_BUF_POST;
+	put32(item, 4, INFO_ID_BASE + n);
+	put16(item, 8, INFO_BUF_SIZE);
+	put32(item, 16, (uint32_t)pa);
+	put32(item, 20, (uint32_t)(pa >> 32));
+	info.w = (uint16_t)((info.w + 1) % INFO_ITEMS);
+	mb.idx[mb.h2d_w + info.h2d] = info.w;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	pcie_wr(PCIE_H2D_MAILBOX_0, 1);
+}
+
+/* what the firmware has put on the debug info completion ring: each buffer posted again (the rings' lock held) */
+static unsigned
+info_poll(void)
+{
+	unsigned n = 0;
+
+	if (!info.up) {
+		return 0;
+	}
+	uint16_t w = (uint16_t)mb.idx[mb.d2h_w + info.d2h];
+
+	if (info.edl) {                 /* (the EDL ring: its items are the logs themselves -- read past, counted) */
+		if (w >= EDL_ITEMS) {
+			return 0;
+		}
+		while (info.r != w) {
+			if (info.mode == 4 && info.completions < 10) {
+				const uint8_t *m = edl_ring + (uint32_t)info.r * EDL_ITEM_SIZE;
+
+				printf("wifi: edl: item %u: %02x %02x %02x %02x len %u\n", info.r, m[0], m[1], m[2], m[3], get16(m, 12));
+			}
+			info.completions++;
+			info.r = (uint16_t)((info.r + 1) % EDL_ITEMS);
+			mb.idx[mb.d2h_r + info.d2h] = info.r;
+			n++;
+		}
+		return n;
+	}
+	if (w >= INFO_ITEMS) {
+		return 0;
+	}
+	while (info.r != w) {
+		const uint8_t *m = info.cpl + (uint32_t)info.r * INFO_CPL_SIZE;
+		uint32_t id = get32(m, 4);
+		uint16_t len = get16(m, 12);
+
+		if (m[0] == MSG_INFO_BUF_CMPLT && id >= INFO_ID_BASE && id < INFO_ID_BASE + INFO_BUFS) {
+			info.completions++;
+			info.bytes += len;
+			if (info.mode == 2 && info.completions <= 20) {
+				printf("wifi: info: a buffer back with %u bytes of the firmware's logs (status %d)\n", len,
+				    (int16_t)get16(m, 8));
+			}
+			info_buf_post(id - INFO_ID_BASE);
+		}
+		info.r = (uint16_t)((info.r + 1) % INFO_ITEMS);
+		mb.idx[mb.d2h_r + info.d2h] = info.r;
+		n++;
+	}
+	return n;
+}
+
+static unsigned d2h_ctrl_poll(void);
+
+/* the two rings asked for and the buffers posted (step 6, the rings' lock held) */
+static void
+info_rings_up(void)
+{
+	uint64_t t0;
+
+	info.mode = 3;                  /* (the EDL ring, with host_cap's HOSTCAP_EDL_RING: rings_up) */
+	PE_parse_boot_argn("wifi_inforing", &info.mode, sizeof(info.mode));
+	if (info.mode == 0) {
+		return;
+	}
+	if (ring_counts.max_cpl < 4 || ring_counts.max_sub < 3) {
+		printf("wifi: 6: no spare ring slots for the debug info rings (%u submission, %u completion)\n", ring_counts.max_sub,
+		    ring_counts.max_cpl);
+		return;
+	}
+	info.h2d = ring_counts.max_sub - 1;
+	info.d2h = ring_counts.max_cpl - 1;
+	if (info.mode >= 3) {
+		/* the EDL ring (bcmdhd's dhd_prot_init_edl_rings, used when the firmware says PCIE_SHARED2_EDL_RING and the
+		 * host_cap has HOSTCAP_EDL_RING: wifi_hostcap=0x10000000): one D2H ring, type 7, 256 items of 2 KB */
+		if (edl_ring == NULL) {
+			edl_ring = (uint8_t *)dma_piece(EDL_ITEMS * EDL_ITEM_SIZE, &edl_ring_pa);
+		}
+		if (edl_ring == NULL) {
+			printf("wifi: 6: no 512 KB in one piece for the EDL ring\n");
+			return;
+		}
+		bzero(edl_ring, EDL_ITEMS * EDL_ITEM_SIZE);
+		uint8_t *it = h2d_reserve(RING_H2D_CTRL);
+		if (it == NULL) {
+			return;
+		}
+		it[0] = MSG_D2H_RING_CREATE;
+		put32(it, 4, 0xfff9);
+		put16(it, 8, (uint16_t)info.d2h);
+		put16(it, 10, 7);                       /* BCMPCIE_D2H_RING_TYPE_EDL */
+		put32(it, 16, (uint32_t)edl_ring_pa);
+		put32(it, 20, (uint32_t)(edl_ring_pa >> 32));
+		put16(it, 24, EDL_ITEMS);
+		put16(it, 26, EDL_ITEM_SIZE);
+		info.d2h_status = 1;
+		h2d_commit(RING_H2D_CTRL, 1);
+		for (t0 = mach_absolute_time(); info.d2h_status == 1 && micros_since(t0) < 1000000;) {
+			if (d2h_ctrl_poll() == 0) {
+				delay(200);
+			}
+		}
+		printf("wifi: 6: the EDL ring (D2H %u, %u x %u bytes): %s %d\n", info.d2h, EDL_ITEMS, EDL_ITEM_SIZE,
+		    info.d2h_status == 0 ? "MADE" : info.d2h_status == 1 ? "no answer" : "refused", info.d2h_status);
+		if (info.d2h_status == 0) {
+			info.edl = true;
+			info.up = true;
+		}
+		return;
+	}
+	info.sub = dma_take(INFO_ITEMS * INFO_SUB_SIZE, &info.sub_pa);
+	info.cpl = dma_take(INFO_ITEMS * INFO_CPL_SIZE, &info.cpl_pa);
+	info.buf = dma_take(INFO_BUFS * INFO_BUF_SIZE, &info.buf_pa);
+	if (info.sub == NULL || info.cpl == NULL || info.buf == NULL) {
+		printf("wifi: 6: no room for the debug info rings\n");
+		return;
+	}
+	bzero(info.sub, INFO_ITEMS * INFO_SUB_SIZE);
+	bzero(info.cpl, INFO_ITEMS * INFO_CPL_SIZE);
+
+	/* the completion ring first (d2h_ring_create_req_t), then the submit ring naming it (h2d_ring_create_req_t) */
+	uint8_t *item = h2d_reserve(RING_H2D_CTRL);
+	if (item == NULL) {
+		return;
+	}
+	item[0] = MSG_D2H_RING_CREATE;
+	put32(item, 4, 0xfff9);                         /* (DHD_D2H_DBGRING_REQ_PKTID's like) */
+	put16(item, 8, (uint16_t)info.d2h);
+	put16(item, 10, 4);                             /* BCMPCIE_D2H_RING_TYPE_DBGBUF_CPL */
+	put32(item, 16, (uint32_t)info.cpl_pa);
+	put32(item, 20, (uint32_t)(info.cpl_pa >> 32));
+	put16(item, 24, INFO_ITEMS);
+	put16(item, 26, INFO_CPL_SIZE);
+	info.d2h_status = 1;
+	h2d_commit(RING_H2D_CTRL, 1);
+	for (t0 = mach_absolute_time(); info.d2h_status == 1 && micros_since(t0) < 1000000;) {
+		if (d2h_ctrl_poll() == 0) {
+			delay(200);
+		}
+	}
+	if (info.d2h_status != 0) {
+		printf("wifi: 6: the debug info completion ring (D2H %u): %s %d\n", info.d2h, info.d2h_status == 1 ? "no answer" :
+		    "refused", info.d2h_status);
+		return;
+	}
+	if ((item = h2d_reserve(RING_H2D_CTRL)) == NULL) {
+		return;
+	}
+	item[0] = MSG_H2D_RING_CREATE;
+	put32(item, 4, 0xfffa);
+	put16(item, 8, (uint16_t)info.h2d);
+	item[10] = 5;                                   /* BCMPCIE_H2D_RING_TYPE_DBGBUF_SUBMIT */
+	item[11] = 1;                                   /* one completion ring */
+	put32(item, 16, (uint32_t)info.sub_pa);
+	put32(item, 20, (uint32_t)(info.sub_pa >> 32));
+	put16(item, 24, INFO_ITEMS);
+	put16(item, 26, INFO_SUB_SIZE);
+	put16(item, 28, (uint16_t)(ring_counts.max_sub + info.d2h));
+	info.h2d_status = 1;
+	h2d_commit(RING_H2D_CTRL, 1);
+	for (t0 = mach_absolute_time(); info.h2d_status == 1 && micros_since(t0) < 1000000;) {
+		if (d2h_ctrl_poll() == 0) {
+			delay(200);
+		}
+	}
+	if (info.h2d_status != 0) {
+		printf("wifi: 6: the debug info submit ring (H2D %u): %s %d\n", info.h2d, info.h2d_status == 1 ? "no answer" :
+		    "refused", info.h2d_status);
+		return;
+	}
+	info.up = true;
+	for (uint32_t i = 0; i < INFO_BUFS; i++) {
+		info_buf_post(i);
+	}
+	printf("wifi: 6: THE DEBUG INFO RINGS are made (H2D %u, D2H %u: the firmware's logs have somewhere to go), %u buffers "
+	    "of %u bytes posted\n", info.h2d, info.d2h, INFO_BUFS, INFO_BUF_SIZE);
+}
+
 static void flow_created(int16_t status, uint16_t ring);
 static void flow_deleted(int16_t status, uint16_t ring);
 static unsigned d2h_tx_poll(void);
@@ -1261,6 +1546,12 @@ d2h_ctrl_poll(void)
 		case MSG_FLOW_RING_CREATE_CMPLT:
 			flow_created((int16_t)get16(m, 8), get16(m, 10));
 			break;
+		case MSG_D2H_RING_CREATE_CMPLT:
+			info.d2h_status = (int16_t)get16(m, 8);
+			break;
+		case MSG_H2D_RING_CREATE_CMPLT:
+			info.h2d_status = (int16_t)get16(m, 8);
+			break;
 		case MSG_FLOW_RING_DELETE_CMPLT:
 			flow_deleted((int16_t)get16(m, 8), get16(m, 10));
 			break;
@@ -1278,6 +1569,7 @@ d2h_ctrl_poll(void)
 	}
 	n += d2h_rx_poll();
 	n += d2h_tx_poll();
+	n += info_poll();
 	mb_data_check();
 	return n;
 }
@@ -1430,6 +1722,8 @@ rings_up(uint32_t shared)
 	mb.tcm_h2d_r = mem_rd(ringinfo + 8);
 	max_sub = mem_rd(ringinfo + 52) >> 16;          /* (max_tx_flowrings at +52, max_submission_queues +54) */
 	max_cpl = mem_rd(ringinfo + 56) & 0xffff;
+	ring_counts.max_sub = max_sub;
+	ring_counts.max_cpl = max_cpl;
 	printf("wifi: 5: ring info 0x%08x: ring memory 0x%08x, %u flow rings, %u submission, %u completion rings, %u "
 	    "virtual interfaces; TCM index arrays 0x%08x 0x%08x 0x%08x 0x%08x\n", ringinfo, ringmem, mem_rd(ringinfo + 52) & 0xffff,
 	    max_sub, max_cpl, mem_rd(ringinfo + 56) >> 16, mem_rd(ringinfo + 4), mem_rd(ringinfo + 8), mem_rd(ringinfo + 12),
@@ -1503,8 +1797,43 @@ rings_up(uint32_t shared)
 			mem_wr(shared + SHARED_HOST_SCB_ADDR + 4, 0);
 			mem_wr(shared + SHARED_HOST_SCB_SIZE, 0);
 		}
-		printf("wifi: 5: pcie_shared flags2 0x%08x, host_cap 0x%08x, the firmware's host SCB size %u (%s)\n",
-		    mem_rd(shared + SHARED_FLAGS2), mem_rd(shared + SHARED_HOST_CAP), mem_rd(shared + SHARED_HOST_SCB_SIZE),
+		/*
+		 * The host's capabilities (11-11 night, TODO 35f): this driver wrote none -- every capability off, the IPC version
+		 * 0. Android's dhd_set_host_cap() (dhd_msgbuf.c) writes, for this firmware (flags 0x70050107: protocol 7, host
+		 * ready, in-band and no-OOB deep sleep offered): the version (7), HOSTRDY (it rings doorbell 1 after the rings,
+		 * as this driver does), extended trap data (into a host buffer whose address it gives), UR_FW_NO_TRAP, and for
+		 * deep sleep either in-band device wake (Pixel's build) or, without that, DS_NO_OOB_DW: "Disable DS altogether"
+		 * -- (this driver has no device wake; it acks the firmware's deep-sleep requests).
+		 * TRIED (11-11 night, hc-*, rejoin-ds0): that whole set halted the chip at once (the PCIe link gone after host
+		 * ready); the version alone (7) -- the firmware never read the control ring: protocol 7 wants more of the host
+		 * than these bits; DS_NO_OOB_DW alone (0x1000) -- joins as before, and the trap after a failed handshake is the
+		 * same.
+		 * WHAT IS WRITTEN (11-11 late, THE FIX OF THE TRAP): HOSTCAP_EDL_RING alone -- the firmware's event logs and
+		 * statistics then go into the EDL ring step 6 makes (info_rings_up), as on Android (its Kbuild: EWP_EDL,
+		 * EWP_ECNTRS_LOGGING); without it the firmware kept them for a host ring that never came and ran out of memory
+		 * and packet ids ~130 s after its start, every time. It honours the bit with the version 0.
+		 * wifi_hostcap=N: N written instead (with EXTENDED_TRAP_DATA, a buffer for it given too); 1: nothing.
+		 */
+		uint32_t hostcap = HOSTCAP_EDL_RING;
+		(void)(HOSTCAP_DS_NO_OOB_DW | HOSTCAP_UR_FW_NO_TRAP | HOSTCAP_H2D_ENABLE_HOSTRDY);
+
+		PE_parse_boot_argn("wifi_hostcap", &hostcap, sizeof(hostcap));
+		if (hostcap != 1) {
+			if (hostcap & HOSTCAP_EXTENDED_TRAP_DATA) {
+				trap_data = dma_take(EXT_TRAP_DATA_MAXLEN, &pa);
+				if (trap_data != NULL) {
+					bzero(trap_data, EXT_TRAP_DATA_MAXLEN);
+					mem_wr(shared + SHARED_HOST_TRAP_ADDR, (uint32_t)pa);
+					mem_wr(shared + SHARED_HOST_TRAP_ADDR + 4, (uint32_t)(pa >> 32));
+				} else {
+					hostcap &= ~HOSTCAP_EXTENDED_TRAP_DATA;
+				}
+			}
+			mem_wr(shared + SHARED_HOST_CAP, hostcap);
+		}
+		printf("wifi: 5: pcie_shared flags2 0x%08x, host_cap 0x%08x (%s), the firmware's host SCB size %u (%s)\n",
+		    mem_rd(shared + SHARED_FLAGS2), mem_rd(shared + SHARED_HOST_CAP), hostcap == 1 ? "none written" :
+		    "wifi_hostcap's", mem_rd(shared + SHARED_HOST_SCB_SIZE),
 		    ringupd_old ? "brcmfmac's ring-update buffer written over it" : "zeroed");
 	}
 	mb.ioctl_req = dma_take(IOCTL_MAX + 2, &mb.ioctl_req_pa);
@@ -1980,6 +2309,65 @@ en0_poll(void)
 			}
 		}
 	}
+	{
+		/*
+		 * Diagnosis (11-11, TODO 35f: the firmware runs out of packet ids ~130 s after it starts, idle or not):
+		 * wifi_poolwatch=N -- every N seconds the firmware's own packet-id variables read straight from its memory
+		 * (fw_bcmdhd.map_4383_a3, THIS build only: total_pool_pktid_count, hnd_pktid_max, the failure count, the map's
+		 * first words); wifi_console=N -- its console's new lines every N seconds.
+		 */
+		static uint32_t poolwatch = ~0u, console_every;
+		static uint64_t pool_at, console_at;
+
+		if (poolwatch == ~0u) {
+			poolwatch = 0;
+			PE_parse_boot_argn("wifi_poolwatch", &poolwatch, sizeof(poolwatch));
+			PE_parse_boot_argn("wifi_console", &console_every, sizeof(console_every));
+		}
+		if (poolwatch != 0 && !fw_halted && micros_since(pool_at) > poolwatch * 1000000ull) {
+			uint32_t map = mem_rd(0x006e01d8), w[6] = { 0 };
+
+			pool_at = mach_absolute_time();
+			if (map >= ram_base && map + 24 <= ram_base + ram_size) {
+				for (int i = 0; i < 6; i++) {
+					w[i] = mem_rd(map + 4 * i);
+				}
+			}
+			printf("wifi: pool: total_pool_pktid_count %u, hnd_pktid_max %u, failures %u, map at 0x%08x: %08x %08x %08x "
+			    "%08x %08x %08x; %u frames in, %u events\n", mem_rd(0x006e0108), mem_rd(0x006e01dc), mem_rd(0x006e01d4), map,
+			    w[0], w[1], w[2], w[3], w[4], w[5], mb.rx_frames, mb.events);
+			/* the firmware's packet pools (pktpool_t, hnd_pktpool.h: inited/type/id/istx, a mutex, freelist, avail,
+			 * n_pkts, maxlen, max_pkt_bytes ...): which one grows as the free ids fall? and its heap's free memory */
+			static const struct { uint32_t at; const char *name; } pools[] = {
+				{ 0x006e01f0, "resv_lfrag" }, { 0x006e01f4, "shared" }, { 0x006e01f8, "shared_lfrag" },
+				{ 0x006e01fc, "shared_rxlfrag" }, { 0x006e02d8, "pktfetch" },
+			};
+			for (unsigned k = 0; k < sizeof(pools) / sizeof(pools[0]); k++) {
+				uint32_t pp = mem_rd(pools[k].at), v[8] = { 0 };
+
+				if (pp >= ram_base && pp + 32 <= ram_base + ram_size) {
+					for (int i = 0; i < 8; i++) {
+						v[i] = mem_rd(pp + 4 * i);
+					}
+				}
+				printf("wifi: pool %s at 0x%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n", pools[k].name, pp, v[0], v[1],
+				    v[2], v[3], v[4], v[5], v[6], v[7]);
+			}
+			printf("wifi: heap: in use %u, free %u, in use high-water %u\n", mem_rd(0x006e029c), mem_rd(0x006e02a8),
+			    mem_rd(0x006e0294));
+			/* every common ring's indices as the chip leaves them in host memory (and ours): where do frames go? */
+			printf("wifi: rings: D2H write ctrl %u txcpl %u rxcpl %u (+%u), ours %u %u %u; H2D read ctrl %u rxpost %u flow %u, "
+			    "ours %u %u %u; rx posted %u, rx bad %u; debug info %u back (%u bytes)\n", mb.idx[mb.d2h_w + 0], mb.idx[mb.d2h_w + 1], mb.idx[mb.d2h_w + 2],
+			    mb.idx[mb.d2h_w + 3], mb.r[RING_D2H_CTRL], mb.r[RING_D2H_TXCPL], mb.r[RING_D2H_RXCPL],
+			    mb.idx[mb.h2d_r + RING_H2D_CTRL], mb.idx[mb.h2d_r + RING_H2D_RXPOST], mb.idx[mb.h2d_r + 2],
+			    mb.w[RING_H2D_CTRL], mb.w[RING_H2D_RXPOST], mb.idx[mb.h2d_w + 2], mb.rx_posted, mb.rx_bad, info.completions,
+			    info.bytes);
+		}
+		if (console_every != 0 && !fw_halted && micros_since(console_at) > console_every * 1000000ull) {
+			console_at = mach_absolute_time();
+			console_say(mb.shared);
+		}
+	}
 	if (micros_since(said_at) > 30000000) {
 		said_at = mach_absolute_time();
 		printf("wifi: en0: %u frames sent (%u done, %u dropped, %u out), %u received (%u bytes); link %s, keys %s\n",
@@ -2050,8 +2438,12 @@ en0_attach(void)
 		printf("wifi: 8: no address from the chip: stopped\n");
 		return;
 	}
-	tx.ring = (uint8_t *)dma_piece(FLOW_ITEMS * FLOW_ITEM_SIZE, &tx.ring_pa);
-	tx.buf = (uint8_t *)dma_piece(TX_BUFS * TX_BUF_SIZE, &tx.buf_pa);
+	if (tx.ring == NULL) {
+		tx.ring = (uint8_t *)dma_piece(FLOW_ITEMS * FLOW_ITEM_SIZE, &tx.ring_pa);
+	}
+	if (tx.buf == NULL) {
+		tx.buf = (uint8_t *)dma_piece(TX_BUFS * TX_BUF_SIZE, &tx.buf_pa);
+	}
 	if (tx.ring == NULL || tx.buf == NULL) {
 		printf("wifi: 8: no memory in one piece for the flow ring and the send buffers: stopped\n");
 		return;
@@ -2276,6 +2668,10 @@ sta_power(bool on)
 {
 	int err;
 
+	if (fw_halted || recovering) {
+		return on ? EIO : 0;
+	}
+
 	if (on == radio_up) {
 		return 0;
 	}
@@ -2299,7 +2695,7 @@ sta_scan(const struct hakios_sta_scan *what)
 {
 	int err, was = sta_phase;
 
-	if (fw_halted) {
+	if (fw_halted || recovering) {
 		return EIO;
 	}
 	if (!radio_up) {
@@ -2357,7 +2753,7 @@ sta_join(const struct hakios_sta_join *j)
 	bool psk = j->security == HAKIOS_STA_WPA2_PSK, any_bssid = true;
 	int err, result;
 
-	if (fw_halted) {
+	if (fw_halted || recovering) {
 		return EIO;
 	}
 	if (!radio_up) {
@@ -2514,7 +2910,7 @@ sta_join(const struct hakios_sta_join *j)
 static int
 sta_leave(void)
 {
-	if (fw_halted) {
+	if (fw_halted || recovering) {
 		return 0;
 	}
 	sta_radio_cycle();                      /* (out, the radio down and up: the next join comes after a fresh start) */
@@ -2576,6 +2972,86 @@ fw_halt_said(void)
 	radio_up = false;
 }
 
+/*
+ * RECOVERY (11-11, TODO 35f): the firmware has halted -- it traps a few seconds after ANY failed WPA handshake (a wrong
+ * passphrase: its own supplicant's failure path runs out of packet ids), and nothing else brings it back. As Android's
+ * driver does after a trap: the chip's power off and on and its link again (akita_pcie_restart), steps 1 to 7 from
+ * scratch (the firmware, the rings -- the same memory again --, the blobs, the events, the radio), en0 carrying again
+ * (the same interface: Darwin's network stack never sees it go), the station's radio on -- which joins the standing
+ * network again (hakios.sta.c: the last network asked for, or fw/network's). A wrong passphrase costs a few seconds,
+ * not the Wi-Fi until the next boot. At most recover_max times in 5 minutes (wifi_recover=N; 0: none).
+ */
+static void
+bcm_recover(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static uint64_t window_start;
+	static unsigned in_window, total;
+	uint64_t t0 = mach_absolute_time();
+	bool ok;
+
+	if (micros_since(window_start) > 300000000ull || window_start == 0) {
+		window_start = t0;
+		in_window = 0;
+	}
+	if (in_window >= recover_max) {
+		printf("wifi: recovery: %u already in 5 minutes: the firmware stays halted (Wi-Fi off until the next boot)\n",
+		    in_window);
+		return;
+	}
+	in_window++;
+	total++;
+	printf("wifi: recovery %u: the firmware halted -- the chip started again from scratch\n", total);
+
+	/* en0 quiet: nothing polled or sent; the link down (Darwin was told: fw_halt_said) */
+	lck_mtx_lock(wl_lock);
+	en0_live = false;
+	link_up = keyed = false;
+	lck_mtx_unlock(wl_lock);
+	/* the station's call under way (the failed join that brought this on) let finish: it fails at once now */
+	for (unsigned i = 0; i < 200 && hakios_sta_busy(); i++) {
+		sleep_ms(100);
+	}
+
+	ok = akita_pcie_restart();
+	if (ok) {
+		lck_mtx_lock(wl_lock);
+		bzero(&mb, sizeof(mb));
+		bzero(&info, sizeof(info));
+		trap_data = NULL;
+		console_forget = true;
+		tx.state = 0;
+		tx.w = 0;
+		tx.outstanding = 0;
+		bzero(tx.busy, sizeof(tx.busy));
+		fw_halted = false;
+		lck_mtx_unlock(wl_lock);
+		bar0_win = rd(cfg, CFG_BAR0_WIN);
+		bar2_win = ~0u;                 /* (unknown after the reset: set at the next access) */
+		ok = bcm_steps();
+	}
+	if (ok) {
+		en0_attach();                   /* (en0 there already: the flow ring and send buffers again, en0_live) */
+		ok = en0_live;
+	}
+	if (!ok) {
+		fw_halted = true;
+		recovering = false;
+		printf("wifi: recovery %u FAILED after %llu ms: Wi-Fi stays off until the next boot\n", total, micros_since(t0) / 1000);
+		return;
+	}
+	bzero(&sta_joined_with, sizeof(sta_joined_with));       /* (the next join is a fresh one, not "the same again") */
+	radio_up = true;                        /* (WLC_UP at step 7) */
+	sta_phase = HAKIOS_STA_IDLE;
+	recovering = false;
+	printf("wifi: recovery %u: the firmware runs again after %llu ms; the station's radio %s\n", total, micros_since(t0) / 1000,
+	    hakios_sta_powered() ? "on: the standing network joined again" : "left off (Darwin has it off)");
+	if (hakios_sta_powered()) {
+		(void)hakios_sta_ask_power(true);
+	} else {
+		(void)sta_power(false);
+	}
+}
+
 /* the link's events, under the rings' lock (event_handle): a network joined and lost by itself is said */
 static void
 sta_link_check(void)
@@ -2628,8 +3104,10 @@ station_start(void)
 	rx_say();
 }
 
-void
-akita_bcm_run(void)
+/* steps 1 to 7: the chip's cores, its ARM halted, the firmware and calibration written, the ARM let go, the rings, the
+ * first ioctls and blobs, the events and the radio -- at the start, and again after a recovery (bcm_recover) */
+static bool
+bcm_steps(void)
 {
 	struct core *arm, *pcie;
 	const uint8_t *fw, *nv;
@@ -2637,38 +3115,27 @@ akita_bcm_run(void)
 	uint8_t *vars = NULL;
 	uint32_t vars_len = 0, vars_alloc = 0, token = 0, top, shared = 0;
 
-	if (!PE_parse_boot_argn("wifi", &steps, sizeof(steps)) || steps == 0) {
-		return;
-	}
-	if (wl_lock == NULL) {                  /* (made already when en0 came at the start) */
-		wl_group = lck_grp_alloc_init("akita_wifi", LCK_GRP_ATTR_NULL);
-		wl_lock = lck_mtx_alloc_init(wl_group, LCK_ATTR_NULL);
-	}
-	cfg = akita_pcie_config();
-	bar0 = (volatile uint8_t *)ml_io_map(akita_pcie_bar(0), BAR0_SIZE);
-	bar0_win = rd(cfg, CFG_BAR0_WIN);
-
 	if (!announce(1, "reads: the chip's cores (enumeration ROM)")) {
-		return;
+		return false;
 	}
 	printf("wifi: 1: chipcommon id 0x%08x; PCIe core: power control 0x%08x, completion timeout 0x%08x\n",
 	    bp_rd(CC_BASE + CC_CHIPID), pcie_rd(PCIE_POWER_CONTROL), pcie_rd(PCIE_CPL_TO_CTRL));
 	if (!erom_scan()) {
 		printf("wifi: 1: no cores: stopped\n");
-		return;
+		return false;
 	}
 	arm = core_find(CORE_ARM_CR4);
 	pcie = core_find(CORE_PCIE2);
 	if (arm == NULL || pcie == NULL) {
 		printf("wifi: 1: no %s core: stopped (an ARM CA7 or sysmem chip is not what Google's driver says the 4383 "
 		    "is)\n", arm == NULL ? "ARM CR4" : "PCIe2");
-		return;
+		return false;
 	}
 	printf("wifi: 1: PCIe core revision %u (Android: buscorerev 77)\n", pcie->rev);
 
 	/* (the ARM's registers only after its domain is powered and the completion timeout is on: step 2) */
 	if (!announce(2, "writes: completion timeout on, the ARM's backplane powered, the ARM halted, its memory sized")) {
-		return;
+		return false;
 	}
 	wr(cfg, CFG_INT_MASK, CFG_INT_MASK_CTO | CFG_INT_MASK_SERR);
 	pcie_wr(PCIE_CPL_TO_CTRL, CTO_CTRL_ANDROID);
@@ -2691,7 +3158,9 @@ akita_bcm_run(void)
 	pcie_wr(PCIE_CONFIG_IND_ADDR, 0x4e0);   /* (Google's attach writes this word of the core's config back) */
 	pcie_wr(PCIE_CONFIG_IND_DATA, pcie_rd(PCIE_CONFIG_IND_DATA));
 
-	bar2 = (volatile uint8_t *)ml_io_map_unmappable(akita_pcie_bar(2), BAR2_SIZE, VM_WIMG_IO);
+	if (bar2 == NULL) {                     /* (mapped once: a recovery finds the same place) */
+		bar2 = (volatile uint8_t *)ml_io_map_unmappable(akita_pcie_bar(2), BAR2_SIZE, VM_WIMG_IO);
+	}
 	wr(cfg, CFG_BAR1_WIN, 0);
 	bar2_win = 0;
 	core_say(arm, "as found");
@@ -2701,7 +3170,7 @@ akita_bcm_run(void)
 	ram_size = cr4_ram_size(arm);
 	if (ram_size == 0 || ram_size > 0x800000) {
 		printf("wifi: 2: a memory of %u bytes cannot be: stopped\n", ram_size);
-		return;
+		return false;
 	}
 	printf("wifi: 2: memory 0x%x - 0x%x (Android: 2228224 bytes at 0x6e0000)\n", ram_base, ram_base + ram_size);
 	top = ram_base + ram_size - 4;
@@ -2709,19 +3178,19 @@ akita_bcm_run(void)
 	printf("wifi: 2: the top word 0x%08x: 0x%08x; address 0: 0x%08x\n", top, mem_rd(top), mem_rd(0));
 
 	if (!announce(3, "writes: the firmware, the calibration with its token, random bytes, the reset vector")) {
-		return;
+		return false;
 	}
 	fw = hakios_image_file("fw", FW_NAME, &fw_size, NULL);
 	nv = hakios_image_file("fw", NVRAM_NAME, &nv_size, NULL);
 	if (fw == NULL || nv == NULL) {
 		printf("wifi: 3: fw/%s or fw/%s not in the small image (fw-wifi/ of the build): stopped\n", FW_NAME,
 		    NVRAM_NAME);
-		return;
+		return false;
 	}
 	if (fw_size < 64 || fw_size + nv_size + 0x10000 > ram_size) {
 		printf("wifi: 3: fw/%s (%llu bytes) and fw/%s (%llu) do not fit a memory of %u bytes: stopped\n", FW_NAME,
 		    fw_size, NVRAM_NAME, nv_size, ram_size);
-		return;
+		return false;
 	}
 	{
 		uint64_t t0 = mach_absolute_time();
@@ -2734,13 +3203,13 @@ akita_bcm_run(void)
 		printf("wifi: 3: read back in %llu us: %u words differ\n", micros_since(t0), bad);
 		if (bad) {
 			printf("wifi: 3: stopped\n");
-			return;
+			return false;
 		}
 	}
 	vars_len = nvram_vars(nv, nv_size, &vars, &vars_alloc);
 	if (vars_len == 0 || vars_len > 0x10000) {
 		printf("wifi: 3: the calibration came to %u bytes: stopped\n", vars_len);
-		return;
+		return false;
 	}
 	{
 		uint32_t varaddr = top - vars_len, words = vars_len / 4, rnd_addr, bad;
@@ -2768,7 +3237,7 @@ akita_bcm_run(void)
 		memcpy(&vector, fw, 4);
 		if (before == 0xffffffffu) {
 			printf("wifi: 3: address 0 reads 0xffffffff: the reset vector is locked (secure boot?): stopped\n");
-			return;
+			return false;
 		}
 		mem_wr(0, vector);
 		printf("wifi: 3: reset vector 0x%08x at address 0 (was 0x%08x, reads 0x%08x)\n", vector, before, mem_rd(0));
@@ -2776,7 +3245,7 @@ akita_bcm_run(void)
 	kfree_data(vars, vars_alloc);
 
 	if (!announce(4, "runs: the ARM let go; the firmware's shared area awaited")) {
-		return;
+		return false;
 	}
 	{
 		uint64_t t0 = mach_absolute_time(), us = 0;
@@ -2793,12 +3262,12 @@ akita_bcm_run(void)
 		core_say(arm, "running");
 		if (v == token) {
 			printf("wifi: 4: the top word still the token after 5 s: the firmware did not come up\n");
-			return;
+			return false;
 		}
 		printf("wifi: 4: the top word 0x%08x after %llu ms\n", v, us / 1000);
 		if (v < ram_base || v >= ram_base + ram_size) {
 			printf("wifi: 4: not an address in the chip's memory: stopped\n");
-			return;
+			return false;
 		}
 		shared = v;
 	}
@@ -2817,16 +3286,16 @@ akita_bcm_run(void)
 	printf("wifi: 4: the BCM4383's firmware runs\n");
 
 	if (!announce(5, "writes: the message rings in host memory, the chip told the host is ready, buffers posted")) {
-		return;
+		return false;
 	}
 	if (!rings_up(shared)) {
 		console_say(shared);
-		return;
+		return false;
 	}
 	console_say(shared);
 
 	if (!announce(6, "talks: the first ioctls (\"ver\", \"cur_etheraddr\"), the regulatory and transmit-cap blobs")) {
-		return;
+		return false;
 	}
 	{
 		char ver[256];
@@ -2850,6 +3319,54 @@ akita_bcm_run(void)
 			(void)blob_load("bcmdhd_clm.blob_4383_a3", "clmload", "clmload_status");
 			(void)blob_load("bcmdhd_txcap.blob_4383_a3", "txcapload", "txcapload_status");
 		}
+		wl_take();
+		info_rings_up();
+		wl_give();
+		/*
+		 * The firmware's event logs (11-11 night, TODO 35f -- THE TRAP): its packet-id pool (hnd_pktid_map's free count,
+		 * read from its memory with wifi_poolwatch) fell from ~254 to 0 in ~125 s from its start, idle or not, rx buffers
+		 * 256 or 64, and it trapped there (hnd_pkt_get -> _hnd_die). Its console meanwhile: "EL: <tag> <fmt>" every
+		 * second -- event-log records it makes for the host, which takes them through a debug info ring (or the EDL
+		 * ring) that this driver never creates. "logtrace" 0 (what Android sets to keep it from waking a sleeping host)
+		 * stops it sending them up. wifi_logtrace=1: left as the firmware has it.
+		 */
+		{
+			/*
+			 * ... "logtrace" is not in this firmware (-23). What stopped the leak instead: every event-log tag off
+			 * ("event_log_tag_control", wl_el_tag_params_t {tag, set, flags}: flags 0, neither LOG (0x80: kept for the
+			 * host) nor PRINT (0x40: the console), tags 0 to EVENT_LOG_TAG_MAX 482). Its heap grew ~900 bytes a record
+			 * (wifi_poolwatch: 1159 KB -> 1389 KB in 120 s, the pools themselves unchanged) and each took a packet id.
+			 * wifi_evlog=1: left on.
+			 */
+			uint32_t evlog = 0, failed = 0;
+			uint64_t t0 = mach_absolute_time();
+
+			evlog = 0;
+			PE_parse_boot_argn("wifi_evlog_off", &evlog, sizeof(evlog));
+			if (evlog) {    /* (OFF by default: with every tag off, rx stopped -- 39 frames, then 1 (evlog0, soak1)) */
+				for (uint16_t tag = 0; tag <= 482; tag++) {
+					uint8_t el[4] = { (uint8_t)tag, (uint8_t)(tag >> 8), 0, 0 };
+
+					if (iovar_set("event_log_tag_control", el, sizeof(el)) != 0) {
+						failed++;
+					}
+				}
+				printf("wifi: 6: the firmware's event logs off (483 tags, %u refused) in %llu ms\n", failed,
+				    micros_since(t0) / 1000);
+				/* ("ecounters_suspend", to stop its statistics reports too: -47, not taken) */
+			}
+		}
+		{
+			uint32_t keep = 0, off = 0, now = ~0u;
+
+			PE_parse_boot_argn("wifi_logtrace", &keep, sizeof(keep));
+			if (!keep) {
+				int e = iovar_set("logtrace", &off, sizeof(off));
+
+				(void)iovar_get("logtrace", &now, sizeof(now));
+				printf("wifi: 6: \"logtrace\" 0 (its event logs not sent up): %d, now %u\n", e, now);
+			}
+		}
 		sleep_ms(200);
 		(void)d2h_ctrl_poll();
 		console_say(shared);
@@ -2859,11 +3376,33 @@ akita_bcm_run(void)
 	}
 
 	if (!announce(7, "talks: the events wanted, the radio up, a scan of every channel")) {
-		return;
+		return false;
 	}
 	scan_all();
 	console_say(shared);
 
+	return true;
+}
+
+void
+akita_bcm_run(void)
+{
+	if (!PE_parse_boot_argn("wifi", &steps, sizeof(steps)) || steps == 0) {
+		return;
+	}
+	if (wl_lock == NULL) {                  /* (made already when en0 came at the start) */
+		wl_group = lck_grp_alloc_init("akita_wifi", LCK_GRP_ATTR_NULL);
+		wl_lock = lck_mtx_alloc_init(wl_group, LCK_ATTR_NULL);
+	}
+	cfg = akita_pcie_config();
+	bar0 = (volatile uint8_t *)ml_io_map(akita_pcie_bar(0), BAR0_SIZE);
+	bar0_win = rd(cfg, CFG_BAR0_WIN);
+
+	PE_parse_boot_argn("wifi_recover", &recover_max, sizeof(recover_max));
+	recover_call = thread_call_allocate(bcm_recover, NULL);
+	if (!bcm_steps()) {
+		return;
+	}
 	if (!announce(8, "carries: en0 on the chip, the station Darwin's Wi-Fi side talks to, the network of fw/network joined")) {
 		return;
 	}
@@ -2871,5 +3410,29 @@ akita_bcm_run(void)
 	if (en0_attached) {
 		station_start();
 	}
-	console_say(shared);
+	console_say(mb.shared);
+	{
+		/* diagnosis (11-11, TODO 35f): wifi_ioctltest=N -- the firmware's free packet ids (hnd_pktid_map +4, THIS build)
+		 * before and after N "ver" iovars, then N WLC_GET_RSSI: does an ioctl cost one for good? */
+		uint32_t n = 0;
+
+		PE_parse_boot_argn("wifi_ioctltest", &n, sizeof(n));
+		if (n != 0) {
+			uint32_t map = mem_rd(0x006e01d8), f0, f1, f2;
+			char ver[64];
+			int32_t rssi;
+
+			sleep_ms(5000);
+			f0 = mem_rd(map + 4);
+			for (uint32_t i = 0; i < n; i++) {
+				(void)iovar_get("ver", ver, sizeof(ver));
+			}
+			f1 = mem_rd(map + 4);
+			for (uint32_t i = 0; i < n; i++) {
+				(void)bcm_ioctl(127, NULL, 0, &rssi, sizeof(rssi));     /* WLC_GET_RSSI */
+			}
+			f2 = mem_rd(map + 4);
+			printf("wifi: ioctl test: free packet ids %u, after %u \"ver\" %u, after %u WLC_GET_RSSI %u\n", f0, n, f1, n, f2);
+		}
+	}
 }

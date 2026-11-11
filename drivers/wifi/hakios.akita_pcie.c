@@ -651,7 +651,9 @@ chip(void)
 	/* BAR0's first 4 KB on chipcommon: its identity register */
 	wr(cfg, BCM_BAR0_WIN, BCM_ENUM_BASE);
 	printf("pcie: %u: BAR0 window 0x%08x\n", step, rd(cfg, BCM_BAR0_WIN));
-	bar0 = (volatile uint8_t *)ml_io_map(EP_BAR0, 0x4000);
+	if (bar0 == NULL) {                     /* (mapped once: a restart finds the same place) */
+		bar0 = (volatile uint8_t *)ml_io_map(EP_BAR0, 0x4000);
+	}
 	id = rd(bar0, 0);
 	printf("pcie: %u: chipcommon: chip 0x%x, revision %u, package %u, %u cores, interconnect type %u (id 0x%08x)%s\n",
 	    step, id & 0xffff, (id >> 16) & 0xf, (id >> 20) & 0xf, (id >> 24) & 0xf, id >> 28, id,
@@ -660,6 +662,40 @@ chip(void)
 }
 
 /* ---- for the chip's driver (hakios.akita_bcm.c) ---- */
+
+/*
+ * The chip power-cycled and its link brought up again, from the chip's driver when its firmware has halted (11-11,
+ * TODO 35f): the link stopped, PERST# asserted and WL_REG_ON low (the chip's power off) for 100 ms, power on, the PHY
+ * powered down and up and set again, the link trained, the chip's BARs placed again (its configuration space is
+ * reset with it). Every mapping is kept. True when the BCM4383 answers again.
+ */
+bool akita_pcie_restart(void);
+bool
+akita_pcie_restart(void)
+{
+	if (elbi == NULL || pin_hsi2 == NULL) {
+		return false;
+	}
+	printf("pcie: restart: the chip's power off and on, the link again\n");
+	wr(elbi, ELBI_LTSSM_ENABLE, 0);
+	pin_set(pin_hsi2, GPH3_PERST, 1, -1, 0);
+	pin_set(pin_hsi2, GPH3_WL_REG_ON, 1, 0, 0);
+	sleep_ms(100);
+	pin_set(pin_hsi2, GPH3_WL_REG_ON, 1, 0, 1);
+	sleep_ms(200);
+	phy_power_down();
+	wr(socr, 0x0, 0x15);
+	phy_power_up();
+	if (!phy_config()) {
+		printf("pcie: restart: the PHY did not lock\n");
+		return false;
+	}
+	if (!establish_link()) {
+		printf("pcie: restart: no link after ten tries\n");
+		return false;
+	}
+	return chip();
+}
 
 volatile uint8_t *akita_pcie_config(void);
 uint64_t akita_pcie_bar(unsigned n);
