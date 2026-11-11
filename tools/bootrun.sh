@@ -22,7 +22,14 @@ SAFE=""; case "$BOOTARGS" in *usb_lost_reboot=*) ;; *) SAFE="usb_lost_reboot=90"
 # in BOOTARGS for a longer run by hand)
 TRA=600
 case "$BOOTARGS" in *test_reboot_after=*) ;; *) SAFE="$SAFE test_reboot_after=$TRA";; esac
-CMDLINE="debug=0x8 $SAFE cpus=9 touchscreen=1 buttons=1 fuelgauge=1 usbmux=1 usb_serial=d6ca5f8da676e44a1ed9455d72d070481d33dd9e ${THERMAL-thermal=1 dvfs=1} root_apfs=ufs_darwin ufs=2 ufs_write=1 var_hfs=ufs_darwin_data mali_keep=1 metal=1 metal_plugin=../../../redwood/lib/HakiosMetal display_flip=1 $BOOTARGS"
+# usbmux's serial (lockdownd's UDID: a phone identifier, never in git) from ~/akita/usb_serial
+USBSER=""; [ -s ~/akita/usb_serial ] && USBSER="usb_serial=$(head -1 ~/akita/usb_serial)"
+[ -n "$USBSER" ] || echo "bootrun: no ~/akita/usb_serial (lockdownd's UniqueDeviceID: ideviceinfo -s -k UniqueDeviceID): usbmux without it"
+# (torch=3: the flashlight for Darwin -- a hardware switch like touchscreen=1, not a test argument; torch=0 in BOOTARGS: off.
+# The vibration motor, haptic=5, is OFF by default since 11-11 at the tester's word: every test boot buzzed ~48 s in --
+# Darwin itself plays a tap and 0.3 s of vibration then -- and his cat minded. haptic=5 in BOOTARGS for a run with it.)
+HW=""; case "$BOOTARGS" in *torch=*) ;; *) HW="torch=3";; esac
+CMDLINE="debug=0x8 $SAFE cpus=9 touchscreen=1 buttons=1 fuelgauge=1 usbmux=1 $USBSER ${THERMAL-thermal=1 dvfs=1} root_apfs=ufs_darwin ufs=2 ufs_write=1 var_hfs=ufs_darwin_data mali_keep=1 metal=1 metal_plugin=../../../redwood/lib/HakiosMetal display_flip=1 $HW $BOOTARGS"
 [ ${#CMDLINE} -gt 490 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the kernel gets whole (490: at 491 its last character was lost, 11-10); shorten BOOTARGS"; exit 1; }
 xnuloader/mkpayload.py -o $D/test-payload.bin kernel=hakios-kernel ramdisk=userland/root.apfs resident=userland/flashboot.apfs --cmdline "$CMDLINE" >/dev/null && tools/mkubootimg.py -d akita -p $D/test-payload.bin -o $D/test.img >/dev/null || exit 1
 # to the bootloader from wherever the phone is -- and again if it turns up elsewhere meanwhile (a test build's own

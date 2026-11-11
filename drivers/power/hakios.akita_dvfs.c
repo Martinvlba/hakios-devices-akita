@@ -162,10 +162,11 @@ static int gpu_applied = -1;            /* the row last set (-1: the bootloader'
 static int gpu_want;                    /* the governor's row (fastest 0), before the thermal floor */
 extern void (*hakios_touch_interaction)(void);  /* drivers/input/hakios.input.c */
 static volatile uint64_t touch_until;   /* the interaction boost lasts until (mach_absolute_time) */
-static uint32_t touch_row = 3, touch_ms = 1000;   /* (row 3, 900/723 MHz, since 11-10: with the display's submission gate
-						 * each frame's GPU work starts at the panel's switch and must end by the next one, so the
-						 * GPU's speed is the frame rate; Spotlight's openings, buffers over 18 ms of GPU time:
-						 * row 6 18/10/14, row 3 11/5/0. dvfs_touch_row=6: as before) */
+static uint32_t touch_row = 0, touch_ms = 1000;   /* (row 0, 900/890 MHz, since 11-11: with triple buffering the frames
+						 * left late are the GPU's -- rc.jobs.motion, frames under 10 ms: row 3 69 %, the GPU fixed at
+						 * row 0 75 % (its wait 4.5 -> 3.1 ms a frame), the CPUs at their top 67 %, no better.
+						 * Row 3, 900/723 MHz, since 11-10: Spotlight's openings, buffers over 18 ms of GPU time:
+						 * row 6 18/10/14, row 3 11/5/0. dvfs_touch_row=3: as on 11-10, =6 before) */
 static uint32_t touch_boosts;
 /*
  * ... and the clusters at least these clocks meanwhile (LITTLE, MID, BIG; MHz), as Android's INTERACTION hint raises
@@ -174,7 +175,19 @@ static uint32_t touch_boosts;
  * caps still apply. dvfs_touch_cpu=0: the GPU's boost alone.
  */
 static const uint32_t touch_cpu_mhz[3] = { 1197, 1572, 1557 };
-static uint32_t touch_cpu = 1;
+/*
+ * ... and while a FINGER is on the glass (and touch_ms after its last sample -- not the frames' extension below), every
+ * cluster at its top step, within the thermal caps (dvfs_touch_cpu=2, the default since 11-11): what the touch makes
+ * SpringBoard do is one main thread's CPU work -- the widgets page's first opening after a boot stalled 392 ms between
+ * the finger landing and the page moving (run-loop turns of 141-302 ms, 85-90 % of them CPU: glyph outlines, the dock's
+ * material snapshot, views laid out), the second opening 192 ms. With this: the first 310-351 ms, the second 0-167 ms
+ * (wopen-new, wopen-all*, wboost*) -- a modest gain; the first opening's stall is SpringBoard's own first-time work on a
+ * busy fresh boot (130 s after it 117 ms: wlate). (Two runs with every cluster always at the top had none; two with the
+ * same clocks for the boot's first two minutes had 310 and 318 ms -- the clock is not what decides it.) Android's top-app
+ * boost does the same through uclamp. dvfs_touch_cpu=1: the floors above only, as before; 0: the GPU's boost alone.
+ */
+static uint32_t touch_cpu = 2;
+static uint64_t finger_until;           /* the last touch sample + touch_ms */
 /*
  * FRAMES FLOWING KEEP IT UP TOO (11-10): while the panel gets dvfs_anim_fps (50) frames a second or more, the touch
  * boost is held (dvfs_anim_ms, 250, after the last such look) -- an animation nobody touches (a page settling, an app
@@ -731,6 +744,9 @@ govern(struct cluster *c)
 			floor++;
 		}
 		want = want > floor ? want : floor;
+		if (touch_cpu >= 2 && mach_absolute_time() < finger_until) {
+			want = c->nsteps - 1;       /* (a finger on the glass: every cluster at the top; the caps below still apply) */
+		}
 	}
 	if (top_always) {
 		want = c->nsteps - 1;
@@ -794,6 +810,7 @@ dvfs_touch(void)
 
 	nanoseconds_to_absolutetime((uint64_t)touch_ms * NSEC_PER_MSEC, &span);
 	touch_until = now + span;
+	finger_until = touch_until;
 	if (starts) {
 		touch_boosts++;
 		thread_wakeup((event_t)&touch_until);
