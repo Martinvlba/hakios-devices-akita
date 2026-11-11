@@ -1,0 +1,7 @@
+# devices/akita/drivers/trusty/conf: a client of Trusty, the Pixel 8a's secure-world OS (docs/drivers-config.md,
+# docs/porting/drivers.md): the GSA's AoC service (starting the AoC: audio, sensors) is reached through it.
+
+driver AKITA_TRUSTY
+	file    bsd/dev/hakios.akita_trusty.c
+	help    a client of Trusty, the Pixel 8a's secure-world OS (SMC calls, FF-A shared memory, Trusty IPC): the GSA's AoC
+	help    service is behind it; a look so far (trusty=1): Trusty's version and API, FF-A's version and our endpoint id

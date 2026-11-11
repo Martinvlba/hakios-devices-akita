@@ -1,0 +1,7 @@
+# devices/akita/drivers/aoc/conf: the Pixel 8a's AoC, Google's always-on DSP subsystem (docs/drivers-config.md,
+# docs/porting/drivers.md): audio and the sensors are behind it.
+
+driver AKITA_AOC
+	file    bsd/dev/hakios.akita_aoc.c
+	help    the Pixel 8a's AoC (audio, sensors): through the GSA's mailbox (gsa-ns 0x16490000), which authenticates and starts
+	help    its firmware; a look so far (aoc=1): the AoC's power state and one GSA request (its chip id)
