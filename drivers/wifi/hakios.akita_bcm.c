@@ -642,6 +642,10 @@ console_say(uint32_t shared)
 #define SHARED_DMA_SCRATCH_ADDR 56
 #define SHARED_DMA_RINGUPD_LEN  64
 #define SHARED_DMA_RINGUPD_ADDR 68
+#define SHARED_HOST_SCB_ADDR    64              /* (bcmdhd's layout, protocol 6+: what brcmfmac's ring update overlaps) */
+#define SHARED_HOST_SCB_SIZE    72
+#define SHARED_FLAGS2           80
+#define SHARED_HOST_CAP         84
 #define D2H_MB_DS_ENTER_REQ     0x2u
 #define D2H_MB_DS_EXIT_NOTE     0x4u
 #define D2H_MB_FWHALT           0x10000000u
@@ -675,11 +679,20 @@ console_say(uint32_t shared)
 #define RING_D2H_TXCPL          3
 #define RING_D2H_RXCPL          4
 #define RINGS                   5
-#define CTRL_BUFS               8               /* ioctl response buffers posted, and as many for events */
+#define CTRL_BUFS               8               /* ioctl response buffers posted (request ids 1..8) */
+/*
+ * EVENT BUFFERS (11-11): 32 -- Android's bcmdhd posts at least EVENT_BUF_POOL_LOW (32; 64-256 when the firmware asks
+ * through the shared flags2), this driver posted 8. The firmware traps out of packet ids ("hnd_pktid_free_cnt 0",
+ * TODO 35f) seconds after a failed handshake or a re-association -- bursts of events, which wait in its own pool for a
+ * host buffer to go into. wifi_evbufs=N (1-32) for another count.
+ */
+#define EVENT_BUFS_MAX          32
+#define ALL_CTRL_BUFS           (CTRL_BUFS + EVENT_BUFS_MAX)
+static uint32_t event_bufs = EVENT_BUFS_MAX;
 #define CTRL_BUF_SIZE           8192
 #define RX_BUFS                 256             /* data buffers posted on the rx post ring (brcmfmac: max_rxbufpost) */
 #define RX_BUF_SIZE             2048            /* brcmfmac's BRCMF_MSGBUF_MAX_PKT_SIZE */
-#define RX_ID_BASE              0x100           /* their request ids: RX_ID_BASE + n (the control buffers' are 1..16) */
+#define RX_ID_BASE              0x100           /* their request ids: RX_ID_BASE + n (the control buffers' are 1..40) */
 
 static const uint16_t ring_items[RINGS] = { 64, 1024, 64, 1024, 1024 };
 static const uint16_t ring_item_size[RINGS] = { 40, 32, 24, 24, 40 };
@@ -698,8 +711,8 @@ static struct {
 	unsigned h2d_w, h2d_r, d2h_w, d2h_r;    /* where each array starts in idx[] */
 	uint8_t *ioctl_req;
 	uint64_t ioctl_req_pa;
-	uint8_t *ctrl_buf[2 * CTRL_BUFS];       /* request ids 1..8 ioctl responses, 9..16 events */
-	uint64_t ctrl_buf_pa[2 * CTRL_BUFS];
+	uint8_t *ctrl_buf[ALL_CTRL_BUFS];       /* request ids 1..8 ioctl responses, 9..40 events */
+	uint64_t ctrl_buf_pa[ALL_CTRL_BUFS];
 	uint16_t trans_id;
 	bool ioctl_done;
 	int16_t ioctl_status;
@@ -1239,7 +1252,7 @@ d2h_ctrl_poll(void)
 			mb.ioctl_done = true;
 			break;
 		case MSG_WL_EVENT:
-			if (id > CTRL_BUFS && id <= 2 * CTRL_BUFS) {
+			if (id > CTRL_BUFS && id <= CTRL_BUFS + event_bufs) {
 				event_handle(mb.ctrl_buf[id - 1] + mb.rx_dataoffset, get16(m, 12));
 				mb.events++;
 				ctrl_buf_post(id);
@@ -1468,15 +1481,38 @@ rings_up(uint32_t shared)
 		mem_wr(shared + SHARED_DMA_SCRATCH_ADDR, (uint32_t)pa);
 		mem_wr(shared + SHARED_DMA_SCRATCH_ADDR + 4, (uint32_t)(pa >> 32));
 		mem_wr(shared + SHARED_DMA_SCRATCH_LEN, 8);
-		void *ringupd = dma_take(1024, &pa);
+		/*
+		 * NOT brcmfmac's ring-update buffer (11-11 night, TODO 35f): in this firmware's pcie_shared (protocol 7, bcmdhd's
+		 * bcmpcie.h) offsets 64-75 are host_scb_addr (8 bytes) and host_scb_size -- memory the host lends the firmware
+		 * for its station control blocks (HOSTCAP_HSCB) -- and brcmfmac's "ring update" length and address written there
+		 * read as an SCB area at (address << 32 | 1024) of 8 bytes. Zero, as a host without HSCB leaves them.
+		 * wifi_ringupd=1: as before.
+		 */
+		uint32_t ringupd_old = 0;
 
-		(void)ringupd;
-		mem_wr(shared + SHARED_DMA_RINGUPD_ADDR, (uint32_t)pa);
-		mem_wr(shared + SHARED_DMA_RINGUPD_ADDR + 4, (uint32_t)(pa >> 32));
-		mem_wr(shared + SHARED_DMA_RINGUPD_LEN, 1024);
+		PE_parse_boot_argn("wifi_ringupd", &ringupd_old, sizeof(ringupd_old));
+		if (ringupd_old) {
+			void *ringupd = dma_take(1024, &pa);
+
+			(void)ringupd;
+			mem_wr(shared + SHARED_DMA_RINGUPD_ADDR, (uint32_t)pa);
+			mem_wr(shared + SHARED_DMA_RINGUPD_ADDR + 4, (uint32_t)(pa >> 32));
+			mem_wr(shared + SHARED_DMA_RINGUPD_LEN, 1024);
+		} else {
+			mem_wr(shared + SHARED_HOST_SCB_ADDR, 0);
+			mem_wr(shared + SHARED_HOST_SCB_ADDR + 4, 0);
+			mem_wr(shared + SHARED_HOST_SCB_SIZE, 0);
+		}
+		printf("wifi: 5: pcie_shared flags2 0x%08x, host_cap 0x%08x, the firmware's host SCB size %u (%s)\n",
+		    mem_rd(shared + SHARED_FLAGS2), mem_rd(shared + SHARED_HOST_CAP), mem_rd(shared + SHARED_HOST_SCB_SIZE),
+		    ringupd_old ? "brcmfmac's ring-update buffer written over it" : "zeroed");
 	}
 	mb.ioctl_req = dma_take(IOCTL_MAX + 2, &mb.ioctl_req_pa);
-	for (unsigned i = 0; i < 2 * CTRL_BUFS; i++) {
+	PE_parse_boot_argn("wifi_evbufs", &event_bufs, sizeof(event_bufs));
+	if (event_bufs < 1 || event_bufs > EVENT_BUFS_MAX) {
+		event_bufs = EVENT_BUFS_MAX;
+	}
+	for (unsigned i = 0; i < CTRL_BUFS + event_bufs; i++) {
 		mb.ctrl_buf[i] = dma_take(CTRL_BUF_SIZE, &mb.ctrl_buf_pa[i]);
 		if (mb.ctrl_buf[i] == NULL) {
 			printf("wifi: 5: no room for the control buffers: stopped\n");
@@ -1494,7 +1530,7 @@ rings_up(uint32_t shared)
 		pcie_wr(PCIE_H2D_MAILBOX_1, 1);
 		printf("wifi: 5: host ready (doorbell 1)\n");
 	}
-	for (uint32_t id = 1; id <= 2 * CTRL_BUFS; id++) {
+	for (uint32_t id = 1; id <= CTRL_BUFS + event_bufs; id++) {
 		ctrl_buf_post(id);
 	}
 	if (!rx_setup()) {
@@ -1505,7 +1541,7 @@ rings_up(uint32_t shared)
 	(void)d2h_ctrl_poll();
 	printf("wifi: 5: %u ioctl and %u event buffers posted; the chip has read the control ring to %u (of %u written); "
 	    "%u rx buffers of %u bytes posted at 0x%llx, the rx post ring read to %u (of %u); mailbox interrupts 0x%08x\n",
-	    CTRL_BUFS, CTRL_BUFS, mb.idx[mb.h2d_r + RING_H2D_CTRL], mb.w[RING_H2D_CTRL], mb.rx_posted, RX_BUF_SIZE,
+	    CTRL_BUFS, event_bufs, mb.idx[mb.h2d_r + RING_H2D_CTRL], mb.w[RING_H2D_CTRL], mb.rx_posted, RX_BUF_SIZE,
 	    mb.rx_buf_pa, h2d_read_index(RING_H2D_RXPOST), mb.w[RING_H2D_RXPOST], pcie_rd(PCIE_MAILBOX_INT));
 	return true;
 }
@@ -1571,6 +1607,15 @@ scan_all(void)
 		}
 	}
 	printf("wifi: 7: \"mpc\" 0: %d; infrastructure: %d; up: %d\n", iovar_int("mpc", 0), cmd_int(20, 1), cmd_int(2, 1));
+	{
+		/* (11-11, a test of TODO 35f) wifi_roamoff=1: the firmware's own roaming off -- after a failed handshake it may
+		 * try other access points or re-associate by itself, and its packet pool ran dry ~40 ms after such a failure */
+		uint32_t roamoff = 0;
+
+		if (PE_parse_boot_argn("wifi_roamoff", &roamoff, sizeof(roamoff)) && roamoff) {
+			printf("wifi: 7: \"roam_off\" 1: %d\n", iovar_int("roam_off", 1));
+		}
+	}
 	err = iovar_get("scan_ver", &scan_ver, sizeof(scan_ver));
 	printf("wifi: 7: \"scan_ver\": %d, %u\n", err, scan_ver);
 
