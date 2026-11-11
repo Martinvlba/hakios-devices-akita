@@ -26,6 +26,8 @@
 #include <stdint.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
+    thread_t *new_thread);       /* osfmk/kern/thread.c (XNU_KERNEL_PRIVATE in thread.h) */
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -337,7 +339,33 @@ static struct {
 static struct {
 	bool down, seen;
 	uint32_t x, y;
+	uint64_t posted;                /* mach_absolute_time of its last sample handed on (the held finger's repeats) */
 } contact[GOODIX_MAX_TOUCHES];
+static uint32_t held_repeats;
+
+/*
+ * THE CHIP'S OWN PACE (11-11): the time between two reports while a finger is down, counted in buckets -- swipes felt
+ * faster than the finger (the tester): a sample is stamped when it is posted, and UIKit takes a flick's velocity from
+ * those stamps, so the looks' pace has to be well under the chip's. Said with the minute's line.
+ */
+static uint64_t report_last;            /* mach_absolute_time of the last report with a finger down (0: none) */
+static uint32_t report_gaps[8];         /* <=1, <=2, <=4, <=6, <=8, <=10, <=17, longer (ms) */
+static bool any_down;
+
+static void
+report_gap_count(void)
+{
+	uint64_t now = mach_absolute_time(), ns;
+
+	if (report_last != 0) {
+		absolutetime_to_nanoseconds(now - report_last, &ns);
+		uint32_t us = (uint32_t)(ns / 1000);
+		int b = us <= 1000 ? 0 : us <= 2000 ? 1 : us <= 4000 ? 2 : us <= 6000 ? 3 : us <= 8000 ? 4 : us <= 10000 ? 5 :
+		    us <= 17000 ? 6 : 7;
+		report_gaps[b]++;
+	}
+	report_last = now;
+}
 
 static void
 goodix_report(const uint8_t *touches, uint32_t count)
@@ -371,11 +399,18 @@ goodix_report(const uint8_t *touches, uint32_t count)
 			y = 65535 - y;
 		}
 		contact[id].seen = true;
+		/*
+		 * EVERY REPORT HANDED ON, moved or not (11-11): only changes were before, so a finger slowing down and stopping
+		 * before it lifted sent nothing in its last moments, and UIKit flung with the speed it had before the stop --
+		 * "slow and small swipes act as fast and big ones" (the tester). Apple's digitizer goes on reporting a resting
+		 * finger; so does this, and the thread repeats the position while the chip is silent (see below).
+		 */
 		if (!contact[id].down) {
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, id, x, y);
-		} else if (contact[id].x != x || contact[id].y != y) {
+		} else {
 			hakios_touch_post(HAKIOS_TOUCH_MOVE, id, x, y);
 		}
+		contact[id].posted = mach_absolute_time();
 		contact[id].down = true;
 		contact[id].x = x;
 		contact[id].y = y;
@@ -385,6 +420,15 @@ goodix_report(const uint8_t *touches, uint32_t count)
 			contact[id].down = false;
 			hakios_touch_post(HAKIOS_TOUCH_UP, id, contact[id].x, contact[id].y);
 		}
+	}
+	any_down = false;
+	for (uint32_t id = 0; id < GOODIX_MAX_TOUCHES; id++) {
+		any_down = any_down || contact[id].down;
+	}
+	if (any_down) {
+		report_gap_count();
+	} else {
+		report_last = 0;
 	}
 }
 
@@ -450,12 +494,19 @@ static void
 akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t poll_us = 4000, idle = 0, idle_looks;     /* 250 a second: about two looks in each 120 Hz refresh */
+	uint32_t fast_us = 1000;                /* (11-11) while a finger is down, and 100 ms after: see below */
+	uint64_t fast_until = 0, fast_span;
 	bool found = false;
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	if (poll_us < 250 || poll_us > 100000) {
 		poll_us = 4000;
 	}
+	PE_parse_boot_argn("touch_fast_us", &fast_us, sizeof(fast_us));
+	if (fast_us < 250 || fast_us > poll_us) {
+		fast_us = poll_us;
+	}
+	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &fast_span);
 	idle_looks = 80000 / poll_us;
 
 	spi_clock_on();
@@ -480,20 +531,55 @@ akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		return;
 	}
 	printf("akita touch: ready; the interrupt line is looked at every %u us\n", poll_us);
+	uint64_t next_say = 0, minute;
+
+	nanoseconds_to_absolutetime(60 * NSEC_PER_SEC, &minute);
 	for (unsigned tick = 1;; tick++) {
+		/*
+		 * LOOKED AT EVERY fast_us (1 ms) WHILE A FINGER IS DOWN, and for 100 ms after the last report (11-11): a sample is
+		 * stamped when it is read, so 4 ms between looks put up to 4 ms of error into the stamps UIKit takes a flick's
+		 * velocity from -- swipes that ran ahead of the finger. touch_fast_us=N, 4000 for the old pace.
+		 */
+		bool fast = any_down || mach_absolute_time() < fast_until;
+
 		if (interrupt_line_low()) {
 			idle = 0;
 			goodix_poll();
-		} else if (++idle >= idle_looks) {
+			fast_until = mach_absolute_time() + fast_span;
+		} else if (++idle >= (fast ? idle_looks * (poll_us / fast_us) : idle_looks)) {
 			idle = 0;
 			goodix_poll();
 		}
-		if (tick % (60 * (1000000 / poll_us)) == 0) {
-			printf("akita touch: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-			    "interrupt line %s\n", seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    interrupt_line_low() ? "low" : "high");
+		if (any_down) {
+			/*
+			 * A FINGER DOWN AND THE CHIP SILENT for more than a refresh: its position again, stamped now (11-11). The chip
+			 * scans at ~240 Hz but reports on only some scans -- 18 % of the gaps between moves over 17 ms while the tester
+			 * swiped -- and a resting finger may not be reported at all.
+			 */
+			uint64_t now = mach_absolute_time(), refresh;
+
+			nanoseconds_to_absolutetime(8333 * NSEC_PER_USEC, &refresh);
+			for (uint32_t id = 0; id < GOODIX_MAX_TOUCHES; id++) {
+				if (contact[id].down && now - contact[id].posted >= refresh) {
+					hakios_touch_post(HAKIOS_TOUCH_MOVE, id, contact[id].x, contact[id].y);
+					contact[id].posted = now;
+					held_repeats++;
+				}
+			}
 		}
-		delay_for_interval(poll_us, NSEC_PER_USEC);
+		if (mach_absolute_time() >= next_say) {
+			if (next_say != 0) {
+				printf("akita touch: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
+				    "interrupt line %s; between reports with a finger down (ms): <=1 %u, <=2 %u, <=4 %u, <=6 %u, <=8 %u, "
+				    "<=10 %u, <=17 %u, longer %u; %u positions repeated while the chip was silent\n", seen.reports,
+				    seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y, interrupt_line_low() ? "low" : "high",
+				    report_gaps[0], report_gaps[1], report_gaps[2], report_gaps[3], report_gaps[4], report_gaps[5],
+				    report_gaps[6], report_gaps[7], held_repeats);
+			}
+			next_say = mach_absolute_time() + minute;
+		}
+		/* (no leeway: a 1 ms sleep may otherwise be coalesced into a much later wake) */
+		delay_for_interval_with_leeway(fast ? fast_us : poll_us, 0, NSEC_PER_USEC);
 	}
 }
 
@@ -502,7 +588,12 @@ akita_touch_start(__unused thread_call_param_t p0, __unused thread_call_param_t 
 {
 	thread_t thread;
 
-	if (kernel_thread_start(akita_touch_thread, NULL, &thread) == KERN_SUCCESS) {
+	/*
+	 * (11-11) at the highest ordinary kernel priority, BASEPRI_PREEMPT_HIGH (93): while the tester swiped, 19 % of the
+	 * moves came more than 17 ms after the one before -- the looks slipping behind busy threads, the report waiting or
+	 * overwritten -- and a hitch then a jump is what UIKit's velocity reads as a fast flick
+	 */
+	if (kernel_thread_start_priority(akita_touch_thread, NULL, 93, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
 		printf("akita touch: no thread\n");
