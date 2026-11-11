@@ -1,0 +1,7 @@
+# devices/akita/drivers/audio/conf: the Pixel 8a's speaker amplifiers (docs/drivers-config.md, docs/porting/drivers.md):
+# two Cirrus Logic CS35L41s on SPI, fed by the AoC's TDM_0 port.
+
+driver AKITA_AMP
+	file    bsd/dev/hakios.akita_amp.c
+	help    the Pixel 8a's speaker amplifiers: two CS35L41s on zuma's spi@111C0000 (USI1 of HSI0), the right one on a GPIO
+	help    chip select; a look so far (amp=1): both reset, their OTP boot, device and revision ids
