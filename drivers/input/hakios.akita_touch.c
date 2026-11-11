@@ -340,7 +340,38 @@ static struct {
 	bool down, seen;
 	uint32_t x, y;
 	uint64_t posted;                /* mach_absolute_time of its last sample handed on (the held finger's repeats) */
+	/* (touch_jumps=1) */
+	uint64_t down_at, chip_at;      /* when it came down; its last sample from the chip (not a repeat) */
+	uint32_t down_x, down_y, travel, samples, chip_x, chip_y;
 } contact[GOODIX_MAX_TOUCHES];
+
+/*
+ * Boot-arg touch_jumps=1 (11-11, the tester: "sliding things jumps when not intended"): each touch's coming down and
+ * going up said -- where, how long, how far it went in all, how many samples, the chip's size (w) and pressure (p) of
+ * the finger, how many fingers were down --, and any sample that moves a finger more than ~3 % of the screen in under
+ * 25 ms from the chip's sample before (with the time and the record's raw bytes). The first 600 lines.
+ */
+static uint32_t jumps_on, jumps_said;
+
+static uint64_t
+abs_to_us(uint64_t abs)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns / 1000;
+}
+
+static uint32_t
+fingers_down(void)
+{
+	uint32_t n = 0;
+
+	for (uint32_t i = 0; i < GOODIX_MAX_TOUCHES; i++) {
+		n += contact[i].down;
+	}
+	return n;
+}
 static uint32_t held_repeats;
 
 /*
@@ -399,6 +430,37 @@ goodix_report(const uint8_t *touches, uint32_t count)
 			y = 65535 - y;
 		}
 		contact[id].seen = true;
+		if (jumps_on) {
+			uint64_t now = mach_absolute_time();
+			uint32_t dx = x > contact[id].chip_x ? x - contact[id].chip_x : contact[id].chip_x - x;
+			uint32_t dy = y > contact[id].chip_y ? y - contact[id].chip_y : contact[id].chip_y - y;
+
+			if (!contact[id].down) {
+				contact[id].down_at = now;
+				contact[id].down_x = x;
+				contact[id].down_y = y;
+				contact[id].travel = contact[id].samples = 0;
+				if (jumps_said++ < 600) {
+					printf("akita touch: DOWN %u at %u, %u (w %u p %u major %u minor %u); %u fingers were down\n", id,
+					    x, y, le16(t + 6), point_length > 8 ? t[8] : 0, point_length > 12 ? le16(t + 9) : 0,
+					    point_length > 12 ? le16(t + 11) : 0, fingers_down());
+				}
+			} else {
+				uint64_t us = abs_to_us(now - contact[id].chip_at);
+
+				contact[id].travel += dx + dy;
+				if (dx + dy > 2000 && us < 25000 && jumps_said++ < 600) {
+					printf("akita touch: JUMP %u by %u, %u in %llu us (to %u, %u; w %u p %u); %u fingers; raw "
+					    "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x\n", id, dx, dy, us, x, y,
+					    le16(t + 6), point_length > 8 ? t[8] : 0, fingers_down(), t[0], t[1], t[2], t[3], t[4], t[5],
+					    t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13]);
+				}
+			}
+			contact[id].samples++;
+			contact[id].chip_at = now;
+			contact[id].chip_x = x;
+			contact[id].chip_y = y;
+		}
 		/*
 		 * EVERY REPORT HANDED ON, moved or not (11-11): only changes were before, so a finger slowing down and stopping
 		 * before it lifted sent nothing in its last moments, and UIKit flung with the speed it had before the stop --
@@ -419,6 +481,16 @@ goodix_report(const uint8_t *touches, uint32_t count)
 		if (contact[id].down && !contact[id].seen) {
 			contact[id].down = false;
 			hakios_touch_post(HAKIOS_TOUCH_UP, id, contact[id].x, contact[id].y);
+			if (jumps_on && jumps_said++ < 600) {
+				uint32_t dx = contact[id].x > contact[id].down_x ? contact[id].x - contact[id].down_x :
+				    contact[id].down_x - contact[id].x;
+				uint32_t dy = contact[id].y > contact[id].down_y ? contact[id].y - contact[id].down_y :
+				    contact[id].down_y - contact[id].y;
+
+				printf("akita touch: UP %u at %u, %u after %llu ms: %u, %u from where it came down, %u travelled, %u "
+				    "samples\n", id, contact[id].x, contact[id].y, abs_to_us(mach_absolute_time() - contact[id].down_at) / 1000,
+				    dx, dy, contact[id].travel, contact[id].samples);
+			}
 		}
 	}
 	any_down = false;
@@ -612,6 +684,7 @@ akita_touch_init(void)
 		return;
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
+	PE_parse_boot_argn("touch_jumps", &jumps_on, sizeof(jumps_on));
 	spi = ml_io_map(SPI_PHYS, 0x1000);
 	cmu = ml_io_map(CMU_PHYS, 0x2000);
 	sysreg = ml_io_map(SYSREG_PHYS, 0x1000);
