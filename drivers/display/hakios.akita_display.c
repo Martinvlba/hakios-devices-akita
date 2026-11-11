@@ -158,6 +158,7 @@ static volatile uint32_t *dsim_regs;
 #define DSIM0           0x19440000ULL
 static volatile uint32_t *dsim;                 /* DSIM0, for the panel's commands (dsim_dcs) */
 static uint32_t panel_on = 1, max_nits = 800;  /* display_panel=, display_max_nits= (panel_commands) */
+static uint32_t dimming = 1;                    /* display_dimming=0: the panel's smooth dimming not turned on */
 static uint32_t health_on = 1;                 /* display_health=0: the error flags not read (a hang's suspect, 11-10) */
 
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
@@ -240,6 +241,7 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	PE_parse_boot_argn("display_health", &health_on, sizeof(health_on));
 	PE_parse_boot_argn("display_panel", &panel_on, sizeof(panel_on));
 	PE_parse_boot_argn("display_max_nits", &max_nits, sizeof(max_nits));
+	PE_parse_boot_argn("display_dimming", &dimming, sizeof(dimming));
 	max_nits = max_nits < 100 ? 100 : max_nits > 1400 ? 1400 : max_nits;
 	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);     /* (the panel's commands: panel_commands) */
 	if (health_on) {
@@ -979,6 +981,18 @@ panel_commands(void)
 		sent_on = 0;
 		panel_fails += !ok;
 		printf("akita_display: the panel dark (display off %s)\n", ok ? "sent" : "NOT sent");
+	}
+	/*
+	 * THE PANEL'S OWN DIMMING (11-11, the tester: the brightness slider "jumps"): DCS 0x53, WRCTRLD, BCTRL (0x20) and
+	 * DIMMING (0x08) -- the panel then goes from one level to the next smoothly over a few frames, as on Android
+	 * (panel-google-ak3b.c ak3b_update_wrctrld with dimming_on); without it each of the slider's steps was a jump of the
+	 * light. Once, before the first level.
+	 */
+	if (level != 0 && dimming == 1) {
+		const uint8_t w[2] = { 0x53, 0x28 };
+		ok = dsim_dcs(w, sizeof(w));
+		dimming = 2;
+		printf("akita_display: the panel's smooth dimming on (WRCTRLD 0x28 %s)\n", ok ? "sent" : "NOT sent");
 	}
 	if (level != 0 && level != sent_level) {
 		const uint8_t b[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
