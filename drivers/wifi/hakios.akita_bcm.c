@@ -3609,6 +3609,27 @@ bcm_steps(void)
 	}
 	kfree_data(vars, vars_alloc);
 
+	{
+		/*
+		 * (11-12, TODO 35e, a test) wifi_splitrx=0: the firmware's split rx off before it runs -- _bcmsplitrx, the byte at
+		 * 0x6e0133 of THIS build (fw_bcmdhd.map_4383_a3; the word at 0x6e0130 reads 0x01010100 in its image: _bcmfrwdpkt
+		 * 0, 1, 1, _bcmsplitrx 1; _bcmsplitrx_mode 4 next). With split rx a frame's payload goes straight into a host
+		 * buffer and the firmware fetches it back to look at it (pktfetch): under the EDL ring it decrypts frames and
+		 * drops them -- is it that path? Patched only if the word is what this build has.
+		 */
+		uint32_t split = 1;
+
+		if (PE_parse_boot_argn("wifi_splitrx", &split, sizeof(split)) && split == 0) {
+			uint32_t w = mem_rd(0x006e0130);
+
+			if (w == 0x01010100) {
+				mem_wr(0x006e0130, w & 0x00ffffffu);
+				printf("wifi: 3: split rx off (_bcmsplitrx 0: 0x%08x -> 0x%08x)\n", w, mem_rd(0x006e0130));
+			} else {
+				printf("wifi: 3: split rx left: the word at 0x6e0130 is 0x%08x, not this build's\n", w);
+			}
+		}
+	}
 	if (!announce(4, "runs: the ARM let go; the firmware's shared area awaited")) {
 		return false;
 	}
