@@ -564,12 +564,26 @@ amp_setup(int chip)
 	amp_update(chip, L41_PWR_CTRL2, L41_BST_EN_MASK, L41_BST_EN_DEFAULT << L41_BST_EN_SHIFT);
 	amp_update(chip, L41_SP_HIZ_CTRL, L41_ASP_DOUT_HIZ_MASK, 3);   /* cirrus,asp-sdout-hiz = <3> */
 
-	/* DSP-A, the AoC the clock provider, neither clock inverted; 48 kHz; 32-bit slots of 16-bit samples */
+	/* DSP-A, the AoC the clock provider, neither clock inverted; 48 kHz; 32-bit slots (the word length below) */
 	amp_update(chip, L41_SP_FORMAT, L41_SCLK_MSTR_MASK | L41_LRCLK_MSTR_MASK | L41_ASP_FMT_MASK | L41_LRCLK_INV_MASK |
 	    L41_SCLK_INV_MASK, 0);
 	amp_update(chip, L41_GLOBAL_CLK_CTRL, L41_GLOBAL_FS_MASK, L41_FS_48K << L41_GLOBAL_FS_SHIFT);
 	amp_update(chip, L41_SP_FORMAT, L41_ASP_WIDTH_RX_MASK, 32u << L41_ASP_WIDTH_RX_SHIFT);
-	amp_update(chip, L41_SP_RX_WL, L41_ASP_RX_WL_MASK, 16u << L41_ASP_RX_WL_SHIFT);
+	{
+		/*
+		 * The word length the amps take from each 32-bit slot: 32, as Android's mixer gives them (11-12; it was 16 --
+		 * the speakers silent, the earpiece buzzing faintly: if the AoC puts its samples in the LOW bits of a slot, a
+		 * 16-bit word is only their sign bits. 16-bit samples at the top read the same with 32). UNTESTED by ear.
+		 * amp_wl=N: N (16, 24, 32).
+		 */
+		uint32_t wl = 32;
+
+		PE_parse_boot_argn("amp_wl", &wl, sizeof(wl));
+		if (wl != 16 && wl != 24 && wl != 32) {
+			wl = 32;
+		}
+		amp_update(chip, L41_SP_RX_WL, L41_ASP_RX_WL_MASK, wl << L41_ASP_RX_WL_SHIFT);
+	}
 	/* the left amplifier plays slot 0, the right slot 1 (RX1 bits 5:0, RX2 bits 13:8) */
 	amp_update(chip, L41_SP_FRAME_RX_SLOT, 0x3f3f, chip ? 0x0001 : 0x0100);
 
@@ -587,7 +601,16 @@ amp_setup(int chip)
 	amp_update(chip, L41_DAC_PCM1_SRC, L41_ASP_SOURCE_MASK, L41_DACPCM_ASPRX1);
 	amp_update(chip, L41_PWR_CTRL3, L41_CLASSH_EN_MASK, L41_CLASSH_EN_MASK);
 	amp_update(chip, L41_AMP_DIG_VOL_CTRL, L41_AMP_VOL_PCM_MASK, 0);
-	amp_update(chip, L41_AMP_GAIN_CTRL, L41_AMP_GAIN_PCM_MASK, 0);
+	{
+		/* the analog gain: the least (0: 0.5 dB) unless amp_gain=N (0-20, 0.5 dB + N dB; Android's mixer: 17) */
+		uint32_t gain = 0;
+
+		PE_parse_boot_argn("amp_gain", &gain, sizeof(gain));
+		if (gain > 20) {
+			gain = 0;
+		}
+		amp_update(chip, L41_AMP_GAIN_CTRL, L41_AMP_GAIN_PCM_MASK, gain << L41_AMP_GAIN_PCM_SHIFT);
+	}
 
 	uint32_t fmt = 0, slots = 0, pll = 0, pwr2 = 0, src = 0;
 	amp_read(chip, L41_SP_FORMAT, &fmt);
