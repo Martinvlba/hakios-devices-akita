@@ -541,7 +541,7 @@ extern "C" uint64_t akita_mali_kernel_bytes(void);     /* hakios.akita_mali.c */
 bool
 MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 {
-	uint64_t snap[64], deadline, t0 = mach_absolute_time();
+	uint64_t snap[192], deadline, t0 = mach_absolute_time();       /* (hakios.akita_mali.c: 48 groups of 4 queues) */
 	unsigned n;
 	bool done;
 
@@ -553,7 +553,7 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 	/* the command buffers drawing into it, recorded or running, done first (the marks: busyChange) -- and the grace
 	 * below whenever the GPU still has work at all: a frame presented before its main stage is recorded has no mark
 	 * yet (the screen recording: every half-drawn frame was recorded with the GPU busy) */
-	n = akita_mali_snapshot(snap, 64);
+	n = akita_mali_snapshot(snap, 192);
 	static uint32_t grace_us = 0xffffffff;
 	uint64_t grace_abs, until, released = 0;
 
@@ -621,7 +621,7 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		gBusyWaits++;
 		gBusyWaitAbs += mach_absolute_time() - b0;
 	}
-	n = akita_mali_snapshot(snap, 64);
+	n = akita_mali_snapshot(snap, 192);
 	while (!(done = akita_mali_done(snap, n)) && mach_absolute_time() < deadline) {
 		/* until the GPU's JOB interrupt (a submission done) or a millisecond, the lock dropped meanwhile */
 		IOLockUnlock(gLock);

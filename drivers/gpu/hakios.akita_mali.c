@@ -263,11 +263,20 @@ static vm_offset_t table_pool;
 static vm_size_t table_left;
 static unsigned int table_count;
 
+/* tables given back (a VM that went: free_tables), linked through their first word */
+static uint64_t *table_free;
+
 static uint64_t *
 new_table(void)
 {
 	uint64_t *table;
 
+	if (table_free != NULL) {
+		table = table_free;
+		table_free = (uint64_t *)(uintptr_t)table[0];
+		bzero(table, GPU_PAGE);
+		return table;
+	}
 	if (table_left < GPU_PAGE) {
 		table_pool = gpu_memory(PAGE_SIZE);
 		table_left = table_pool ? PAGE_SIZE : 0;
@@ -1365,9 +1374,22 @@ compute_job(void)
  * idle never took effect, step 9's lesson); the scoreboards each program sets up itself (panvk does).
  */
 #define KVM_BASE                0x800000000000ULL       /* the kernel's half of a program's address space */
-#define MAX_VMS                 8
-#define MAX_GROUPS              8
+/*
+ * MORE CLIENTS THAN THE GPU HAS PLACES (11-12, Metal for every process): the Mali-G715 has 8 address spaces (0 the
+ * MCU's) and its firmware 8 group slots; a VM and a group each took one for good, so the eighth process to open the
+ * device got none ("no VM": Maps, Safari, WebKit's GPU process ran without, the watch faces' snapshot service died of
+ * it). Now a VM and a group are the driver's own (MAX_VMS, MAX_GROUPS), and take a place only while they work: a group
+ * is given a slot at its submission (group_bind) -- a free one, or that of the group idle longest (everything it was
+ * given done: ended with CSG TERMINATE as a restart ends one, and started again later with empty rings, group_restart's
+ * way, which loses nothing of an idle group) -- and its VM an address space the same way (vm_bind: one whose VM has no
+ * group in a slot is turned off and handed over). panthor does this with its scheduler's ticks; here it is done at
+ * the submission, under HakiosGPU's lock.
+ */
+#define MAX_VMS                 48
+#define MAX_GROUPS              48
 #define MAX_QUEUES              4
+#define CSG_SLOTS               8
+#define AS_SLOTS                8
 
 struct mali_queue {
 	vm_offset_t ring;               /* the kernel's address */
@@ -1390,17 +1412,30 @@ static struct mali_vm {
 	uint64_t *root;
 	uint64_t kernel_next;           /* the next free address of the kernel's half */
 	bool flush_pending;             /* pages mapped since its last update: flushed before its next submission */
+	unsigned int as;                /* the address space it has now (1..7), 0: none */
+	uint64_t last_used;             /* mach absolute time of its groups' last submission */
 } vms[MAX_VMS];
 
 static struct mali_group {
 	bool used;
 	unsigned int vm, queues;
 	struct mali_queue q[MAX_QUEUES];
-	/* what its start was given, for a restart after a fatal error (group_restart) */
-	uint32_t suspend_va, user_va[MAX_QUEUES];
 	uint8_t priority;
 	unsigned int restarts;
+	int slot;                       /* the firmware's group slot it has now, -1: none */
+	uint64_t last_used;             /* mach absolute time of its last submission */
 } groups[MAX_GROUPS];
+
+/* the places: a slot's group (its number + 1, 0: free), an address space's VM (0: free; address space 0 is the MCU's) */
+static unsigned int slot_group[CSG_SLOTS], as_vm[AS_SLOTS];
+/* what the MCU reaches of a slot, made once and used by whichever group has the slot: the suspend buffer and each
+ * queue's two user pages (the MCU's zone has room for exactly eight slots' worth and gives nothing back: made a group,
+ * as before, the tenth group ever made found it empty) */
+static struct {
+	bool made;
+	uint32_t suspend_va, user_va[MAX_QUEUES];
+	vm_offset_t user[MAX_QUEUES];
+} slots[CSG_SLOTS];
 
 static uint32_t mcu_next = MCU_ZONE_BASE;
 static bool kept;
@@ -1517,16 +1552,16 @@ unmap_page_in(uint64_t *root, uint64_t va)
 	clean_dcache((vm_offset_t)&table[(va >> 12) & 511] & ~63UL, 64, FALSE);
 }
 
-/* an address space's registers pointed at its tables again: the TLB and the walk's caches see what was written */
+/* an address space's registers pointed at tables: the TLB and the walk's caches see what was written */
 static void
-as_update(unsigned int as)
+as_program(unsigned int as, uint64_t *root)
 {
 	uint32_t base = AS0 + as * 0x40;
 
 	flush_gpu();
 	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
 	wr64(base + AS_TRANSCFG, TRANSCFG_VALUE);
-	wr64(base + AS_TRANSTAB, kvtophys((vm_offset_t)(as == 0 ? level0 : vms[as].root)));
+	wr64(base + AS_TRANSTAB, kvtophys((vm_offset_t)root));
 	wr64(base + AS_MEMATTR, MEMATTR_TABLE);
 	wr(base + AS_COMMAND, AS_CMD_UPDATE);
 	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
@@ -1542,6 +1577,90 @@ as_update(unsigned int as)
 	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
 }
 
+/* an address space turned off: what uses it fails (a page fault's answer; a VM losing its place) */
+#define TRANSCFG_UNMAPPED       1ULL
+
+static void
+as_off(unsigned int as)
+{
+	uint32_t base = AS0 + as * 0x40;
+
+	flush_gpu();
+	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+	wr64(base + AS_TRANSCFG, TRANSCFG_UNMAPPED);
+	wr(base + AS_COMMAND, AS_CMD_UPDATE);
+	wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+}
+
+/* a VM's tables as they are now, for the GPU -- if the VM has an address space (one without gets it at its group's
+ * next submission, programmed then); 0: the MCU's own */
+static void
+as_update(unsigned int vm)
+{
+	if (vm == 0) {
+		as_program(0, level0);
+	} else if (vm < MAX_VMS && vms[vm].as != 0) {
+		as_program(vms[vm].as, vms[vm].root);
+	}
+}
+
+/* an address space for the VM: a free one, or the one of the VM used longest ago that has no group in a slot */
+static bool
+vm_bind(unsigned int vm)
+{
+	unsigned int as = 0;
+
+	if (vms[vm].as != 0) {
+		return true;
+	}
+	for (unsigned int a = 1; a < AS_SLOTS && as == 0; a++) {
+		if (as_vm[a] == 0) {
+			as = a;
+		}
+	}
+	if (as == 0) {
+		uint64_t oldest = ~0ULL;
+
+		for (unsigned int a = 1; a < AS_SLOTS; a++) {
+			unsigned int v = as_vm[a];
+			bool working = false;
+
+			for (unsigned int g = 0; g < MAX_GROUPS && !working; g++) {
+				working = groups[g].used && groups[g].vm == v && groups[g].slot >= 0;
+			}
+			if (!working && vms[v].last_used < oldest) {
+				oldest = vms[v].last_used;
+				as = a;
+			}
+		}
+		if (as == 0) {
+			return false;
+		}
+		as_off(as);
+		vms[as_vm[as]].as = 0;
+	}
+	as_vm[as] = vm;
+	vms[vm].as = as;
+	vms[vm].flush_pending = false;
+	as_program(as, vms[vm].root);
+	return true;
+}
+
+/* a VM's tables given back (not what they map) */
+static void
+free_tables(uint64_t *table, int level)
+{
+	if (level < 3) {
+		for (unsigned int i = 0; i < 512; i++) {
+			if ((table[i] & 3) != 0) {
+				free_tables((uint64_t *)phystokv(table[i] & PTE_ADDR), level + 1);
+			}
+		}
+	}
+	table[0] = (uint64_t)(uintptr_t)table_free;
+	table_free = table;
+}
+
 int akita_mali_vm_new(void);
 int
 akita_mali_vm_new(void)
@@ -1555,7 +1674,9 @@ akita_mali_vm_new(void)
 			clean_dcache((vm_offset_t)vms[i].root, GPU_PAGE, FALSE);
 			vms[i].used = true;
 			vms[i].kernel_next = KVM_BASE;
-			as_update(i);
+			vms[i].as = 0;                  /* (its address space at its group's first submission: vm_bind) */
+			vms[i].flush_pending = false;
+			vms[i].last_used = mach_absolute_time();
 			return (int)i;
 		}
 	}
@@ -1566,8 +1687,15 @@ void akita_mali_vm_free(int vm);
 void
 akita_mali_vm_free(int vm)
 {
-	if (vm > 0 && vm < MAX_VMS) {
-		vms[vm].used = false;   /* (its tables stay in the pool: given again with the next VM's) */
+	if (vm > 0 && vm < MAX_VMS && vms[vm].used) {
+		if (vms[vm].as != 0) {
+			as_off(vms[vm].as);
+			as_vm[vms[vm].as] = 0;
+			vms[vm].as = 0;
+		}
+		vms[vm].used = false;
+		free_tables(vms[vm].root, 0);   /* (11-12: they stayed for good, a tree a client that ever was) */
+		vms[vm].root = NULL;
 	}
 }
 
@@ -1798,16 +1926,248 @@ stream_blocks(uint32_t *gc, unsigned int q, volatile uint32_t **in, volatile uin
 	*out = kernel_address(sc[STREAM_OUTPUT_VA / 4]);
 }
 
-/* ring sizes in bytes (powers of two, 4 KiB to 1 MiB); the group's slot or -1 */
+/* a slot's own memory in the MCU's zone, made the first time the slot is used */
+static bool
+slot_make(unsigned int s)
+{
+	volatile uint32_t *gin, *gout;
+	uint32_t *gc;
+
+	if (slots[s].made) {
+		return true;
+	}
+	group_blocks(s, &gin, &gout, &gc);
+	if (gin == NULL || gout == NULL || gc[GROUP_SUSPEND_SIZE / 4] > 0x40000 ||
+	    mcu_region(gc[GROUP_SUSPEND_SIZE / 4], &slots[s].suspend_va) == 0) {
+		return false;
+	}
+	for (unsigned int q = 0; q < MAX_QUEUES; q++) {
+		slots[s].user[q] = mcu_region(2 * GPU_PAGE, &slots[s].user_va[q]);
+		if (slots[s].user[q] == 0) {
+			return false;
+		}
+	}
+	slots[s].made = true;
+	return true;
+}
+
+/* the slot's group ended (CSG TERMINATE): the slot is the firmware's to start again */
+static bool
+slot_stop(unsigned int s)
+{
+	volatile uint32_t *gin, *gout;
+	uint32_t *gc;
+
+	group_blocks(s, &gin, &gout, &gc);
+	from_gpu(gout, 64);
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u);            /* TERMINATE */
+	to_gpu(gin, 64);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << s);
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	return acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200);
+}
+
+/*
+ * Group G started in slot S, its VM in an address space already: its rings from their start (REQ_RESOURCE held from the
+ * stream's first word -- a request made only after the group had been idle never took effect, step 9's lesson -- and the
+ * VM's tiler heap set: hakios-metal sets it once, in its first command buffer, and a queue started again without it
+ * ended its next draw in an invalid instruction fault, 0x49), everything it was given counted reached, the slot's user
+ * pages and suspend buffer its own for now.
+ */
+static bool
+slot_start(unsigned int s, unsigned int g)
+{
+	struct mali_group *grp = &groups[g];
+	volatile uint32_t *gin, *gout, *sin, *sout;
+	uint32_t *gc;
+	uint64_t shaders = rd64(SHADER_PRESENT);
+	unsigned int compute = 0;
+
+	group_blocks(s, &gin, &gout, &gc);
+	if (gin == NULL || gout == NULL || grp->queues > gc[GROUP_STREAM_NUM / 4]) {
+		return false;
+	}
+	for (unsigned int q = 0; q < grp->queues; q++) {
+		struct mali_queue *mq = &grp->q[q];
+		uint64_t *r = (uint64_t *)mq->ring;
+
+		*mq->seqno = mq->submitted;
+		to_gpu((void *)mq->seqno, 8);
+		mq->seen = mq->submitted;
+		bzero((void *)mq->ring, mq->ring_size);
+		r[0] = 34ULL << 56 | 0xf;
+		for (int h = 0; h < MAX_HEAPS; h++) {
+			if (heaps[h].used && heaps[h].vm == grp->vm) {
+				r[1] = 1ULL << 56 | 0ULL << 48 | (heaps[h].ctx_va & 0xffffffffffffULL);     /* MOVE48 r0 <- context */
+				r[2] = 48ULL << 56;                                                      /* HEAP_SET */
+				break;
+			}
+		}
+		mq->insert = 64;
+		to_gpu((void *)mq->ring, mq->ring_size);
+		mq->user_in = (volatile uint32_t *)slots[s].user[q];
+		mq->user_out = (volatile uint32_t *)(slots[s].user[q] + GPU_PAGE);
+		bzero((void *)mq->user_in, GPU_PAGE);
+		bzero((void *)mq->user_out, GPU_PAGE);
+		mq->user_in[CS_INSERT / 4] = (uint32_t)mq->insert;
+		to_gpu(mq->user_in, GPU_PAGE);
+		to_gpu(mq->user_out, GPU_PAGE);
+		stream_blocks(gc, q, &sin, &sout);
+		if (sin == NULL || sout == NULL) {
+			return false;
+		}
+		from_gpu(sin, 128);
+		from_gpu(sout, 128);
+		sin[CS_BASE_LO / 4] = (uint32_t)mq->ring_va;
+		sin[CS_BASE_HI / 4] = (uint32_t)(mq->ring_va >> 32);
+		sin[CS_SIZE / 4] = mq->ring_size;
+		sin[CS_USER_INPUT_LO / 4] = slots[s].user_va[q];
+		sin[CS_USER_INPUT_HI / 4] = 0;
+		sin[CS_USER_OUTPUT_LO / 4] = slots[s].user_va[q] + GPU_PAGE;
+		sin[CS_USER_OUTPUT_HI / 4] = 0;
+		sin[CS_CONFIG / 4] = (1 + s) << 8 | 1;
+		sin[CS_ACK_IRQ_MASK / 4] = 0xffffffff;
+		sin[CS_REQ / 4] = (sout[CS_ACK / 4] & 0xc0000000u) | CS_REQ_IDLE_BITS | CS_STATE_START;
+		to_gpu(sin, 128);
+	}
+	for (uint64_t m = shaders; m; m &= m - 1) {
+		compute++;
+	}
+	from_gpu(gout, 64);
+	gin[CSG_DB_REQ / 4] = gout[CSG_DB_ACK / 4] ^ ((1u << grp->queues) - 1);
+	gin[CSG_ALLOW_COMPUTE_LO / 4] = (uint32_t)shaders;
+	gin[CSG_ALLOW_COMPUTE_HI / 4] = (uint32_t)(shaders >> 32);
+	gin[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
+	gin[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
+	gin[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
+	/* SEVERAL GROUPS (TODO 16): each its own CSG priority, 15 - its slot (panthor gives every slot a priority of its
+	 * own). With the same one (every hakios-metal client asks 1) the firmware handed the endpoints out in pieces -- one
+	 * group the compute ones, another the fragment and tiler -- and each waited for the other's for good (CS blocked
+	 * on resources, 0x5). The first slot, backboardd's as a rule, ranks first. (The client's PRIORITY is kept.) */
+	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(15 - s) << 28;
+	gin[CSG_EP_REQ_HI / 4] = 0;
+	gin[CSG_CONFIG / 4] = vms[grp->vm].as;  /* the group's address space: its VM's, for now */
+	gin[CSG_SUSPEND_BUF_LO / 4] = slots[s].suspend_va;
+	gin[CSG_SUSPEND_BUF_HI / 4] = 0;
+	gin[CSG_ACK_IRQ_MASK / 4] = 0xffffffff;
+	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u) | CSG_STATE_START;
+	to_gpu(gin, 128);
+	from_gpu(glb_out, 64);
+	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << s);
+	to_gpu(glb_in, 64);
+	ring_doorbell(0);
+	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
+		printf("mali: group %u did not start in slot %u (CSG_REQ 0x%x, ACK 0x%x)\n", g, s, gin[CSG_REQ / 4],
+		    gout[CSG_ACK / 4]);
+		faults("a group's start");
+		return false;
+	}
+	return true;
+}
+
+/* has the GPU done everything the group was given (its sequence pages, read past the caches) */
+static bool
+group_idle(unsigned int g)
+{
+	for (unsigned int q = 0; q < groups[g].queues; q++) {
+		from_gpu(groups[g].q[q].seqno, 8);
+		if (*groups[g].q[q].seqno < groups[g].q[q].submitted) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static unsigned int binds, evictions;
+
+/* the slot of the idle group used longest ago made free (not KEEP's; OTHER_VM: nor one of KEEP's VM, when it is an
+ * address space that is wanted); false: every group in a slot is at work */
+static bool
+evict_one(unsigned int keep, bool other_vm)
+{
+	int victim = -1;
+	uint64_t oldest = ~0ULL;
+
+	flush_gpu();
+	for (unsigned int s = 0; s < CSG_SLOTS; s++) {
+		unsigned int v;
+
+		if (slot_group[s] == 0) {
+			continue;
+		}
+		v = slot_group[s] - 1;
+		if (v == keep || (other_vm && groups[v].vm == groups[keep].vm) || !group_idle(v)) {
+			continue;
+		}
+		if (groups[v].last_used < oldest) {
+			oldest = groups[v].last_used;
+			victim = (int)s;
+		}
+	}
+	if (victim < 0) {
+		return false;
+	}
+	if (!slot_stop((unsigned int)victim)) {
+		printf("mali: group %u in slot %d did not end for another's turn\n", slot_group[victim] - 1, victim);
+	}
+	groups[slot_group[victim] - 1].slot = -1;
+	slot_group[victim] = 0;
+	evictions++;
+	return true;
+}
+
+/* a slot (and its VM an address space) for the group, which is about to be given work; false: none to be had now */
+static bool
+group_bind(unsigned int g)
+{
+	struct mali_group *grp = &groups[g];
+	unsigned int slots_there = glb_ctl[GLB_GROUP_NUM_W] < CSG_SLOTS ? glb_ctl[GLB_GROUP_NUM_W] : CSG_SLOTS;
+	int s = -1;
+
+	if (grp->slot >= 0) {
+		return true;
+	}
+	while (!vm_bind(grp->vm)) {
+		if (!evict_one(g, true)) {
+			return false;
+		}
+	}
+	for (;;) {
+		for (unsigned int i = 0; i < slots_there && s < 0; i++) {
+			if (slot_group[i] == 0) {
+				s = (int)i;
+			}
+		}
+		if (s >= 0) {
+			break;
+		}
+		if (!evict_one(g, false)) {
+			return false;
+		}
+	}
+	if (!slot_make((unsigned int)s) || !slot_start((unsigned int)s, g)) {
+		return false;
+	}
+	slot_group[s] = g + 1;
+	grp->slot = s;
+	binds++;
+	if (binds <= 12 || binds % 200 == 0) {
+		printf("mali: group %u (VM %u) in slot %d, address space %u (%u turns given, %u taken from idle groups)\n", g, grp->vm,
+		    s, vms[grp->vm].as, binds, evictions);
+	}
+	return true;
+}
+
+/* ring sizes in bytes (powers of two, 4 KiB to 1 MiB); the group's number or -1. It takes a slot of the firmware's
+ * only at its first submission (group_bind). */
 static void mali_irq_attach(void);
 int akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority);
 int
 akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority)
 {
-	volatile uint32_t *gin, *gout, *sin, *sout;
-	uint32_t *gc, suspend_va, mcu_va;
-	uint64_t shaders = rd64(SHADER_PRESENT);
-	unsigned int compute = 0, g;
+	unsigned int g;
 	struct mali_group *grp;
 
 	if (vm <= 0 || vm >= MAX_VMS || !vms[vm].used || nqueues == 0 || nqueues > MAX_QUEUES) {
@@ -1820,110 +2180,47 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 	}
 	grp = &groups[g];
 	bzero(grp, sizeof(*grp));
+	grp->slot = -1;
+	grp->vm = (unsigned)vm;
 	from_gpu((void *)shared_iface, 0x10000);
-	group_blocks(g, &gin, &gout, &gc);
-	if (gin == NULL || gout == NULL || nqueues > gc[GROUP_STREAM_NUM / 4] || gc[GROUP_SUSPEND_SIZE / 4] > 0x40000) {
-		return -1;
-	}
-	if (mcu_region(gc[GROUP_SUSPEND_SIZE / 4], &suspend_va) == 0) {
-		return -1;
+	{
+		volatile uint32_t *gin, *gout;
+		uint32_t *gc;
+
+		group_blocks(0, &gin, &gout, &gc);      /* (the slots are alike: what one takes, each does) */
+		if (gin == NULL || gout == NULL || nqueues > gc[GROUP_STREAM_NUM / 4]) {
+			return -1;
+		}
 	}
 	for (unsigned int q = 0; q < nqueues; q++) {
 		struct mali_queue *mq = &grp->q[q];
 		uint32_t size = ring_sizes[q];
-		vm_offset_t user;
 
 		if (size < 0x1000 || size > 0x100000 || (size & (size - 1))) {
-			return -1;
+			size = 0;
+		} else {
+			mq->ring = vm_kernel_region((unsigned)vm, size, &mq->ring_va, false);
+			mq->seqno = (volatile uint64_t *)vm_kernel_region((unsigned)vm, GPU_PAGE, &mq->seqno_va, false);
 		}
-		mq->ring = vm_kernel_region((unsigned)vm, size, &mq->ring_va, false);
-		mq->seqno = (volatile uint64_t *)vm_kernel_region((unsigned)vm, GPU_PAGE, &mq->seqno_va, false);
-		user = mcu_region(2 * GPU_PAGE, &mcu_va);
-		if (mq->ring == 0 || mq->seqno == NULL || user == 0) {
+		if (size == 0 || mq->ring == 0 || mq->seqno == NULL) {
+			/* what was made so far given back */
+			for (unsigned int k = 0; k <= q; k++) {
+				vm_kernel_free((unsigned)vm, grp->q[k].ring_va, grp->q[k].ring, grp->q[k].ring_size);
+				vm_kernel_free((unsigned)vm, grp->q[k].seqno_va, (vm_offset_t)grp->q[k].seqno, GPU_PAGE);
+			}
 			return -1;
 		}
 		mq->ring_size = size;
-		grp->user_va[q] = mcu_va;
-		mq->seen = mq->submitted;       /* (a group's slot used again: nothing outstanding on it) */
-		bzero(mq->lost, sizeof(mq->lost));
-		mq->lost_next = 0;
-		*mq->seqno = mq->submitted;     /* (the ring adds 1 a submission to it) */
+		*mq->seqno = 0;
 		to_gpu((void *)mq->seqno, 8);
-		mq->user_in = (volatile uint32_t *)user;
-		mq->user_out = (volatile uint32_t *)(user + GPU_PAGE);
-		/* the stream's first words: REQ_RESOURCE compute, fragment, tiler and IDVS, held from its start (a program's
-		 * own request, made after the group had been idle, never took effect: its first render pass drew, and every
-		 * later submission's IDVS bound nothing); and 0xaaaa stored into the sequence page's second word (a check that
-		 * the group's writes arrive: akita_mali_debug prints it) */
-		{
-			uint64_t *r = (uint64_t *)mq->ring;
-
-			r[0] = 34ULL << 56 | 0xf;
-			r[1] = 1ULL << 56 | 92ULL << 48 | (mq->seqno_va + 8);
-			r[2] = 2ULL << 56 | 94ULL << 48 | 0xaaaa;
-			r[3] = 21ULL << 56 | 94ULL << 48 | 92ULL << 40 | 0x1ULL << 16;
-			mq->insert = 64;                /* (the rest of the line NOPs: zero) */
-			to_gpu((void *)mq->ring, 64);
-		}
-		mq->user_in[CS_INSERT / 4] = (uint32_t)mq->insert;
-		to_gpu(mq->user_in, 16);
-		stream_blocks(gc, q, &sin, &sout);
-		if (sin == NULL || sout == NULL) {
-			return -1;
-		}
-		from_gpu(sin, 128);
-		from_gpu(sout, 128);
-		sin[CS_BASE_LO / 4] = (uint32_t)mq->ring_va;
-		sin[CS_BASE_HI / 4] = (uint32_t)(mq->ring_va >> 32);
-		sin[CS_SIZE / 4] = size;
-		sin[CS_USER_INPUT_LO / 4] = mcu_va;
-		sin[CS_USER_INPUT_HI / 4] = 0;
-		sin[CS_USER_OUTPUT_LO / 4] = mcu_va + GPU_PAGE;
-		sin[CS_USER_OUTPUT_HI / 4] = 0;
-		sin[CS_CONFIG / 4] = (1 + g) << 8 | 1;
-		sin[CS_ACK_IRQ_MASK / 4] = 0xffffffff;
-		sin[CS_REQ / 4] = (sout[CS_ACK / 4] & 0xc0000000u) | CS_REQ_IDLE_BITS | CS_STATE_START;
-		to_gpu(sin, 128);
 	}
-	as_update((unsigned int)vm);            /* the rings and pages just mapped into it */
-	for (uint64_t m = shaders; m; m &= m - 1) {
-		compute++;
-	}
-	from_gpu(gout, 64);
-	gin[CSG_DB_REQ / 4] = gout[CSG_DB_ACK / 4] ^ ((1u << nqueues) - 1);
-	gin[CSG_ALLOW_COMPUTE_LO / 4] = (uint32_t)shaders;
-	gin[CSG_ALLOW_COMPUTE_HI / 4] = (uint32_t)(shaders >> 32);
-	gin[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
-	gin[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
-	gin[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
-	/* SEVERAL GROUPS (TODO 16): each its own CSG priority, 15 - its slot (panthor gives every slot a priority of its
-	 * own). With the same one (every hakios-metal client asks 1) the firmware handed the endpoints out in pieces -- one
-	 * group the compute ones, another the fragment and tiler -- and each waited for the other's for good (CS blocked
-	 * on resources, 0x5). The first group, backboardd's as a rule, ranks first. (The client's PRIORITY is kept.) */
-	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(15 - g) << 28;
-	gin[CSG_EP_REQ_HI / 4] = 0;
-	gin[CSG_CONFIG / 4] = (uint32_t)vm;     /* the group's address space is its VM's slot */
-	gin[CSG_SUSPEND_BUF_LO / 4] = suspend_va;
-	gin[CSG_SUSPEND_BUF_HI / 4] = 0;
-	gin[CSG_ACK_IRQ_MASK / 4] = 0xffffffff;
-	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u) | CSG_STATE_START;
-	to_gpu(gin, 128);
-	from_gpu(glb_out, 64);
-	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
-	to_gpu(glb_in, 64);
-	ring_doorbell(0);
-	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
-		printf("mali: group %u did not start (CSG_REQ 0x%x, ACK 0x%x)\n", g, gin[CSG_REQ / 4], gout[CSG_ACK / 4]);
-		faults("a group's start");
-		return -1;
-	}
+	as_update((unsigned int)vm);            /* the rings and pages just mapped into it (if it has an address space) */
 	grp->used = true;
-	grp->vm = (unsigned)vm;
 	grp->queues = nqueues;
-	grp->suspend_va = suspend_va;
 	grp->priority = priority;
+	grp->last_used = mach_absolute_time();
 	mali_irq_attach();
-	printf("mali: group %u started in address space %d, %u queue(s)\n", g, vm, nqueues);
+	printf("mali: group %u made in VM %d, %u queue(s)\n", g, vm, nqueues);
 	return (int)g;
 }
 
@@ -1931,22 +2228,25 @@ void akita_mali_group_free(int g);
 void
 akita_mali_group_free(int g)
 {
-	volatile uint32_t *gin, *gout;
-	uint32_t *gc;
+	struct mali_group *grp;
 
 	if (g < 0 || g >= MAX_GROUPS || !groups[g].used) {
 		return;
 	}
-	group_blocks((unsigned)g, &gin, &gout, &gc);
-	from_gpu(gout, 64);
-	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u);            /* TERMINATE */
-	to_gpu(gin, 64);
-	from_gpu(glb_out, 64);
-	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
-	to_gpu(glb_in, 64);
-	ring_doorbell(0);
-	acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200);
-	groups[g].used = false;         /* (its memory stays: given again with the next group's) */
+	grp = &groups[g];
+	if (grp->slot >= 0) {
+		slot_stop((unsigned int)grp->slot);
+		slot_group[grp->slot] = 0;
+		grp->slot = -1;
+	}
+	grp->used = false;
+	/* (11-12) its rings and sequence pages given back: they stayed for good, a set a client that ever was */
+	for (unsigned int q = 0; q < grp->queues; q++) {
+		vm_kernel_free(grp->vm, grp->q[q].ring_va, grp->q[q].ring, grp->q[q].ring_size);
+		vm_kernel_free(grp->vm, grp->q[q].seqno_va, (vm_offset_t)grp->q[q].seqno, GPU_PAGE);
+		grp->q[q].ring = 0;
+		grp->q[q].seqno = NULL;
+	}
 	busy_update();
 }
 
@@ -2025,6 +2325,8 @@ mali_ack_events(unsigned int g)
  * A program's stream into a queue: the ring's instructions (CALL it; WAIT; store the new sequence number), then the
  * group woken as step 9 found it must be. The sequence number (1, 2, ...) or 0 if there is no room or no queue.
  */
+static void mmu_faults(void);
+static void tiler_oom(void);
 uint64_t akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size);
 uint64_t
 akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
@@ -2033,11 +2335,29 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 	volatile uint32_t *gin, *gout;
 	uint32_t *gc;
 	uint64_t cmd[24];
-	unsigned int n = 0;
+	unsigned int n = 0, s;
 
 	if (g < 0 || g >= MAX_GROUPS || !groups[g].used || q >= groups[g].queues || (size & 7) || size == 0) {
 		return 0;
 	}
+	/* A SLOT FOR THE GROUP, if it has none (its first work, or its slot went to another while it was idle): a free
+	 * one, or an idle group's; with every slot's group at work, waited for -- their work goes on meanwhile (the
+	 * heaps' and faults' events are looked after here: the waiters that do it otherwise stand at HakiosGPU's lock) */
+	uint64_t bind_deadline;
+
+	clock_interval_to_deadline(3000, 1000 * 1000, &bind_deadline);
+	while (!group_bind((unsigned int)g)) {
+		if (mach_absolute_time() >= bind_deadline) {
+			printf("mali: group %d: no slot in 3 s (every slot's group at work, or it did not start)\n", g);
+			return 0;
+		}
+		flush_gpu();
+		mmu_faults();
+		tiler_oom();
+		delay_for_interval(1, 1000 * 1000);
+	}
+	s = (unsigned int)groups[g].slot;
+	groups[g].last_used = vms[groups[g].vm].last_used = mach_absolute_time();
 	mq = &groups[g].q[q];
 	from_gpu(mq->user_out, 16);
 	if (mq->insert + sizeof(cmd) - *(volatile uint64_t *)mq->user_out > mq->ring_size) {
@@ -2092,7 +2412,7 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 	to_gpu(mq->user_in, 16);
 	/* the wake (step 9): caches, the group's idle event acked and its endpoints asked for again, the doorbells */
 	flush_gpu();
-	group_blocks((unsigned)g, &gin, &gout, &gc);
+	group_blocks(s, &gin, &gout, &gc);
 	from_gpu(gout, 64);
 	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~CSG_REQ_IDLE) | (gout[CSG_ACK / 4] & CSG_REQ_IDLE);
 	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~CSG_REQ_EP_CFG) | ((gout[CSG_ACK / 4] ^ CSG_REQ_EP_CFG) & CSG_REQ_EP_CFG);
@@ -2101,10 +2421,10 @@ akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size)
 	to_gpu(gin, 64);
 	wr(JOB_IRQ_CLEAR, 0xffffffff);
 	from_gpu(glb_out, 64);
-	glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << g)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << g)) & (1u << g));
+	glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << s)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << s)) & (1u << s));
 	to_gpu(glb_in, 64);
 	ring_doorbell(0);
-	ring_doorbell(1 + (unsigned)g);
+	ring_doorbell(1 + s);
 	return mq->submitted;
 }
 
@@ -2176,30 +2496,22 @@ static void
 group_restart(unsigned int g)
 {
 	struct mali_group *grp = &groups[g];
-	volatile uint32_t *gin, *gout, *sin, *sout;
-	uint32_t *gc;
-	uint64_t shaders = rd64(SHADER_PRESENT);
-	unsigned int compute = 0;
+	unsigned int s;
 
+	if (grp->slot < 0) {
+		return;                         /* (not in a slot: nothing of it is with the firmware) */
+	}
+	s = (unsigned int)grp->slot;
 	grp->restarts++;
-	group_blocks(g, &gin, &gout, &gc);
-	from_gpu(gout, 64);
-	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u);            /* TERMINATE */
-	to_gpu(gin, 64);
-	from_gpu(glb_out, 64);
-	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
-	to_gpu(glb_in, 64);
-	ring_doorbell(0);
-	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
-		printf("mali: group %u: not ended for its restart (CSG_REQ 0x%x, ACK 0x%x)\n", g, gin[CSG_REQ / 4], gout[CSG_ACK / 4]);
+	if (!slot_stop(s)) {
+		printf("mali: group %u: not ended for its restart (slot %u)\n", g, s);
 	}
 	as_update(grp->vm);             /* (its address space back on, if a page fault turned it off: mmu_faults) */
 	for (unsigned int q = 0; q < grp->queues; q++) {
 		struct mali_queue *mq = &grp->q[q];
-		uint64_t *r = (uint64_t *)mq->ring;
 
-		/* everything it was given counted done; the ring from its start again, as group_new left it -- what the GPU
-		 * had not reached is kept as lost (the faulting submission and those queued behind it) */
+		/* everything it was given counted done (slot_start); what the GPU had not reached is kept as lost (the
+		 * faulting submission and those queued behind it) */
 		from_gpu((void *)mq->seqno, 8);
 		if (*mq->seqno < mq->submitted) {
 			mq->lost[mq->lost_next % LOST_RANGES].after = *mq->seqno;
@@ -2208,66 +2520,16 @@ group_restart(unsigned int g)
 			printf("mali: group %u queue %u: submissions %llu..%llu are lost with the restart\n", g, q, *mq->seqno + 1,
 			    mq->submitted);
 		}
-		*mq->seqno = mq->submitted;
-		to_gpu((void *)mq->seqno, 8);
-		mq->seen = mq->submitted;
-		bzero((void *)mq->ring, mq->ring_size);
-		r[0] = 34ULL << 56 | 0xf;
-		/* the queue's tiler heap again (HEAP_SET: hakios-metal sets it once, in its first command buffer; a restarted
-		 * queue without it ended its next draw in an invalid instruction fault, 0x49) -- the VM's first heap */
-		for (int h = 0; h < MAX_HEAPS; h++) {
-			if (heaps[h].used && heaps[h].vm == grp->vm) {
-				r[1] = 1ULL << 56 | 0ULL << 48 | (heaps[h].ctx_va & 0xffffffffffffULL);     /* MOVE48 r0 <- context */
-				r[2] = 48ULL << 56;                                                      /* HEAP_SET */
-				break;
-			}
+	}
+	if (!slot_start(s, g)) {
+		/* (the slot is given up: the group takes one again at its next submission) */
+		slot_group[s] = 0;
+		grp->slot = -1;
+		for (unsigned int q = 0; q < grp->queues; q++) {
+			*grp->q[q].seqno = grp->q[q].submitted;
+			to_gpu((void *)grp->q[q].seqno, 8);
+			grp->q[q].seen = grp->q[q].submitted;
 		}
-		mq->insert = 64;
-		to_gpu((void *)mq->ring, mq->ring_size);
-		bzero((void *)mq->user_in, 16);
-		bzero((void *)mq->user_out, 16);
-		mq->user_in[CS_INSERT / 4] = (uint32_t)mq->insert;
-		to_gpu(mq->user_in, 16);
-		to_gpu(mq->user_out, 16);
-		stream_blocks(gc, q, &sin, &sout);
-		from_gpu(sin, 128);
-		from_gpu(sout, 128);
-		sin[CS_BASE_LO / 4] = (uint32_t)mq->ring_va;
-		sin[CS_BASE_HI / 4] = (uint32_t)(mq->ring_va >> 32);
-		sin[CS_SIZE / 4] = mq->ring_size;
-		sin[CS_USER_INPUT_LO / 4] = grp->user_va[q];
-		sin[CS_USER_INPUT_HI / 4] = 0;
-		sin[CS_USER_OUTPUT_LO / 4] = grp->user_va[q] + GPU_PAGE;
-		sin[CS_USER_OUTPUT_HI / 4] = 0;
-		sin[CS_CONFIG / 4] = (1 + g) << 8 | 1;
-		sin[CS_ACK_IRQ_MASK / 4] = 0xffffffff;
-		sin[CS_REQ / 4] = (sout[CS_ACK / 4] & 0xc0000000u) | CS_REQ_IDLE_BITS | CS_STATE_START;
-		to_gpu(sin, 128);
-	}
-	for (uint64_t m = shaders; m; m &= m - 1) {
-		compute++;
-	}
-	from_gpu(gout, 64);
-	gin[CSG_DB_REQ / 4] = gout[CSG_DB_ACK / 4] ^ ((1u << grp->queues) - 1);
-	gin[CSG_ALLOW_COMPUTE_LO / 4] = (uint32_t)shaders;
-	gin[CSG_ALLOW_COMPUTE_HI / 4] = (uint32_t)(shaders >> 32);
-	gin[CSG_ALLOW_FRAGMENT_LO / 4] = (uint32_t)shaders;
-	gin[CSG_ALLOW_FRAGMENT_HI / 4] = (uint32_t)(shaders >> 32);
-	gin[CSG_ALLOW_OTHER / 4] = (uint32_t)rd64(TILER_PRESENT);
-	gin[CSG_EP_REQ_LO / 4] = compute | compute << 8 | 1u << 16 | (uint32_t)(15 - (grp - groups)) << 28;   /* (as group_new) */
-	gin[CSG_EP_REQ_HI / 4] = 0;
-	gin[CSG_CONFIG / 4] = grp->vm;
-	gin[CSG_SUSPEND_BUF_LO / 4] = grp->suspend_va;
-	gin[CSG_SUSPEND_BUF_HI / 4] = 0;
-	gin[CSG_ACK_IRQ_MASK / 4] = 0xffffffff;
-	gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~7u) | CSG_STATE_START;
-	to_gpu(gin, 128);
-	from_gpu(glb_out, 64);
-	glb_in[GLB_DB_REQ / 4] = glb_out[GLB_DB_ACK / 4] ^ (1u << g);
-	to_gpu(glb_in, 64);
-	ring_doorbell(0);
-	if (!acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 7, 200)) {
-		printf("mali: group %u did not start again (CSG_REQ 0x%x, ACK 0x%x)\n", g, gin[CSG_REQ / 4], gout[CSG_ACK / 4]);
 		return;
 	}
 	wr(MMU_IRQ_CLEAR, 0xffffffff);
@@ -2280,8 +2542,6 @@ group_restart(unsigned int g)
  * timeout). As panthor: the fault cleared and the address space turned off (unmapped), so that what stalled fails;
  * then the groups on it restarted (group_restart turns it on again).
  */
-#define TRANSCFG_UNMAPPED       1ULL
-
 static void
 mmu_faults(void)
 {
@@ -2290,25 +2550,24 @@ mmu_faults(void)
 	if (raw == 0) {
 		return;
 	}
-	for (unsigned int vm = 1; vm < MAX_VMS; vm++) {
-		uint32_t base = AS0 + vm * 0x40, status = rd(base + AS_FAULTSTATUS);
+	for (unsigned int as = 1; as < AS_SLOTS; as++) {
+		uint32_t base = AS0 + as * 0x40, status = rd(base + AS_FAULTSTATUS);
 		/* page faults only: AS1's bus fault bit comes back at once after every clear, from start-up on, and the fault
 		 * status keeps the last page fault's -- acting on it restarted the group in a loop */
-		uint32_t bits = 1u << vm;
+		uint32_t bits = 1u << as;
+		unsigned int vm = as_vm[as];
 		bool any = false;
 
-		if (!vms[vm].used || !(raw & bits)) {
+		if (vm == 0 || !vms[vm].used || !(raw & bits)) {
 			continue;
 		}
-		printf("mali: address space %u: %s fault 0x%x at 0x%llx; it is turned off and its groups restart\n", vm,
+		printf("mali: address space %u (VM %u): %s fault 0x%x at 0x%llx; it is turned off and its groups restart\n", as, vm,
 		    "page", status, rd64(base + AS_FAULTADDRESS));
 		faults("a GPU page fault");
 		wr(MMU_IRQ_CLEAR, bits);
-		wr64(base + AS_TRANSCFG, TRANSCFG_UNMAPPED);
-		wr(base + AS_COMMAND, AS_CMD_UPDATE);
-		wait_for(base + AS_STATUS, AS_STATUS_ACTIVE, 0, 100000);
+		as_off(as);
 		for (unsigned int g = 0; g < MAX_GROUPS; g++) {
-			if (groups[g].used && groups[g].vm == vm) {
+			if (groups[g].used && groups[g].vm == vm && groups[g].slot >= 0) {
 				group_restart(g);
 				any = true;
 			}
@@ -2334,15 +2593,17 @@ tiler_oom(void)
 		PE_parse_boot_argn("mali_heap_say", &say, sizeof(say));
 		mali_heap_say = say;
 	}
-	for (unsigned int g = 0; g < MAX_GROUPS; g++) {
+	for (unsigned int s = 0; s < CSG_SLOTS; s++) {
 		volatile uint32_t *gin, *gout, *sin, *sout;
 		uint32_t *gc;
 		bool rang = false;
+		unsigned int g;
 
-		if (!groups[g].used) {
+		if (slot_group[s] == 0) {
 			continue;
 		}
-		group_blocks(g, &gin, &gout, &gc);
+		g = slot_group[s] - 1;          /* (the group that has the slot) */
+		group_blocks(s, &gin, &gout, &gc);
 		for (unsigned int q = 0; q < groups[g].queues; q++) {
 			stream_blocks(gc, q, &sin, &sout);
 			from_gpu(sout, 256);
@@ -2394,10 +2655,10 @@ tiler_oom(void)
 			gin[CSG_IRQ_ACK / 4] = gout[CSG_IRQ_REQ / 4];
 			to_gpu(gin, 64);
 			from_gpu(glb_out, 64);
-			glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << g)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << g)) & (1u << g));
+			glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << s)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << s)) & (1u << s));
 			to_gpu(glb_in, 64);
 			ring_doorbell(0);
-			ring_doorbell(1 + g);
+			ring_doorbell(1 + s);
 		}
 	}
 	busy = 0;
@@ -2428,6 +2689,13 @@ akita_mali_reached(int g, unsigned int q)
 	if (g < 0 || g >= MAX_GROUPS || !groups[g].used || q >= groups[g].queues) {
 		return 0;
 	}
+	if (groups[g].slot < 0) {
+		/* (in no slot: it was idle when its slot went, or has had no work yet -- its page says where it stands) */
+		from_gpu(groups[g].q[q].seqno, 8);
+		groups[g].q[q].seen = *groups[g].q[q].seqno;
+		busy_update();
+		return groups[g].q[q].seen;
+	}
 	if (mali_irq_on) {
 		/* nothing new since the last look -- no interrupt (every event raises one), and the page (read past the CPU's
 		 * cache, possibly behind the GPU's but never ahead) already says all done: no cache flush, no events. The
@@ -2447,9 +2715,9 @@ akita_mali_reached(int g, unsigned int q)
 	mmu_faults();
 	tiler_oom();
 	if (mali_irq_on) {
-		for (unsigned int i = 0; i < MAX_GROUPS; i++) {
-			if (groups[i].used) {
-				mali_ack_events(i);
+		for (unsigned int i = 0; i < CSG_SLOTS; i++) {
+			if (slot_group[i] != 0) {
+				mali_ack_events(i);     /* (a slot's events) */
 			}
 		}
 	}
@@ -2499,19 +2767,22 @@ void akita_mali_debug(void);
 void
 akita_mali_debug(void)
 {
-	for (unsigned int g = 0; g < MAX_GROUPS; g++) {
+	for (unsigned int s = 0; s < CSG_SLOTS; s++) {
 		volatile uint32_t *gin, *gout, *sin, *sout;
 		uint32_t *gc;
+		unsigned int g;
 
-		if (!groups[g].used) {
+		if (slot_group[s] == 0) {
 			continue;
 		}
-		group_blocks(g, &gin, &gout, &gc);
+		g = slot_group[s] - 1;          /* (the groups in slots: the others have nothing with the firmware) */
+		printf("mali: slot %u: group %u, VM %u in address space %u\n", s, g, groups[g].vm, vms[groups[g].vm].as);
+		group_blocks(s, &gin, &gout, &gc);
 		from_gpu(gout, 64);
 		gin[CSG_REQ / 4] = (gin[CSG_REQ / 4] & ~(1u << 5)) | ((gout[CSG_ACK / 4] ^ (1u << 5)) & (1u << 5));
 		to_gpu(gin, 64);
 		from_gpu(glb_out, 64);
-		glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << g)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << g)) & (1u << g));
+		glb_in[GLB_DB_REQ / 4] = (glb_in[GLB_DB_REQ / 4] & ~(1u << s)) | ((glb_out[GLB_DB_ACK / 4] ^ (1u << s)) & (1u << s));
 		to_gpu(glb_in, 64);
 		ring_doorbell(0);
 		acked(&gin[CSG_REQ / 4], &gout[CSG_ACK / 4], 1u << 5, 100);
