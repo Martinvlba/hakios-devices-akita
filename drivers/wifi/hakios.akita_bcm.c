@@ -1756,6 +1756,58 @@ blob_load(const char *file, const char *var, const char *status_var)
 	return err != 0 ? err : (int)status;
 }
 
+/*
+ * (11-12, TODO 35e, a test) wifi_msi=1: the chip's MSI enabled in its configuration space (capability 5), its
+ * address a word of our memory -- an interrupt is then just a write of the data there, counted by en0's thread
+ * (msi_seen), no handler needed. Android's host takes the chip's interrupts as MSIs; this one polls with MSI off
+ * (INTx): does the firmware hold received frames for a host that cannot be interrupted?
+ */
+static volatile uint32_t *msi_word;
+static unsigned msi_seen;
+
+static void
+msi_setup(void)
+{
+	uint32_t want = 0;
+	static uint64_t pa;
+
+	if (!PE_parse_boot_argn("wifi_msi", &want, sizeof(want)) || want == 0) {
+		return;
+	}
+	uint32_t at = rd(cfg, 0x34) & 0xfc;
+	for (unsigned hops = 0; at >= 0x40 && at < 0x100 && hops < 32; hops++) {
+		uint32_t head = rd(cfg, at);
+
+		if ((head & 0xff) == 0x05) {
+			uint16_t control = (uint16_t)(head >> 16);
+			bool wide = (control & 0x80) != 0;
+
+			if (msi_word == NULL) {
+				msi_word = (volatile uint32_t *)dma_piece(4096, &pa);
+			}
+			if (msi_word == NULL) {
+				printf("wifi: 5: MSI: no memory\n");
+				return;
+			}
+			*msi_word = 0;
+			wr(cfg, at + 4, (uint32_t)pa);
+			if (wide) {
+				wr(cfg, at + 8, (uint32_t)(pa >> 32));
+				wr(cfg, at + 12, 0x5a5a);
+			} else {
+				wr(cfg, at + 8, 0x5a5a);
+			}
+			wr(cfg, at, (head & 0xff8fffffu) | (1u << 16));        /* enable, one vector */
+			wr(cfg, 0x04, rd(cfg, 0x04) | (1u << 10) | (1u << 2));  /* INTx off; bus master on */
+			printf("wifi: 5: MSI enabled at 0x%02x (control 0x%04x -> 0x%04x, %s), its writes to 0x%llx\n", at, control,
+			    rd(cfg, at) >> 16, wide ? "64-bit" : "32-bit", pa);
+			return;
+		}
+		at = (head >> 8) & 0xfc;
+	}
+	printf("wifi: 5: MSI: no capability 5 in the chip's configuration space\n");
+}
+
 /* step 5: the rings set up, the chip told the host is ready, buffers posted for answers and events */
 static bool
 rings_up(uint32_t shared)
@@ -1923,6 +1975,7 @@ rings_up(uint32_t shared)
 			printf("wifi: 5: interrupt mask as found: 0x%08x\n", pcie_rd(PCIE_MAILBOX_MASK));
 		}
 	}
+	msi_setup();
 	if (flags & SHARED_FLAG_HOSTRDY) {
 		pcie_wr(PCIE_H2D_MAILBOX_1, 1);
 		printf("wifi: 5: host ready (doorbell 1)\n");
@@ -2452,6 +2505,57 @@ intclear_masked(void)
 	return m;
 }
 
+/*
+ * wifi_dumps=a,b,c (a diagnosis, 11-12, TODO 35e): the firmware's own "dump" iovar for each named section ("wl dump
+ * NAME": its state as text), once, 60 s after en0 carries frames -- printed line by line. Called without the lock.
+ */
+static void
+dumps_once(void)
+{
+	static char names[96];
+	static int state;                       /* 0 not read, 1 waiting, 2 done */
+	static uint64_t live_at;
+	static uint8_t out[4096];
+
+	if (state == 0) {
+		state = PE_parse_boot_arg_str("wifi_dumps", names, sizeof(names)) && names[0] ? 1 : 2;
+		live_at = mach_absolute_time();
+	}
+	if (state != 1 || fw_halted || recovering || micros_since(live_at) < 120000000ull) {
+		return;
+	}
+	state = 2;
+	for (char *name = names; *name != 0;) {
+		char *end = name;
+		uint8_t req[64];
+
+		while (*end != 0 && *end != ',') {
+			end++;
+		}
+		size_t n = (size_t)(end - name);
+		if (n > 0 && n < 40) {
+			bzero(req, sizeof(req));
+			memcpy(req, "dump", 5);
+			memcpy(req + 5, name, n);
+			bzero(out, sizeof(out));
+			int err = bcm_ioctl(WLC_GET_VAR, req, sizeof(out), out, sizeof(out) - 1);
+			printf("wifi: dump %.*s: %d\n", (int)n, name, err);
+			if (err == 0) {
+				char *line = (char *)out;
+				for (unsigned k = 0; k < 120 && *line != 0; k++) {
+					char *nl = line;
+					while (*nl != 0 && *nl != '\n') {
+						nl++;
+					}
+					printf("wifi: dump %.*s| %.*s\n", (int)n, name, (int)(nl - line > 200 ? 200 : nl - line), line);
+					line = *nl ? nl + 1 : nl;
+				}
+			}
+		}
+		name = *end ? end + 1 : end;
+	}
+}
+
 /* the interface's thread, every 2-10 ms: the completion rings (events, received frames, sent ones); a line every 30 s */
 static unsigned
 en0_poll(void)
@@ -2496,6 +2600,12 @@ en0_poll(void)
 				st = 0;
 			}
 		}
+	}
+	if (msi_word != NULL && *msi_word != 0) {
+		if (msi_seen++ < 3) {
+			printf("wifi: en0: an MSI (0x%x)\n", *msi_word);
+		}
+		*msi_word = 0;
 	}
 	n = d2h_ctrl_poll();
 	if (intclear_masked()) {
@@ -2596,9 +2706,12 @@ en0_poll(void)
 	}
 	if (micros_since(said_at) > 30000000) {
 		said_at = mach_absolute_time();
-		printf("wifi: en0: %u frames sent (%u done, %u dropped, %u out), %u received (%u bytes); link %s, keys %s\n",
+		printf("wifi: en0: %u frames sent (%u done, %u dropped, %u out), %u received (%u bytes); link %s, keys %s%s\n",
 		    tx.sent, tx.done, tx.dropped, tx.outstanding, mb.rx_frames, mb.rx_bytes, link_up ? "up" : "down",
-		    keyed ? "set" : "not set");
+		    keyed ? "set" : "not set", msi_word != NULL ? " (MSIs counted)" : "");
+		if (msi_word != NULL) {
+			printf("wifi: en0: %u MSIs so far\n", msi_seen);
+		}
 		if (!fw_halted && mb.tcm_d2h_w != 0) {
 			/*
 			 * (11-12, TODO 35e: since the EDL ring, ~10 frames a minute come in where 400 did before -- iOS "offline":
@@ -2623,6 +2736,7 @@ en0_poll(void)
 	}
 	lck_mtx_unlock(wl_lock);
 	counters_watch();
+	dumps_once();
 	return n;
 }
 
