@@ -737,6 +737,8 @@ static struct {
 	uint32_t ioctl_buf;             /* the request id of the buffer holding the answer */
 	uint32_t shared, h2d_mb, d2h_mb, rx_dataoffset;
 	uint32_t tcm_h2d_r;             /* the chip's own array of H2D read indices (4 bytes apart) */
+	uint32_t tcm_d2h_w;             /* ... and of its D2H write indices (what it has written, whatever it DMAed to us) */
+	uint32_t tcm_d2h_r;             /* ... and of the D2H read indices (ours, as far as it has fetched them?) */
 	unsigned events;
 	uint8_t *rx_buf;                /* RX_BUFS data buffers of RX_BUF_SIZE in one piece of their own (uncached view) */
 	uint64_t rx_buf_pa;
@@ -1093,6 +1095,27 @@ event_handle(const uint8_t *frame, uint32_t length)
 		break;
 	case EV_COUNTRY_CODE_CHANGED: name = " (country code changed)"; break;
 	case EV_IF: name = " (interface)"; break;
+	case 75: {
+		/*
+		 * WLC_E_ACTION_FRAME_RX: an 802.11 action frame the firmware hands up (wl_event_rx_frame_data_t, then the frame
+		 * from its 802.11 header). (11-12, TODO 35e: three, 3 s apart, right after the join -- and frames for the host
+		 * held until ~25 s later or for minutes: which kind are they? 3 block ack, 8 SA query, 5 radio measurement, 10
+		 * WNM.) The first ten said, all of them.
+		 */
+		static unsigned said;
+		char hex[3 * 72 + 1];
+		unsigned at = 0;
+
+		name = " (action frame received)";
+		hex[0] = 0;
+		for (uint32_t i = 0; i < datalen && i < 72; i++) {
+			at += (unsigned)snprintf(hex + at, sizeof(hex) - at, " %02x", data[i]);
+		}
+		if (said++ < 10) {
+			printf("wifi: %u: action frame:%s\n", step, hex);
+		}
+		break;
+	}
 	}
 	printf("wifi: %u: event %u%s, status %u, reason %u, flags 0x%x, %u bytes\n", step, type, name, status, reason, flags,
 	    datalen);
@@ -1343,10 +1366,15 @@ info_poll(void)
 			return 0;
 		}
 		while (info.r != w) {
-			if (info.mode == 4 && info.completions < 10) {
+			if (info.mode == 4 && (info.completions < 6 || (info.completions >= 40 && info.completions < 70))) {
+				/* (wifi_inforing=4: what EDL items hold -- the first few, and some after the join: 48 bytes each) */
 				const uint8_t *m = edl_ring + (uint32_t)info.r * EDL_ITEM_SIZE;
+				char hex[48 * 3 + 1];
 
-				printf("wifi: edl: item %u: %02x %02x %02x %02x len %u\n", info.r, m[0], m[1], m[2], m[3], get16(m, 12));
+				for (unsigned i = 0; i < 48; i++) {
+					snprintf(hex + 3 * i, 4, " %02x", m[i]);
+				}
+				printf("wifi: edl: item %u (#%u):%s\n", info.r, info.completions, hex);
 			}
 			info.completions++;
 			info.r = (uint16_t)((info.r + 1) % EDL_ITEMS);
@@ -1720,6 +1748,8 @@ rings_up(uint32_t shared)
 	flags = mem_rd(shared + SHARED_FLAGS);
 	ringmem = mem_rd(ringinfo + 0);
 	mb.tcm_h2d_r = mem_rd(ringinfo + 8);
+	mb.tcm_d2h_w = mem_rd(ringinfo + 12);
+	mb.tcm_d2h_r = mem_rd(ringinfo + 16);
 	max_sub = mem_rd(ringinfo + 52) >> 16;          /* (max_tx_flowrings at +52, max_submission_queues +54) */
 	max_cpl = mem_rd(ringinfo + 56) & 0xffff;
 	ring_counts.max_sub = max_sub;
@@ -1855,6 +1885,22 @@ rings_up(uint32_t shared)
 	    ring_item_size[3], ring_items[4], ring_item_size[4]);
 
 	pcie_wr(PCIE_MAILBOX_INT, pcie_rd(PCIE_MAILBOX_INT));
+	{
+		/*
+		 * (11-12, TODO 35e, a test) wifi_intmask=N: the PCIe core's MailboxIntMask set to N -- bcmdhd's def_intmask for a
+		 * core of revision 64 or later is PCIE_MB_D2H_MB_MASK, 0xffff (the D2H doorbells; bit 0, D2H doorbell 0, is the
+		 * status the firmware sets after it puts work on the completion rings). This driver polls and has no
+		 * interrupt handler: left 0 the host looks like one with its interrupts off -- a host asleep?
+		 */
+		uint32_t intmask = ~0u;
+
+		if (PE_parse_boot_argn("wifi_intmask", &intmask, sizeof(intmask)) && intmask != ~0u) {
+			pcie_wr(PCIE_MAILBOX_MASK, intmask);
+			printf("wifi: 5: interrupt mask 0x%08x set (reads 0x%08x)\n", intmask, pcie_rd(PCIE_MAILBOX_MASK));
+		} else {
+			printf("wifi: 5: interrupt mask as found: 0x%08x\n", pcie_rd(PCIE_MAILBOX_MASK));
+		}
+	}
 	if (flags & SHARED_FLAG_HOSTRDY) {
 		pcie_wr(PCIE_H2D_MAILBOX_1, 1);
 		printf("wifi: 5: host ready (doorbell 1)\n");
@@ -1925,7 +1971,10 @@ scan_all(void)
 		void const *mac = NULL;
 		unsigned int size = 0;
 
-		if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+		uint32_t own = 1;               /* (wifi_mac=0, a test of TODO 35e: the chip's own address, en0 made at step 8) */
+
+		PE_parse_boot_argn("wifi_mac", &own, sizeof(own));
+		if (own != 0 && SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
 		    SecureDTGetProperty(chosen, "mac-address-wifi0", &mac, &size) == kSuccess && size == 6) {
 			const uint8_t *m = mac;
 
@@ -1933,6 +1982,32 @@ scan_all(void)
 			    m[0], m[5], iovar_set("cur_etheraddr", m, 6));
 		} else {
 			printf("wifi: 7: no mac-address-wifi0 in the device tree's /chosen: the chip's own address\n");
+		}
+	}
+	{
+		/*
+		 * (11-12, TODO 35e, a test) wifi_ampdurx=N: "ampdu_rx" N before the radio is up (0: no block-ack sessions taken
+		 * from the access point). With the EDL ring the firmware took in and decrypted ~1 frame a second after the join
+		 * (its counters) and handed the host none for minutes -- then, once, hundreds at a time: frames held somewhere,
+		 * released together; a reorder queue waiting on a hole is one such place.
+		 */
+		uint32_t ampdurx = ~0u;
+
+		if (PE_parse_boot_argn("wifi_ampdurx", &ampdurx, sizeof(ampdurx)) && ampdurx <= 1) {
+			printf("wifi: 7: \"ampdu_rx\" %u: %d\n", ampdurx, iovar_int("ampdu_rx", ampdurx));
+		}
+	}
+	{
+		/*
+		 * "bus:host_access" 1 right before WLC_UP, as Android does (its Kbuild has WLAN_ACCEL_BOOT: dhd_cfg80211.c's
+		 * wl_dongle_up; 0 again after WLC_DOWN): the host's memory there for the firmware to use. (11-12, TODO 35e: being
+		 * tested.) wifi_hostaccess=0: not said.
+		 */
+		uint32_t ha = 1;
+
+		PE_parse_boot_argn("wifi_hostaccess", &ha, sizeof(ha));
+		if (ha != 0) {
+			printf("wifi: 7: \"bus:host_access\" 1: %d\n", iovar_int("bus:host_access", 1));
 		}
 	}
 	printf("wifi: 7: \"mpc\" 0: %d; infrastructure: %d; up: %d\n", iovar_int("mpc", 0), cmd_int(20, 1), cmd_int(2, 1));
@@ -1943,6 +2018,22 @@ scan_all(void)
 
 		if (PE_parse_boot_argn("wifi_roamoff", &roamoff, sizeof(roamoff)) && roamoff) {
 			printf("wifi: 7: \"roam_off\" 1: %d\n", iovar_int("roam_off", 1));
+		}
+	}
+	{
+		/*
+		 * The radio's power saving (WLC_GET_PM 85 / WLC_SET_PM 86: 0 off, 1 PM_MAX -- awake for the DTIM beacons only, 2
+		 * PM_FAST -- awake while traffic flows; Android's dhd sets 2). Not set by this driver until 11-12: the firmware's
+		 * own default. (11-12, TODO 35e: after the join one frame comes in, then none for minutes while ~150 go out --
+		 * the chip's own rx completion index does not move: the firmware takes nothing in.) wifi_pm=N: N set, a test.
+		 */
+		uint32_t pm = ~0u, now = ~0u;
+		int got = bcm_ioctl(85, &now, sizeof(now), &now, sizeof(now));
+
+		if (PE_parse_boot_argn("wifi_pm", &pm, sizeof(pm)) && pm <= 2) {
+			printf("wifi: 7: power saving (PM) %u as found (%d); %u set: %d\n", now, got, pm, cmd_int(86, pm));
+		} else {
+			printf("wifi: 7: power saving (PM) %u as found (%d), left so\n", now, got);
 		}
 	}
 	err = iovar_get("scan_ver", &scan_ver, sizeof(scan_ver));
@@ -2285,6 +2376,60 @@ d2h_tx_poll(void)
 	return n;
 }
 
+/*
+ * wifi_counters=N (a diagnosis, 11-12, TODO 35e): every N seconds the firmware's own "counters" (wl_cnt_info_t: xtlvs, the
+ * WLC layer's wl_cnt_wlc_t at id 0x100, 32-bit words) -- what the radio took in and why it dropped it: no buffer, not
+ * decrypted, filtered. Called on en0's thread without the rings' lock (the ioctl takes it).
+ */
+static void
+counters_watch(void)
+{
+	static uint32_t every = ~0u;
+	static uint64_t at;
+	static uint8_t buf[4096];
+
+	if (every == ~0u) {
+		every = 0;
+		PE_parse_boot_argn("wifi_counters", &every, sizeof(every));
+	}
+	if (every == 0 || fw_halted || recovering || micros_since(at) < every * 1000000ull) {
+		return;
+	}
+	at = mach_absolute_time();
+	bzero(buf, sizeof(buf));
+	int err = iovar_get("counters", buf, sizeof(buf));
+	uint32_t datalen = get16(buf, 2), off = 4;
+
+	while (err == 0 && off + 4 <= 4 + datalen && off + 4 <= sizeof(buf)) {
+		uint32_t id = get16(buf, off), len = get16(buf, off + 2);
+
+		if (id == 0x100 && len >= 72 * 4 && off + 4 + len <= sizeof(buf)) {
+			const uint8_t *c = buf + off + 4;
+#define CNT(i) get32(c, 4 * (i))
+			printf("wifi: counters: tx %u (fail %u, retrans %u, nobuf %u); rx %u frames %u bytes, error %u, ctl %u, NOBUF %u, "
+			    "nondata %u, bad da %u, filter %u, overflow %u, frag %u, multi %u, crc %u, dup %u; UNDECRYPTED %u (ccmp %u), "
+			    "decrypted %u\n", CNT(0), CNT(50), CNT(2), CNT(7), CNT(15), CNT(16), CNT(17), CNT(18), CNT(19), CNT(20),
+			    CNT(29), CNT(30), CNT(31), CNT(57), CNT(58), CNT(59), CNT(53), CNT(61), CNT(67), CNT(71));
+#undef CNT
+			return;
+		}
+		off += 4 + ((len + 3) & ~3u);
+	}
+	printf("wifi: counters: %d, version %u, %u bytes: no WLC counters found\n", err, get16(buf, 0), datalen);
+}
+
+static bool intclear_masked_now;
+
+/* (wifi_intclear=2: whether this poll masked the chip's interrupts as bcmdhd's ISR does, to unmask after the rings) */
+static bool
+intclear_masked(void)
+{
+	bool m = intclear_masked_now;
+
+	intclear_masked_now = false;
+	return m;
+}
+
 /* the interface's thread, every 2-10 ms: the completion rings (events, received frames, sent ones); a line every 30 s */
 static unsigned
 en0_poll(void)
@@ -2296,7 +2441,44 @@ en0_poll(void)
 		return 0;                       /* (en0 from the start: the steps poll the rings themselves until step 8) */
 	}
 	lck_mtx_lock(wl_lock);
+	{
+		/*
+		 * The chip's interrupt status (PCIe core MailboxInt), answered as an interrupt handler would: read, written back
+		 * (11-12, TODO 35e, wifi_intclear=0: not). Without it the status set at the first doorbell stayed set for the
+		 * whole run -- and after the join the firmware handed up one frame, then none for minutes while it took in and
+		 * decrypted ~1 a second (its counters), until other traffic of its own (its event logs, the legacy way) pushed
+		 * them out; with the EDL ring, never.
+		 */
+		static uint32_t intclear = ~0u;
+		static unsigned cleared;
+
+		if (intclear == ~0u) {
+			intclear = 1;
+			PE_parse_boot_argn("wifi_intclear", &intclear, sizeof(intclear));
+		}
+		static uint32_t st;
+
+		st = 0;
+		if (intclear != 0 && !fw_halted) {
+			st = pcie_rd(PCIE_MAILBOX_INT);
+			if (st != 0 && st != ~0u) {
+				if (intclear == 2) {
+					pcie_wr(PCIE_MAILBOX_MASK, 0);  /* (2: bcmdhd's ISR -- mask off, status cleared, DPC, mask on) */
+					intclear_masked_now = true;
+				}
+				pcie_wr(PCIE_MAILBOX_INT, st);
+				if (cleared++ < 4 || (cleared & (cleared - 1)) == 0) {
+					printf("wifi: en0: the chip's interrupt status 0x%08x cleared (%u times)\n", st, cleared);
+				}
+			} else {
+				st = 0;
+			}
+		}
+	}
 	n = d2h_ctrl_poll();
+	if (intclear_masked()) {
+		pcie_wr(PCIE_MAILBOX_MASK, 0xffff);     /* (the DPC done: PCIE_MB_D2H_MB_MASK on again) */
+	}
 	{
 		/* the signal of the network joined, every 5 s (wifid's bars, RSSI) */
 		static uint64_t looked_at;
@@ -2355,6 +2537,26 @@ en0_poll(void)
 			}
 			printf("wifi: heap: in use %u, free %u, in use high-water %u\n", mem_rd(0x006e029c), mem_rd(0x006e02a8),
 			    mem_rd(0x006e0294));
+			{
+				/*
+				 * (11-12, TODO 35e) the firmware's rx completion ids (g_rxcplid_list, a pointer: max, avail, ... --
+				 * bcm_rxcplid_list_t): each frame handed up takes one until the firmware sees our read index pass its
+				 * completion (pciedev_freeup_rxcplid). Do they run out after the join? And our D2H read indices as
+				 * the chip's own array has them (ctrl, txcpl, rxcpl).
+				 */
+				uint32_t l = mem_rd(0x006e01b4), v[6] = { 0 };
+
+				if (l >= ram_base && l + 24 <= ram_base + ram_size) {
+					for (int i = 0; i < 6; i++) {
+						v[i] = mem_rd(l + 4 * i);
+					}
+				}
+				printf("wifi: rxcplids at 0x%08x: %08x %08x %08x %08x %08x %08x; the chip's D2H read indices %u %u %u "
+				    "(ours %u %u %u)\n", l, v[0], v[1], v[2], v[3], v[4], v[5],
+				    mb.tcm_d2h_r ? mem_rd(mb.tcm_d2h_r + 0) & 0xffff : 0, mb.tcm_d2h_r ? mem_rd(mb.tcm_d2h_r + 4) & 0xffff : 0,
+				    mb.tcm_d2h_r ? mem_rd(mb.tcm_d2h_r + 8) & 0xffff : 0, mb.r[RING_D2H_CTRL], mb.r[RING_D2H_TXCPL],
+				    mb.r[RING_D2H_RXCPL]);
+			}
 			/* every common ring's indices as the chip leaves them in host memory (and ours): where do frames go? */
 			printf("wifi: rings: D2H write ctrl %u txcpl %u rxcpl %u (+%u), ours %u %u %u; H2D read ctrl %u rxpost %u flow %u, "
 			    "ours %u %u %u; rx posted %u, rx bad %u; debug info %u back (%u bytes)\n", mb.idx[mb.d2h_w + 0], mb.idx[mb.d2h_w + 1], mb.idx[mb.d2h_w + 2],
@@ -2373,8 +2575,30 @@ en0_poll(void)
 		printf("wifi: en0: %u frames sent (%u done, %u dropped, %u out), %u received (%u bytes); link %s, keys %s\n",
 		    tx.sent, tx.done, tx.dropped, tx.outstanding, mb.rx_frames, mb.rx_bytes, link_up ? "up" : "down",
 		    keyed ? "set" : "not set");
+		if (!fw_halted && mb.tcm_d2h_w != 0) {
+			/*
+			 * (11-12, TODO 35e: since the EDL ring, ~10 frames a minute come in where 400 did before -- iOS "offline":
+			 * no ARP answer, no DNS. Whether the chip has written rx completions it has not DMAed the index of: its
+			 * own write index of the rx completion ring beside the copy in our memory; the rx post ring likewise.)
+			 */
+			char types[8 * 16];
+			unsigned at = 0;
+
+			types[0] = 0;
+			for (unsigned i = 0; i < 8 && mb.rx_type_count[i] != 0; i++) {
+				at += (unsigned)snprintf(types + at, sizeof(types) - at, " 0x%04x:%u", mb.rx_types[i], mb.rx_type_count[i]);
+			}
+			printf("wifi: en0: rx completions: the chip's write index %u, its copy here %u, ours read %u; rx post: "
+			    "written %u, read %u (the chip's own %u); %u posted, %u bad; ctrl %u/%u; by ethertype:%s\n",
+			    mem_rd(mb.tcm_d2h_w + 4 * (RING_D2H_RXCPL - 2)) & 0xffff, mb.idx[mb.d2h_w + (RING_D2H_RXCPL - 2)],
+			    mb.r[RING_D2H_RXCPL], mb.w[RING_H2D_RXPOST], mb.idx[mb.h2d_r + RING_H2D_RXPOST],
+			    mem_rd(mb.tcm_h2d_r + 4 * RING_H2D_RXPOST) & 0xffff, mb.rx_posted, mb.rx_bad,
+			    mem_rd(mb.tcm_d2h_w + 4 * (RING_D2H_CTRL - 2)) & 0xffff, mb.idx[mb.d2h_w + (RING_D2H_CTRL - 2)],
+			    at ? types : " none");
+		}
 	}
 	lck_mtx_unlock(wl_lock);
+	counters_watch();
 	return n;
 }
 
@@ -2406,7 +2630,8 @@ hakios_akita_wifi_early(void)
 	unsigned int size = 0;
 
 	if (!PE_parse_boot_argn("wifi", &steps, sizeof(steps)) || steps < 8 ||
-	    (PE_parse_boot_argn("wifi_early_en0", &early, sizeof(early)) && early == 0)) {
+	    (PE_parse_boot_argn("wifi_early_en0", &early, sizeof(early)) && early == 0) ||
+	    (PE_parse_boot_argn("wifi_mac", &early, sizeof(early)) && early == 0)) {
 		return;
 	}
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
@@ -3346,7 +3571,13 @@ bcm_steps(void)
 			evlog = 0;
 			PE_parse_boot_argn("wifi_evlog_off", &evlog, sizeof(evlog));
 			if (evlog) {    /* (OFF by default: with every tag off, rx stopped -- 39 frames, then 1 (evlog0, soak1)) */
-				for (uint16_t tag = 0; tag <= 482; tag++) {
+				/* (11-12, TODO 35e) wifi_evlog_lo/hi=N: only the tags from lo to hi off -- which ones does rx need? */
+				uint32_t lo = 0, hi = 482;
+
+				PE_parse_boot_argn("wifi_evlog_lo", &lo, sizeof(lo));
+				PE_parse_boot_argn("wifi_evlog_hi", &hi, sizeof(hi));
+				printf("wifi: 6: event-log tags %u to %u to be turned off\n", lo, hi);
+				for (uint16_t tag = (uint16_t)lo; tag <= hi && tag <= 482; tag++) {
 					uint8_t el[4] = { (uint8_t)tag, (uint8_t)(tag >> 8), 0, 0 };
 
 					if (iovar_set("event_log_tag_control", el, sizeof(el)) != 0) {

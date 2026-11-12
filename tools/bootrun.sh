@@ -3,7 +3,12 @@
 # SECS seconds into LOGDIR (default ~/akita/logs/run: build-boot.log, test-console.log, test-k.log). Extra boot-args in
 # BOOTARGS (usb_lost_reboot=90 after them: a phone that loses its USB link restarts into the active slot, Android;
 # usb_lost_reboot=0 in BOOTARGS turns it off -- the first one counts; test_reboot_after=600 too: a test build restarts
-# after ten minutes whatever happens, test_reboot_after=0 in BOOTARGS for a longer run); THERMAL= overrides "thermal=1 dvfs=1". Never set RC or JOBS (userland/build.sh reads them).
+# after ten minutes whatever happens, test_reboot_after=0 in BOOTARGS for a longer run); THERMAL="thermal=0 dvfs=0" turns
+# the thermal driver and DVFS off. Never set RC or JOBS (userland/build.sh reads them).
+# What works is BUILT INTO the kernel since 11-12 (CONFIG_DEFAULTS in devices/akita/configs/akita.config: touchscreen,
+# buttons, fuel gauge, usbmux, thermal, DVFS, the Mali, Metal, the display's flips, the root and /var, Wi-Fi): each holds
+# unless the command line names it, x=0 turns one off (wifi=0 pcie=0: a run without Wi-Fi). The command line keeps what
+# the loader reads (cpus, ufs, ufs_write, torch), the GPU's display arguments, the failsafes and the run's own.
 cd ~/akita/hackios-kernel; D=~/akita/darwin-flash; S=${LOGDIR:-$HOME/akita/logs/run}; mkdir -p $S
 # GPU=1, the default unless the job file is mali_draw_test's own: CoreAnimation on the Mali (METAL_PLUGIN=ca with the
 # iPhone 11's library from ~/ca-share), the panel at 120 Hz, zero-copy scan-out. GPU=0: iOS draws in software -- what the
@@ -29,7 +34,8 @@ USBSER=""; [ -s ~/akita/usb_serial ] && USBSER="usb_serial=$(head -1 ~/akita/usb
 # The vibration motor, haptic=5, is OFF by default since 11-11 at the tester's word: every test boot buzzed ~48 s in --
 # Darwin itself plays a tap and 0.3 s of vibration then -- and his cat minded. haptic=5 in BOOTARGS for a run with it.)
 HW=""; case "$BOOTARGS" in *torch=*) ;; *) HW="torch=3";; esac
-CMDLINE="debug=0x8 $SAFE cpus=9 touchscreen=1 buttons=1 fuelgauge=1 usbmux=1 $USBSER ${THERMAL-thermal=1 dvfs=1} root_apfs=ufs_darwin ufs=2 ufs_write=1 var_hfs=ufs_darwin_data mali_keep=1 metal=1 metal_plugin=../../../redwood/lib/HakiosMetal display_flip=1 $HW $BOOTARGS"
+LC_ALL=C grep -aq "touchscreen=1 buttons=1" hakios-kernel || { echo "bootrun: hakios-kernel has no built-in arguments (CONFIG_DEFAULTS, 11-12): make kernel"; exit 1; }
+CMDLINE="debug=0x8 $SAFE cpus=9 $USBSER ${THERMAL:+$THERMAL }ufs=2 ufs_write=1 $HW $BOOTARGS"
 [ ${#CMDLINE} -gt 490 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the kernel gets whole (490: at 491 its last character was lost, 11-10); shorten BOOTARGS"; exit 1; }
 xnuloader/mkpayload.py -o $D/test-payload.bin kernel=hakios-kernel ramdisk=userland/root.apfs resident=userland/flashboot.apfs --cmdline "$CMDLINE" >/dev/null && tools/mkubootimg.py -d akita -p $D/test-payload.bin -o $D/test.img >/dev/null || exit 1
 # to the bootloader from wherever the phone is -- and again if it turns up elsewhere meanwhile (a test build's own
