@@ -324,6 +324,32 @@ aoc_out_cmd(const char *what, void *cmd, uint32_t len, uint16_t id)
 	return got >= 0;
 }
 
+/*
+ * The entry point's volume at a sink (aoc_alsa_hw.c's aoc_audio_volume_set: CMD_AUDIO_OUTPUT_SET_PARAMETER 209, packed --
+ * the header, block 16 + sink, component 0, key the source, value 0-1000). Google's driver sends chip->volume, 1000 from
+ * its start, for every playback stream at prepare (aoc_audio_set_ctls); this driver never sent one until 11-12 -- the
+ * AoC's own default may be silence, which is what the speakers gave with everything else in order (TODO 33: sink
+ * processing active, DSP in playback, the amps up). aocvol=N: N instead of 1000. UNTESTED by ear (11-12 night, no sound
+ * without the tester).
+ */
+static bool
+aoc_volume(uint8_t source, uint8_t sink)
+{
+	uint32_t value = 1000, key = source;
+	uint8_t p[18] = { 0 };
+
+	PE_parse_boot_argn("aocvol", &value, sizeof(value));
+	if (value > 1000) {
+		value = 1000;
+	}
+	p[8] = (uint8_t)(16 + sink);                    /* AOC_AUDIO_SINK_BLOCK_ID_BASE + sink */
+	p[9] = 0;                                       /* component */
+	memcpy(p + 10, &key, 4);
+	memcpy(p + 14, &value, 4);
+	printf("akita aoc: volume %u of 1000 for entry point %u at sink %u\n", value, source, sink);
+	return aoc_out_cmd("SET_PARAMETER (volume)", p, sizeof(p), 209);
+}
+
 /* what the AoC says of its output: the DSP's mode, the speaker sink's processing state, each sink's channel bitmap */
 static void
 aoc_out_state(void)
@@ -414,6 +440,7 @@ aoc_play(void)
 	    !aoc_out_cmd("BIND2 to the speaker", bind, sizeof(bind), 271)) {
 		return;
 	}
+	(void)aoc_volume(0, 0);                         /* (entry point 0 at SINK_SPEAKER, as Google's driver at prepare) */
 
 	/* the ring filled half before the source goes on, then kept half full for AOCPLAY seconds */
 	vm_offset_t ring = ipc_base + off;
@@ -597,6 +624,7 @@ aoc_stream(bool on, vm_offset_t svc, vm_offset_t r, vm_offset_t ring, uint32_t s
 	    !aoc_out_cmd("BIND2 to the speaker", bind, sizeof(bind), 271)) {
 		return false;
 	}
+	(void)aoc_volume(0, 0);
 	aoc_ring_put(svc, r, ring, size, silence, BLOCK_BYTES);
 	return aoc_out_cmd("SOURCE on", src, sizeof(src), 201);
 }
@@ -884,6 +912,30 @@ aoc_boot(void)
 			}
 			ipc_base = dram + image_size;
 			aoc_talk();
+			{
+				/* (aocvol_probe=1: the volume command once, no stream -- does the AoC take it? silent) */
+				uint32_t probe = 0;
+
+				if (PE_parse_boot_argn("aocvol_probe", &probe, sizeof(probe)) && probe != 0) {
+					/* the AoC's volume for entry point 0 at the speaker before and after (GET_PARAMETER 211) */
+					for (int pass = 0; pass < 2; pass++) {
+						uint8_t g[18] = { 0 };
+						uint32_t key = 0, val = ~0u;
+
+						g[8] = 16;
+						memcpy(g + 10, &key, 4);
+						if (aoc_out_cmd(pass == 0 ? "GET_PARAMETER (volume, as found)" : "GET_PARAMETER (volume, set)",
+						    g, sizeof(g), 211)) {
+							memcpy(&val, g + 14, 4);
+							printf("akita aoc: the AoC's volume for entry point 0 at the speaker: %u (of 1000)%s\n",
+							    val, pass == 0 ? ", as found" : ", after ours");
+						}
+						if (pass == 0) {
+							(void)aoc_volume(0, 0);
+						}
+					}
+				}
+			}
 			if (PE_parse_boot_argn("aocplay", &aocplay, sizeof(aocplay)) && aocplay != 0) {
 				aoc_play();
 			}
