@@ -1409,13 +1409,35 @@ info_poll(void)
 
 static unsigned d2h_ctrl_poll(void);
 
+/*
+ * WHICH MODE (11-12 night, TODO 35e/35f) -- wifi_edl=1: the EDL ring (host_cap HOSTCAP_EDL_RING and a D2H ring of type
+ * 7): the firmware's event logs go there and it never runs out of packet ids (35f's trap fixed) -- BUT it hands the
+ * host one received frame after the join and then holds them all (it releases held rx only as a side effect of its
+ * event logs going the old way): no ARP answer, no DNS, iOS "offline". Default (0), the old mode: no host_cap, no
+ * EDL ring, event-log tags 121-482 off (0-120 left on: with them off rx is held too -- the volume, no single tag):
+ * rx flows ~25 s after the join, and the firmware traps every ~2-3 minutes (its packet ids gone into event logs no
+ * ring takes) and is recovered in 7.6 s -- the internet there ~75% of the time (uptime-legacy 25/35 fetches,
+ * ev121-482 24/32) against ~0% with the EDL ring. Until the rx hold is understood, the mode with an internet.
+ */
+static bool
+wifi_edl(void)
+{
+	static uint32_t edl = ~0u;
+
+	if (edl == ~0u) {
+		edl = 0;
+		PE_parse_boot_argn("wifi_edl", &edl, sizeof(edl));
+	}
+	return edl != 0;
+}
+
 /* the two rings asked for and the buffers posted (step 6, the rings' lock held) */
 static void
 info_rings_up(void)
 {
 	uint64_t t0;
 
-	info.mode = 3;                  /* (the EDL ring, with host_cap's HOSTCAP_EDL_RING: rings_up) */
+	info.mode = wifi_edl() ? 3 : 0; /* (the EDL ring with wifi_edl=1, with host_cap's HOSTCAP_EDL_RING: rings_up) */
 	PE_parse_boot_argn("wifi_inforing", &info.mode, sizeof(info.mode));
 	if (info.mode == 0) {
 		return;
@@ -1838,13 +1860,13 @@ rings_up(uint32_t shared)
 		 * ready); the version alone (7) -- the firmware never read the control ring: protocol 7 wants more of the host
 		 * than these bits; DS_NO_OOB_DW alone (0x1000) -- joins as before, and the trap after a failed handshake is the
 		 * same.
-		 * WHAT IS WRITTEN (11-11 late, THE FIX OF THE TRAP): HOSTCAP_EDL_RING alone -- the firmware's event logs and
+		 * WHAT IS WRITTEN WITH wifi_edl=1 (11-11 late, THE FIX OF THE TRAP; not the default since 11-12: wifi_edl()): HOSTCAP_EDL_RING alone -- the firmware's event logs and
 		 * statistics then go into the EDL ring step 6 makes (info_rings_up), as on Android (its Kbuild: EWP_EDL,
 		 * EWP_ECNTRS_LOGGING); without it the firmware kept them for a host ring that never came and ran out of memory
 		 * and packet ids ~130 s after its start, every time. It honours the bit with the version 0.
 		 * wifi_hostcap=N: N written instead (with EXTENDED_TRAP_DATA, a buffer for it given too); 1: nothing.
 		 */
-		uint32_t hostcap = HOSTCAP_EDL_RING;
+		uint32_t hostcap = wifi_edl() ? HOSTCAP_EDL_RING : 1;  /* (1: none written -- the old mode, 11-12: see wifi_edl) */
 		(void)(HOSTCAP_DS_NO_OOB_DW | HOSTCAP_UR_FW_NO_TRAP | HOSTCAP_H2D_ENABLE_HOSTRDY);
 
 		PE_parse_boot_argn("wifi_hostcap", &hostcap, sizeof(hostcap));
@@ -2551,6 +2573,8 @@ en0_poll(void)
 						v[i] = mem_rd(l + 4 * i);
 					}
 				}
+				printf("wifi: the firmware's _pciedev_hostready %08x, _pciedevenab byte %02x, dongle_bus 0x%08x, logtrace "
+				    "0x%08x\n", mem_rd(0x006e0118), (mem_rd(0x006e0134) >> 8) & 0xff, mem_rd(0x006e0220), mem_rd(0x006e0180));
 				printf("wifi: rxcplids at 0x%08x: %08x %08x %08x %08x %08x %08x; the chip's D2H read indices %u %u %u "
 				    "(ours %u %u %u)\n", l, v[0], v[1], v[2], v[3], v[4], v[5],
 				    mb.tcm_d2h_r ? mem_rd(mb.tcm_d2h_r + 0) & 0xffff : 0, mb.tcm_d2h_r ? mem_rd(mb.tcm_d2h_r + 4) & 0xffff : 0,
@@ -3568,11 +3592,11 @@ bcm_steps(void)
 			uint32_t evlog = 0, failed = 0;
 			uint64_t t0 = mach_absolute_time();
 
-			evlog = 0;
+			evlog = wifi_edl() ? 0 : 1;     /* (the old mode: tags 121-482 off by default -- see wifi_edl) */
 			PE_parse_boot_argn("wifi_evlog_off", &evlog, sizeof(evlog));
 			if (evlog) {    /* (OFF by default: with every tag off, rx stopped -- 39 frames, then 1 (evlog0, soak1)) */
 				/* (11-12, TODO 35e) wifi_evlog_lo/hi=N: only the tags from lo to hi off -- which ones does rx need? */
-				uint32_t lo = 0, hi = 482;
+				uint32_t lo = wifi_edl() ? 0 : 121, hi = 482;
 
 				PE_parse_boot_argn("wifi_evlog_lo", &lo, sizeof(lo));
 				PE_parse_boot_argn("wifi_evlog_hi", &hi, sizeof(hi));
@@ -3584,7 +3608,7 @@ bcm_steps(void)
 						failed++;
 					}
 				}
-				printf("wifi: 6: the firmware's event logs off (483 tags, %u refused) in %llu ms\n", failed,
+				printf("wifi: 6: the firmware's event logs off (tags %u-%u, %u refused) in %llu ms\n", lo, hi, failed,
 				    micros_since(t0) / 1000);
 				/* ("ecounters_suspend", to stop its statistics reports too: -47, not taken) */
 			}
