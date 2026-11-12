@@ -2128,6 +2128,33 @@ scan_all(void)
 			printf("wifi: 7: \"bus:host_access\" 1: %d\n", iovar_int("bus:host_access", 1));
 		}
 	}
+	{
+		/*
+		 * (11-12 evening, TODO 35e: a test) THE FIRMWARE'S OWN OFFLOADS, never set by this driver -- its defaults held.
+		 * Its wl_sendup (read in fw_bcmdhd.bin) hands a received frame first to its ARP agent (wl_arp_recv_proc: an ARP
+		 * frame it "handles" is freed, never sent up), its neighbour-discovery agent (wl_nd_recv_proc), its hardware
+		 * filter and its packet filter (wlc_pkt_filter_recv_proc: 0 = dropped) -- all after decryption, which is where
+		 * the frames of the EDL mode vanish (the ARP answer of the router first of all). Android's dhd sets these
+		 * itself after the firmware starts (arpoe / arp_ol with the host's address in arp_hostip, ndoe, pkt_filter_mode
+		 * and its filters); a host that sets nothing leaves whatever the firmware build has. wifi_offloads=0: what is
+		 * found is said and then all of it turned off (the host answers ARP itself); 1 (default): only said.
+		 */
+		uint32_t off = 1, v;
+		static const char *const names[] = { "arpoe", "arp_ol", "ndoe", "pkt_filter_mode", "allmulti", "hwfilter" };
+
+		PE_parse_boot_argn("wifi_offloads", &off, sizeof(off));
+		for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+			int err;
+
+			v = 0xdeadbeef;
+			err = iovar_get(names[i], &v, sizeof(v));
+			printf("wifi: 7: the firmware's \"%s\" as found: %d, 0x%x\n", names[i], err, v);
+		}
+		if (off == 0) {
+			printf("wifi: 7: offloads off: \"arpoe\" 0: %d, \"arp_ol\" 0: %d, \"ndoe\" 0: %d\n", iovar_int("arpoe", 0),
+			    iovar_int("arp_ol", 0), iovar_int("ndoe", 0));
+		}
+	}
 	printf("wifi: 7: \"mpc\" 0: %d; infrastructure: %d; up: %d\n", iovar_int("mpc", 0), cmd_int(20, 1), cmd_int(2, 1));
 	{
 		/* (11-11, a test of TODO 35f) wifi_roamoff=1: the firmware's own roaming off -- after a failed handshake it may
@@ -2717,6 +2744,27 @@ en0_poll(void)
 			    mem_rd(0x006e0294));
 			{
 				/*
+				 * (11-12 evening) is the firmware out of memory? rte_heap's failed allocations (mf_count), its arena's
+				 * low-water mark, and the packet fetch (rte_pktfetch: a frame the firmware has to read whole -- an ARP
+				 * answer for its ARP agent, EAPOL -- is fetched back from the host's rx buffer into a packet of its
+				 * pool, or of the heap while more than 16 KB are free and more than 16 packet ids: else the fetch
+				 * fails, -27): the queue of waiting fetches (pktfetchq: +8 a byte "waiting", +0xa a count), fetches
+				 * served from the heap, short ones.
+				 */
+				uint32_t q = mem_rd(0x006e02dc), qw[4] = { 0 }, fq = mem_rd(0x006e0280);
+
+				if (q >= ram_base && q + 16 <= ram_base + ram_size) {
+					for (int i = 0; i < 4; i++) {
+						qw[i] = mem_rd(q + 4 * i);
+					}
+				}
+				printf("wifi: heap: failed allocations %u, successes %u, arena low-water %u, overhead %u; packet fetch: queue "
+				    "0x%08x: %08x %08x %08x %08x, from the heap %u, short %u, fetch requests queue 0x%08x\n",
+				    mem_rd(0x006e02ac), mem_rd(0x006e02a4), mem_rd(0x006e0284), mem_rd(0x006e0298), q, qw[0], qw[1], qw[2],
+				    qw[3], mem_rd(0x006e02e0), mem_rd(0x006e02d0), fq);
+			}
+			{
+				/*
 				 * (11-12, TODO 35e) the firmware's rx completion ids (g_rxcplid_list, a pointer: max, avail, ... --
 				 * bcm_rxcplid_list_t): each frame handed up takes one until the firmware sees our read index pass its
 				 * completion (pciedev_freeup_rxcplid). Do they run out after the join? And our D2H read indices as
@@ -2744,6 +2792,70 @@ en0_poll(void)
 			    mb.idx[mb.h2d_r + RING_H2D_CTRL], mb.idx[mb.h2d_r + RING_H2D_RXPOST], mb.idx[mb.h2d_r + 2],
 			    mb.w[RING_H2D_CTRL], mb.w[RING_H2D_RXPOST], mb.idx[mb.h2d_w + 2], mb.rx_posted, mb.rx_bad, info.completions,
 			    info.bytes);
+			{
+				/*
+				 * (11-12 evening, TODO 35e) THE FIRMWARE'S BUS STATE, read where its own code keeps it (fw_bcmdhd.bin
+				 * disassembled with the .map: pciedev_create_d2h_messages[_tx], pciedev_ds_in_host_sleep,
+				 * pciedev_edl_ring_resource_check; the structure is *pciedev$dongle_bus). A frame for the host is FREED
+				 * there when the firmware takes the host for asleep -- (byte 0x4f8 and its deep-sleep state 0x320 in
+				 * 1..3) or its D3 byte 0x20d -- or while its byte 0x15c is 0 (counted at 0x254); in "host sleep" data
+				 * frames are counted at 0x46c and dropped past the limit 0xbf0 ("In D3 Suspend. Dropping data
+				 * packet", counted at 0x464), events at 0x470 / 0x468, log buffers at 0x6e4 / 0x60c. The EDL ring's
+				 * record hangs at 0x6e8: its ring (byte 0 = made, +0x10 -> our read index as the firmware has it,
+				 * +0x18 its write index), +8 its counts (ring full, when, ring not made).
+				 */
+				uint32_t pd = mem_rd(0x006e0220);
+
+				if (pd >= ram_base && pd + 0xc80 <= ram_base + ram_size) {
+					uint32_t edl = mem_rd(pd + 0x6e8), ring = 0, st = 0, rdp = 0;
+
+					printf("wifi: bus: at 0x%08x: ds byte(0x4f8) %02x, ds state(0x320) %u, D3 byte(0x20d) %02x, up byte"
+					    "(0x15c) %02x, 0xc70 %02x, 0x35b %02x, 0x2bc %08x; dropped: not up %u, D3 data %u (seen %u, "
+					    "limit %u), D3 events %u (seen %u), D3 logs %u (seen %u), 0x490 %u\n", pd,
+					    mem_rd(pd + 0x4f8) & 0xff, mem_rd(pd + 0x320), (mem_rd(pd + 0x20c) >> 8) & 0xff,
+					    mem_rd(pd + 0x15c) & 0xff, mem_rd(pd + 0xc70) & 0xff, (mem_rd(pd + 0x358) >> 24) & 0xff,
+					    mem_rd(pd + 0x2bc), mem_rd(pd + 0x254), mem_rd(pd + 0x464), mem_rd(pd + 0x46c), mem_rd(pd + 0xbf0),
+					    mem_rd(pd + 0x468), mem_rd(pd + 0x470), mem_rd(pd + 0x60c), mem_rd(pd + 0x6e4), mem_rd(pd + 0x490));
+					{
+						/*
+						 * its rx completions waiting to be written (pciedev_queue_rxcomplete_local: the list's head and
+						 * tail at +0/+4, the count at +8): a completion still "in transit" (flags bit 0 of byte 3 >> 2:
+						 * its payload not handed over yet) ends a flush, one marked valid (bit 2) is written; and the
+						 * count of flushes its reorder callback made (pciedev_reorder_flush_cnt)
+						 */
+						uint32_t head = mem_rd(pd), tail = mem_rd(pd + 4), h[5] = { 0 };
+
+						if (head >= ram_base && head + 20 <= ram_base + ram_size) {
+							for (int i = 0; i < 5; i++) {
+								h[i] = mem_rd(head + 4 * i);
+							}
+						}
+						printf("wifi: bus: rx completions waiting: head 0x%08x tail 0x%08x count %u; the head's words %08x "
+						    "%08x %08x %08x %08x; reorder flushes %u, 0x5bc %u\n", head, tail, mem_rd(pd + 8), h[0], h[1], h[2],
+						    h[3], h[4], mem_rd(0x0079fb78), mem_rd(pd + 0x5bc));
+					}
+					if (edl >= ram_base && edl + 12 <= ram_base + ram_size) {
+						ring = mem_rd(edl);
+						st = mem_rd(edl + 8);
+					}
+					if (ring >= ram_base && ring + 0x1c <= ram_base + ram_size) {
+						rdp = mem_rd(ring + 0x10);
+						printf("wifi: bus: EDL record 0x%08x, ring 0x%08x: made %02x, read-index pointer 0x%08x%s, its write "
+						    "index %u", edl, ring, mem_rd(ring) & 0xff, rdp, rdp >= ram_base && rdp < ram_base + ram_size ?
+						    "" : " (not its memory)", mem_rd(ring + 0x18) & 0xffff);
+						if (rdp >= ram_base && rdp + 4 <= ram_base + ram_size) {
+							printf(", our read index as it has it %u", mem_rd(rdp) & 0xffff);
+						}
+						if (st >= ram_base && st + 0x1c <= ram_base + ram_size) {
+							printf("; ring full %u times (last at %u), not made %u", mem_rd(st), mem_rd(st + 4),
+							    mem_rd(st + 0x18));
+						}
+						printf("\n");
+					} else {
+						printf("wifi: bus: no EDL record (0x6e8 = 0x%08x)\n", edl);
+					}
+				}
+			}
 		}
 		if (console_every != 0 && !fw_halted && micros_since(console_at) > console_every * 1000000ull) {
 			console_at = mach_absolute_time();

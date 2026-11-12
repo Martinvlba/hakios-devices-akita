@@ -28,6 +28,7 @@ extern void psci_idle_set_wake(psci_idle_arm_t arm, psci_idle_disarm_t disarm);
 extern bool psci_idle_wanted(void);
 extern void psci_idle_totals(uint64_t *tries, uint64_t *downs, uint64_t *back, uint64_t *refused);
 extern int64_t psci_idle_error(void);
+extern void psci_idle_core(int cpu, uint64_t *downs, uint64_t *refused, uint32_t *pending, uint32_t *enabled);
 extern uint32_t psci_idle_states(uint32_t *taken);
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -60,6 +61,17 @@ extern unsigned int real_ncpus;
 #define CPU_INFORM_CLEAR        0
 #define CPU_INFORM_C2           1
 #define TENSOR_SMC_PMU_SEC_REG  0x82000504
+/*
+ * AND THE FIRMWARE'S PERMISSION (11-12, read in the phone's own BL31 -- TF-A 2.10, bl31_a -- after every CPU_SUSPEND
+ * came back -2): its validate_power_state takes a power-down state only while the PMU's INFORM0 (PMU + 0x800) reads 1;
+ * BL31 clears it when it starts, and Android's exynos-cpupm sets it once it is ready ("PMU_INFORM0, PMU_ALLOWED_C2").
+ * Anything else: -2 and the cancel flag (0x20) in the core's state word. (A standby state is -2 always: the platform has
+ * no cpu_standby. With the permission, a core whose secure timer is enabled is made to WFI and comes back -2 as well:
+ * Android counts those as "rejected".)
+ */
+#define PMU_INFORM0             (0x15460000ULL + 0x800)
+#define PMU_ALLOWED_C2          1
+static uint32_t mct_allow = 1;                  /* cpuidle_allow=0: INFORM0 left as found (every CPU_SUSPEND refused) */
 static uint32_t mct_hint = 1;                   /* cpuidle_hint=0: not written (as before) */
 
 static uint64_t
@@ -184,6 +196,18 @@ mct_report(__unused void *p, __unused wait_result_t w)
 		printf("akita mct: idle so far: %llu tries -- %llu powered down, %llu back at once, %llu refused; the MCT armed %llu "
 		    "times, woke a core %llu times (cores attached 0x%x); the firmware's last refusal %lld; state 0x%x asked, 0x%x "
 		    "taken\n", tries, downs, back, refused, arms, fires, mct_attached, psci_idle_error(), asking, taken);
+		for (int i = 0; i < MCT_CPUS; i++) {
+			uint64_t d, r;
+			uint32_t pending, enabled;
+
+			psci_idle_core(i, &d, &r, &pending, &enabled);
+			if (d != 0 || r != 0) {
+				printf("akita mct: core %d: %llu times down, %llu refused (after the last: SGIs/PPIs pending 0x%08x, enabled "
+				    "0x%08x)\n", i, d, r, pending, enabled);
+			}
+		}
+		printf("akita mct: the firmware's permission (PMU INFORM0) reads 0x%llx\n",
+		    pmu_smc(TENSOR_SMC_PMU_SEC_REG, PMU_INFORM0, 0, 0));
 	}
 }
 
@@ -222,6 +246,14 @@ akita_mct_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1
 	printf("akita mct: version 0x%x, its counter at %llu kHz (%llu cycles in %llu us); the wake for idle cores (cpuidle)%s; "
 	    "CPU_INFORM of core 4 reads 0x%llx\n", rd(MCT_VER), (c1 - c0) * 1000000ULL / (ns ? ns : 1), c1 - c0, ns / 1000,
 	    mct_hint ? ", with the PMU's C2 hint" : "", pmu_smc(TENSOR_SMC_PMU_SEC_REG, PMU_CPU_INFORM(4), 0, 0));
+	PE_parse_boot_argn("cpuidle_allow", &mct_allow, sizeof(mct_allow));
+	if (mct_allow) {
+		uint64_t was = pmu_smc(TENSOR_SMC_PMU_SEC_REG, PMU_INFORM0, 0, 0), now;
+
+		(void)pmu_smc(TENSOR_SMC_PMU_SEC_REG, PMU_INFORM0, 1, PMU_ALLOWED_C2);
+		now = pmu_smc(TENSOR_SMC_PMU_SEC_REG, PMU_INFORM0, 0, 0);
+		printf("akita mct: the firmware's permission for C2 (PMU INFORM0) 0x%llx -> 0x%llx\n", was, now);
+	}
 	psci_idle_set_wake(mct_arm, mct_disarm);
 	if (kernel_thread_start(mct_report, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
