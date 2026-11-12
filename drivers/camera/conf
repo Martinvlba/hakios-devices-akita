@@ -5,3 +5,10 @@ driver AKITA_TORCH
 	help    the Pixel 8a's flashlight: the LM3644 flash driver on zuma's hsi2c@10980000 (USI14 of PERIC0, brought up here),
 	help    a look (torch=1), lit once (torch=2), Darwin's through /dev/hakios-torch (torch=3); never above torch_max_ma
 	help    (100), off after torch_max_s (30), on a fault or a warm skin
+
+driver AKITA_CAMERA
+	file    bsd/dev/hakios.akita_camera.c
+	requires AKITA_ACPM
+	help    the Pixel 8a's three cameras from the start: their buses (PERIC0's USI1-3), clocks (CMU_TOP's CIS_CLKn), pins and
+	help    power (the S2MPG15's camera I/O rail and GPIOs, the SLG51002 camera PMIC) as the device tree has them; a look
+	help    (camera=1), nothing written
