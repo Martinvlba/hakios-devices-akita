@@ -401,18 +401,63 @@ aoc_out_state(void)
 	}
 }
 
-/* a 440 Hz tone (peak aocplay_amp: 2000 about -24 dBFS), frame FRAME onwards, BYTES of it at ring offset AT (wrapping);
- * aocplay_lr=1: odd seconds left only, even seconds right only (which speaker plays which side) */
+/*
+ * The test tone: aocplay_hz=N (default 440) from a 257-entry quarter sine, linearly interpolated, a 32-bit phase (11-12:
+ * the first one stepped through 64 phases without interpolation -- clean harmonics but spurs at 7.9, 8.8, 12 kHz, -36 dB,
+ * which the speakers made louder than the tone itself), peak aocplay_amp (of 32767; 2000 about -24 dBFS); aocplay_lr=1:
+ * odd seconds left only, even seconds right only; aocplay_sweep=1: 1.5 s each at -30, -24, -18, -12, -9 and -6 dBFS
+ * (a distortion test against level, with aocmic=S recording it), then silence.
+ */
+static const int16_t sine_q[257] = {
+	0, 201, 402, 603, 804, 1005, 1206, 1407, 1608, 1809, 2009, 2210, 2410, 2611, 2811, 3012,
+	3212, 3412, 3612, 3811, 4011, 4210, 4410, 4609, 4808, 5007, 5205, 5404, 5602, 5800, 5998, 6195,
+	6393, 6590, 6786, 6983, 7179, 7375, 7571, 7767, 7962, 8157, 8351, 8545, 8739, 8933, 9126, 9319,
+	9512, 9704, 9896, 10087, 10278, 10469, 10659, 10849, 11039, 11228, 11417, 11605, 11793, 11980, 12167, 12353,
+	12539, 12725, 12910, 13094, 13279, 13462, 13645, 13828, 14010, 14191, 14372, 14553, 14732, 14912, 15090, 15269,
+	15446, 15623, 15800, 15976, 16151, 16325, 16499, 16673, 16846, 17018, 17189, 17360, 17530, 17700, 17869, 18037,
+	18204, 18371, 18537, 18703, 18868, 19032, 19195, 19357, 19519, 19680, 19841, 20000, 20159, 20317, 20475, 20631,
+	20787, 20942, 21096, 21250, 21403, 21554, 21705, 21856, 22005, 22154, 22301, 22448, 22594, 22739, 22884, 23027,
+	23170, 23311, 23452, 23592, 23731, 23870, 24007, 24143, 24279, 24413, 24547, 24680, 24811, 24942, 25072, 25201,
+	25329, 25456, 25582, 25708, 25832, 25955, 26077, 26198, 26319, 26438, 26556, 26674, 26790, 26905, 27019, 27133,
+	27245, 27356, 27466, 27575, 27683, 27790, 27896, 28001, 28105, 28208, 28310, 28411, 28510, 28609, 28706, 28803,
+	28898, 28992, 29085, 29177, 29268, 29358, 29447, 29534, 29621, 29706, 29791, 29874, 29956, 30037, 30117, 30195,
+	30273, 30349, 30424, 30498, 30571, 30643, 30714, 30783, 30852, 30919, 30985, 31050, 31113, 31176, 31237, 31297,
+	31356, 31414, 31470, 31526, 31580, 31633, 31685, 31736, 31785, 31833, 31880, 31926, 31971, 32014, 32057, 32098,
+	32137, 32176, 32213, 32250, 32285, 32318, 32351, 32382, 32412, 32441, 32469, 32495, 32521, 32545, 32567, 32589,
+	32609, 32628, 32646, 32663, 32678, 32692, 32705, 32717, 32728, 32737, 32745, 32752, 32757, 32761, 32765, 32766,
+	32767,
+};
+
+static uint32_t aocplay_hz = 440, aocplay_sweep;
+#define SWEEP_STEP      72000u                  /* frames at each level */
+static const uint16_t sweep_peak[6] = { 1036, 2067, 4125, 8231, 11627, 16423 };      /* -30 -24 -18 -12 -9 -6 dBFS */
+
+static int32_t
+tone_sample(uint64_t frame)
+{
+	uint32_t inc = (uint32_t)(((uint64_t)aocplay_hz << 32) / 48000u);
+	uint32_t phase = (uint32_t)(frame * (uint64_t)inc), u = phase & 0x3fffffffu, q = phase >> 30;
+
+	if (q & 1) {
+		u = 0x40000000u - u;
+	}
+	uint32_t idx = u >> 22, frac = (u >> 6) & 0xffffu;
+	int32_t a = sine_q[idx], b = sine_q[idx < 256 ? idx + 1 : 256];
+	int32_t v = a + (int32_t)(((int64_t)(b - a) * frac) >> 16);
+	return q >= 2 ? -v : v;
+}
+
+/* the tone, frame FRAME onwards, BYTES of it at ring offset AT (wrapping): 16-bit stereo */
 static void
 aoc_tone(vm_offset_t ring, uint32_t size, uint32_t at, uint32_t bytes, uint64_t *frame)
 {
-	/* one period of 440 Hz at 48 kHz is 109.09 frames: a 16-entry quarter table interpolated is plenty for a test tone */
-	static const int16_t q[17] = { 0, 196, 390, 581, 765, 942, 1111, 1269, 1414, 1546, 1663, 1764, 1848, 1914, 1962, 1990,
-		                       2000 };
 	for (uint32_t i = 0; i + 4 <= bytes; i += 4) {
-		uint32_t ph = (uint32_t)((*frame * 440ULL * 64ULL / 48000ULL) % 64);    /* 64 steps a period */
-		int32_t v = ph < 16 ? q[ph] : ph < 32 ? q[32 - ph] : ph < 48 ? -q[ph - 32] : -q[64 - ph];
-		v = aoc_tone_on(*frame) ? v * (int32_t)aocplay_amp / 2000 : 0;
+		uint32_t peak = aocplay_amp;
+		if (aocplay_sweep) {
+			uint64_t step = *frame / SWEEP_STEP;
+			peak = step < 6 ? sweep_peak[step] : 0;
+		}
+		int32_t v = aoc_tone_on(*frame) ? (int32_t)(((int64_t)tone_sample(*frame) * peak) / 32767) : 0;
 		uint16_t l = (uint16_t)(int16_t)v, r = l;
 		if (aocplay_lr) {
 			if ((*frame / 48000) % 2 == 0) {
@@ -1000,6 +1045,171 @@ aoc_sound_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 }
 
+/*
+ * aocmic=S: the phone's own two microphones (the built-in PDM mics 0 and 1, as Android's "handset-mic"/"speaker-mic"),
+ * S seconds, through the AoC as Google's driver records (aoc_alsa_hw.c, UC_AUDIO_RECORD on audio_capture0):
+ * MIC_RECORD_AP_SET_PARAMS (224: 2 channels, 16-bit, 48 kHz, mics 0/1 interleaved, 10 ms periods, raw), SET_PARAMS2
+ * (359), the mic mask (SET_PARAMETER 233 block 139 ABLOCK_INPUT_PDM_MIC), AP_INPUT_START (208: the built-in mics),
+ * SET_AP_MIC_INDEX (319: raw) and MIC_RECORD_AP_START_DATA (293) on audio_input_control; the samples come up
+ * audio_capture0's ring. Each second's level of each mic goes in the log; with rec_sound=N rec_sound_mic=1 they go into
+ * the recording too (mic 0 left, mic 1 right), fetched over USB (usbmux port 8: devices/akita/tools/usbmux-sound.py).
+ * With aocplay=S it records while the tone plays: the speakers heard by the phone itself (11-12, the tester: "test for
+ * distortion").
+ */
+static uint32_t aocmic;
+static volatile bool mic_done;
+
+static bool
+aoc_in_cmd(const char *what, void *cmd, uint32_t len, uint16_t id)
+{
+	*(uint16_t *)((uint8_t *)cmd + 4) = id;
+	int got = aoc_audio_cmd("audio_input_control", cmd, len);
+	printf("akita aoc: mic: %s (%u): %s, reply field %d\n", what, id, got < 0 ? "FAILED" : "done", got < 0 ? 0 :
+	    *(int16_t *)((uint8_t *)cmd + 6));
+	return got >= 0;
+}
+
+static uint32_t
+isqrt64(uint64_t v)
+{
+	uint64_t r = 0, b = 1ULL << 62;
+
+	while (b > v) {
+		b >>= 2;
+	}
+	while (b != 0) {
+		if (v >= r + b) {
+			v -= r + b;
+			r = (r >> 1) + b;
+		} else {
+			r >>= 1;
+		}
+		b >>= 2;
+	}
+	return (uint32_t)r;
+}
+
+static void
+aoc_mic_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	static int16_t buf[4800 * 2];                   /* 100 ms of two channels */
+	vm_offset_t svc = aoc_service("audio_capture0");
+	vm_offset_t r = svc ? region(svc, AOC_UP) : 0;
+	uint32_t size = r ? rd(r, 4) : 0, off = r ? rd(r, 0) : 0;
+	uint64_t t0 = now_us(), frames = 0, sq[2] = { 0 }, n_sec = 0;
+	uint32_t peak[2] = { 0 }, second = 0;
+	bool rec = hakios_audio_recording_mic();
+
+	if (!svc || size == 0 || (uint64_t)off + size > ipc_room) {
+		printf("akita aoc: mic: no audio_capture0 ring (%u bytes at +0x%x)\n", size, off);
+		mic_done = true;
+		return;
+	}
+	printf("akita aoc: mic: reading audio_capture0 (%u bytes at +0x%x, tx %u rx %u) for %u s%s\n", size, off, rd(r, 12),
+	    rd(r, 16), aocmic, rec ? ", into the recording (rec_sound_mic=1)" : "");
+	while (now_us() - t0 < (uint64_t)aocmic * 1000000ULL) {
+		uint32_t tx = rd(r, 12), rx = rd(r, 16), avail = tx - rx;
+
+		if (avail > size) {                     /* (overrun: the oldest is gone) */
+			wr(r, 16, tx - size / 2);
+			wr(r, 24, (rd(r, 20) + size - size / 2) % size);
+			printf("akita aoc: mic: the ring overran (%u bytes waiting)\n", avail);
+			continue;
+		}
+		if (avail < 4) {
+			delay(5000);
+			continue;
+		}
+		uint32_t n = avail & ~3u, rp = rd(r, 24);
+		__builtin_arm_dmb(0xf);                 /* (the samples read after the count that says they are there) */
+		n = n < sizeof(buf) ? n : (uint32_t)sizeof(buf);
+		for (uint32_t i = 0; i < n; i += 4) {
+			*(uint32_t *)((uint8_t *)buf + i) = *(volatile uint32_t *)(ipc_base + off + (rp + i) % size);
+		}
+		__builtin_arm_dsb(0xf);
+		wr(r, 16, rx + n);
+		wr(r, 24, (rp + n) % size);
+		for (uint32_t f = 0; f < n / 4; f++) {
+			for (int c = 0; c < 2; c++) {
+				int32_t v = buf[2 * f + c];
+				uint32_t a = (uint32_t)(v < 0 ? -v : v);
+				sq[c] += (uint64_t)(v * v);
+				peak[c] = a > peak[c] ? a : peak[c];
+			}
+		}
+		n_sec += n / 4;
+		frames += n / 4;
+		if (rec) {
+			hakios_audio_record_fed(buf, n / 4);
+		}
+		if (now_us() - t0 >= (uint64_t)(second + 1) * 1000000ULL) {
+			printf("akita aoc: mic: second %u: %llu frames; mic 0 rms %u peak %u, mic 1 rms %u peak %u (of 32768)\n", second,
+			    n_sec, n_sec ? isqrt64(sq[0] / n_sec) : 0, peak[0], n_sec ? isqrt64(sq[1] / n_sec) : 0, peak[1]);
+			second++;
+			n_sec = 0;
+			sq[0] = sq[1] = 0;
+			peak[0] = peak[1] = 0;
+		}
+	}
+	printf("akita aoc: mic: %llu frames in %u s (48000 a second expected)\n", frames, aocmic);
+	mic_done = true;
+}
+
+static bool
+aoc_mic_start(void)
+{
+	uint8_t p[22] = { 0 }, p2[17] = { 0 }, m[18] = { 0 }, in[9] = { 0 }, idx[9] = { 0 }, start[8] = { 0 };
+	vm_offset_t svc = aoc_service("audio_capture0");
+	vm_offset_t r = svc ? region(svc, AOC_UP) : 0;
+	uint32_t key = 0, val = 0xffff0100u;            /* the mic mask: mic ids 0, 1, then none */
+	uint32_t period = 1920, buffer = 4 * 1920;      /* 10 ms of two 16-bit channels; four of them */
+
+	p[8] = 2;                                       /* requested_format: CH_STEREO */
+	p[9] = 1;                                       /* WIDTH_16_BIT */
+	p[10] = 5;                                      /* SR_48KHZ */
+	p[11] = 1;                                      /* FRMT_FIXED_POINT */
+	p[12] = 0;                                      /* offset */
+	p[13] = 0x3;                                    /* pdm_mask: mics 0 and 1 */
+	p[14] = 10;                                     /* period_ms */
+	p[15] = 4;                                      /* num_periods */
+	p[16] = 0; p[17] = 1; p[18] = 0xff; p[19] = 0xff;       /* interleaving */
+	p[20] = 5;                                      /* sample_rate: SR_48KHZ */
+	p[21] = 0;                                      /* mic_process_index: AP_MIC_PROCESS_RAW */
+	p2[8] = 8;                                      /* channel: UC_AUDIO_RECORD (audio_capture0) */
+	memcpy(p2 + 9, &buffer, 4);
+	memcpy(p2 + 13, &period, 4);
+	m[8] = 139;                                     /* ABLOCK_INPUT_PDM_MIC */
+	m[9] = 0;                                       /* ASP_ID_NONE */
+	memcpy(m + 10, &key, 4);                        /* not voice */
+	memcpy(m + 14, &val, 4);
+	in[8] = 1;                                      /* AP_INPUT_PROCESSOR_MIC_INPUT_INDEX */
+	idx[8] = 0;                                     /* AP_MIC_PROCESS_RAW */
+
+	if (!aoc_in_cmd("MIC_RECORD_AP_SET_PARAMS", p, sizeof(p), 224) ||
+	    !aoc_in_cmd("MIC_RECORD_AP_SET_PARAMS2", p2, sizeof(p2), 359)) {
+		return false;
+	}
+	(void)aoc_in_cmd("SET_PARAMETER (mic mask)", m, sizeof(m), 233);
+	if (!aoc_in_cmd("AP_INPUT_START (built-in mics)", in, sizeof(in), 208)) {
+		return false;
+	}
+	if (r) {                                        /* the ring flushed (aoc_ring_flush_read_data) */
+		wr(r, 16, rd(r, 12));
+		wr(r, 24, rd(r, 20));
+	}
+	(void)aoc_in_cmd("SET_AP_MIC_INDEX (raw)", idx, sizeof(idx), 319);
+	return aoc_in_cmd("MIC_RECORD_AP_START_DATA", start, sizeof(start), 293);
+}
+
+static void
+aoc_mic_stop(void)
+{
+	uint8_t stop[8] = { 0 }, in[8] = { 0 };
+
+	(void)aoc_in_cmd("MIC_RECORD_AP_STOP", stop, sizeof(stop), 226);
+	(void)aoc_in_cmd("AP_INPUT_STOP", in, sizeof(in), 209);
+}
+
 /* the AoC's firmware loaded by the GSA and started through Trusty (aoc=3) */
 static void
 aoc_boot(void)
@@ -1213,20 +1423,44 @@ aoc_boot(void)
 				}
 				delay(300000);                  /* (the boot's 256 messages out before ours start) */
 			}
+			bool mic = false;
+
+			if (PE_parse_boot_argn("aocmic", &aocmic, sizeof(aocmic)) && aocmic != 0 && aoc_mic_start()) {
+				thread_t mt;
+
+				mic_done = false;
+				mic = kernel_thread_start_priority(aoc_mic_thread, NULL, 90, &mt) == KERN_SUCCESS;
+				if (mic) {
+					thread_deallocate(mt);
+					delay(500000);          /* (half a second of the room before the tone) */
+				}
+			}
 			if (PE_parse_boot_argn("aocplay", &aocplay, sizeof(aocplay)) && aocplay != 0) {
 				PE_parse_boot_argn("aocplay_amp", &aocplay_amp, sizeof(aocplay_amp));
 				if (aocplay_amp > 32767) {
 					aocplay_amp = 32767;
 				}
 				PE_parse_boot_argn("aocplay_lr", &aocplay_lr, sizeof(aocplay_lr));
+				PE_parse_boot_argn("aocplay_hz", &aocplay_hz, sizeof(aocplay_hz));
+				if (aocplay_hz < 20 || aocplay_hz > 20000) {
+					aocplay_hz = 440;
+				}
+				PE_parse_boot_argn("aocplay_sweep", &aocplay_sweep, sizeof(aocplay_sweep));
 				PE_parse_boot_argn("aocplay_matrix", &aocplay_matrix, sizeof(aocplay_matrix));
 				if (aocplay_matrix) {
 					printf("akita aoc: aocplay_matrix: THE LISTENING TEST -- for each amplifier setting K (1-%u) K beeps, "
 					    "twice, in %u s\n", MATRIX_N, MATRIX_SEG / 48000);
 				}
-				printf("akita aoc: aocplay: a 440 Hz tone for %u s, peak %u of 32767%s\n", aocplay, aocplay_amp,
-				    aocplay_lr ? ", left only and right only by turns (left first)" : ", both sides");
+				printf("akita aoc: aocplay: a %u Hz tone for %u s, %s%s\n", aocplay_hz, aocplay, aocplay_sweep ?
+				    "1.5 s each at -30 -24 -18 -12 -9 -6 dBFS" : "peak as aocplay_amp", aocplay_lr ?
+				    ", left only and right only by turns (left first)" : ", both sides");
 				aoc_play();
+			}
+			if (mic) {
+				while (!mic_done) {
+					delay(100000);
+				}
+				aoc_mic_stop();
 			}
 			if (!PE_parse_boot_argn("aocsound", &aocsound, sizeof(aocsound))) {
 				uint32_t speaker = 0;

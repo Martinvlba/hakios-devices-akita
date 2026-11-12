@@ -296,6 +296,44 @@ rec_thread(void *parameter, __unused wait_result_t result)
 	lck_mtx_unlock(mux_lock);
 }
 
+/*
+ * Port 8 (11-12): the sound recording (boot-arg rec_sound=N, drivers/audio/hakios.audio.c; with rec_sound_mic=1 what the
+ * phone's own microphones heard, hakios.akita_aoc.c aocmic=S) as it lies -- "RWSND001", then the blocks -- then the
+ * connection is closed. devices/akita/tools/usbmux-sound.py on the host; tools/sound.py makes the WAV.
+ */
+extern uint64_t loader_sound[3];                /* { physical address, bytes, kernel address }: hakios.audio.c */
+
+static void
+sound_thread(void *parameter, __unused wait_result_t result)
+{
+	struct mux_conn *c = parameter;
+	const uint8_t *base = (const uint8_t *)(uintptr_t)loader_sound[2];
+	uint64_t length = loader_sound[1];
+
+	if (base == NULL || length == 0) {
+		static const char none[] = "no sound recording: boot-arg rec_sound=N (rec_sound_mic=1: the microphones)\n";
+		screen_send(c, none, sizeof(none) - 1);
+	} else {
+		printf("akita usbmux: the sound recording, %llu KB\n", length >> 10);
+		for (uint64_t at = 0; at < length && c->open;) {
+			uint32_t n = (uint32_t)(length - at < MAX_DATA ? length - at : MAX_DATA);
+
+			if (!screen_send(c, base + at, n)) {
+				break;
+			}
+			at += n;
+		}
+	}
+	delay_for_interval(200, NSEC_PER_MSEC);
+	lck_mtx_lock(mux_lock);
+	if (c->open) {
+		send_tcp(c, TH_FIN | TH_ACK, c->tx_seq, c->rx_next, NULL, 0, false);
+		send_tcp(c, TH_RST, c->tx_seq + 1, c->rx_next, NULL, 0, false);
+	}
+	conn_free(c);
+	lck_mtx_unlock(mux_lock);
+}
+
 #define PMU_REBOOT_CMD          0x15460810UL    /* Android's tree: pixel-reboot, syscon PMU 0x15460000, reboot-cmd-offset 0x810 */
 #define REBOOT_BOOTLOADER       0xfc
 #define TENSOR_SMC_PMU_SEC_REG  0x82000504
@@ -436,7 +474,7 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		send_tcp(&refused, TH_RST, 0, seq + 1, NULL, 0, false);
 		return;
 	}
-	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7) {
+	if (phone_port == 1 || phone_port == 5 || phone_port == 6 || phone_port == 7 || phone_port == 8) {
 		lck_mtx_lock(mux_lock);
 		for (unsigned i = 0; i < CONNS && !c; i++) {
 			if (!conns[i].used) {
@@ -456,10 +494,10 @@ tcp_syn(uint16_t host_port, uint16_t phone_port, uint32_t seq)
 		}
 		printf("akita usbmux: host port %u: the %s\n", host_port,
 		    phone_port == 1 ? "console log" : phone_port == 5 ? "kernel message buffer" : phone_port == 7 ? "screen recording" :
-		    "screen");
+		    phone_port == 8 ? "sound recording" : "screen");
 		send_tcp(c, TH_SYN | TH_ACK, 0, seq + 1, NULL, 0, false);
 		if (kernel_thread_start(phone_port == 1 ? klog_thread : phone_port == 5 ? dmesg_thread : phone_port == 7 ? rec_thread :
-		    screen_thread, c,
+		    phone_port == 8 ? sound_thread : screen_thread, c,
 		    &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		}
