@@ -707,7 +707,9 @@ static uint8_t *trap_data;                      /* the extended trap data, when 
 #define ALL_CTRL_BUFS           (CTRL_BUFS + EVENT_BUFS_MAX)
 static uint32_t event_bufs = EVENT_BUFS_MAX;
 #define CTRL_BUF_SIZE           8192
-#define RX_BUFS                 256             /* data buffers posted on the rx post ring (brcmfmac: max_rxbufpost) */
+#define RX_BUFS                 1023            /* the most data buffers posted on the rx post ring (its 1024 items less
+                                                 * one; 2 MB; see rx_setup) */
+#define RX_BUFS_LEGACY          256             /* ... when the firmware names no number (bcmdhd's LEGACY_MAX_RXBUFPOST) */
 #define RX_BUF_SIZE             2048            /* brcmfmac's BRCMF_MSGBUF_MAX_PKT_SIZE */
 #define RX_ID_BASE              0x100           /* their request ids: RX_ID_BASE + n (the control buffers' are 1..40) */
 
@@ -1167,15 +1169,31 @@ rx_post(unsigned n)
 }
 
 /* (boot-arg wifi_rxbufs=N: fewer posted, a test -- the firmware's packet ids ran out after a few associations, 11-10) */
-static uint32_t rx_bufs = RX_BUFS;
+static uint32_t rx_bufs = RX_BUFS_LEGACY;
 
 static bool
 rx_setup(void)
 {
-	PE_parse_boot_argn("wifi_rxbufs", &rx_bufs, sizeof(rx_bufs));
-	if (rx_bufs == 0 || rx_bufs > RX_BUFS) {
+	/*
+	 * HOW MANY (11-12 evening, TODO 35e -- found in the firmware's own event logs, wifi_evhist: in EDL mode it wrote
+	 * format 0xa1d0 for every unicast frame, which is pciedev_process_d2h_rxpyld's "no host buffer for this frame", and
+	 * freed it; its rx post read index stood at 257 with 256 posted -- it had taken every buffer for the frames its
+	 * radio writes straight into host memory (its rxlfrag pool holds 256) and had none left for a frame it has to
+	 * copy up itself). bcmdhd posts what the firmware asks for: max_host_rxbufs, 16 bits at pcie_shared + 34
+	 * (dhd_prot_init: MAX_HOST_RXBUFS; 0 = an old firmware, then 256); this driver posted a fixed 256 (brcmfmac's
+	 * default). Now the firmware's number, at most RX_BUFS; wifi_rxbufs=N: N instead.
+	 */
+	uint32_t asked = mb.shared ? mem_rd(mb.shared + 32) >> 16 : 0, forced = 0;
+
+	rx_bufs = asked ? asked : RX_BUFS_LEGACY;
+	if (PE_parse_boot_argn("wifi_rxbufs", &forced, sizeof(forced)) && forced != 0) {
+		rx_bufs = forced;
+	}
+	if (rx_bufs > RX_BUFS) {
 		rx_bufs = RX_BUFS;
 	}
+	printf("wifi: rx buffers: the firmware asks for %u (pcie_shared + 34; its packets with host buffers: %u), %u posted\n",
+	    asked, mb.shared ? mem_rd(mb.shared + 32) & 0xffff : 0, rx_bufs);
 	static uint8_t *rx_area;                /* (one piece for the run: a recovery posts the same buffers again) */
 	static uint64_t rx_area_pa;
 
@@ -1364,6 +1382,106 @@ static struct {
 #define EDL_ITEMS               256             /* D2HRING_EDL_MAX_ITEM */
 #define EDL_ITEM_SIZE           2048            /* D2HRING_EDL_ITEMSIZE */
 static uint8_t *edl_ring;                       /* (its own piece, 512 KB, kept across recoveries) */
+
+/*
+ * wifi_evhist=1 (11-12 evening, TODO 35e): WHICH OF ITS LOG LINES THE FIRMWARE WRITES, counted. An EDL item is a message
+ * header (12 bytes), an info header (type, length), a msgtrace header (16 bytes) and an event-log block: its length (16
+ * bits), a count, the set, then records -- each its arguments (words) and LAST a header word: tag (8 bits), the number
+ * of argument words (8), and the format number (16), which is the constant the firmware's code passes to event_logN
+ * (fw_bcmdhd.bin: `ldr r1, =0xa1c0; movs r0, #0x30; bl event_log2` -- so a format number names the place in its code
+ * that wrote the line: the drop branches all log one). Read from the block's end backward, as bcmdhd does; the counts
+ * that grew are said every 30 s as tag/format+n (wifi_evhist=2: with the first two arguments of the last such record).
+ */
+static uint32_t evhist = ~0u;
+static struct {
+	uint16_t fmt;
+	uint8_t tag, args;
+	uint32_t count, said, a0, a1;
+} evh[384];
+static uint32_t evh_n, evh_lost, evh_items;
+
+static void
+edl_histogram(const uint8_t *m)
+{
+	if (evhist == ~0u) {
+		evhist = 0;
+		PE_parse_boot_argn("wifi_evhist", &evhist, sizeof(evhist));
+	}
+	if (evhist == 0) {
+		return;
+	}
+	uint32_t len = get16(m, 32);            /* the block's length, its own header included */
+
+	if (get16(m, 12) != 2 || len < 12 || 32 + len > EDL_ITEM_SIZE) {
+		return;
+	}
+	evh_items++;
+	int idx = (int)(len / 4) - 1;           /* the block's last word */
+	const uint8_t *w = m + 32;
+
+	while (idx >= 2) {
+		uint32_t h = get32(w, 4 * (uint32_t)idx), tag = h & 0xff, cnt = (h >> 8) & 0xff, fmt = h >> 16, i;
+
+		if (tag == 0) {                 /* (padding) */
+			idx--;
+			continue;
+		}
+		if ((int)cnt > idx - 2) {
+			break;
+		}
+		for (i = 0; i < evh_n && !(evh[i].fmt == fmt && evh[i].tag == tag); i++) {
+		}
+		if (i == evh_n) {
+			if (evh_n == sizeof(evh) / sizeof(evh[0])) {
+				evh_lost++;
+				idx -= (int)cnt + 1;
+				continue;
+			}
+			evh[evh_n].fmt = (uint16_t)fmt;
+			evh[evh_n].tag = (uint8_t)tag;
+			evh[evh_n].count = evh[evh_n].said = 0;
+			evh_n++;
+		}
+		evh[i].count++;
+		evh[i].args = (uint8_t)cnt;
+		/* (the arguments in order, the record's time stamp the last of them) */
+		evh[i].a0 = cnt >= 2 ? get32(w, 4 * (uint32_t)(idx - (int)cnt)) : 0;
+		evh[i].a1 = cnt >= 3 ? get32(w, 4 * (uint32_t)(idx - (int)cnt + 1)) : 0;
+		idx -= (int)cnt + 1;
+	}
+}
+
+/* every 30 s (en0's report): the log lines whose counts grew */
+static void
+edl_histogram_say(void)
+{
+	char line[420];
+	unsigned at = 0, n = 0;
+
+	if (evhist == 0 || evhist == ~0u) {
+		return;
+	}
+	for (uint32_t i = 0; i < evh_n; i++) {
+		if (evh[i].count == evh[i].said) {
+			continue;
+		}
+		if (evhist >= 2) {
+			at += scnprintf(line + at, sizeof(line) - at, " %x/%04x+%u(%x,%x)", evh[i].tag, evh[i].fmt,
+			    evh[i].count - evh[i].said, evh[i].a0, evh[i].a1);
+		} else {
+			at += scnprintf(line + at, sizeof(line) - at, " %x/%04x+%u", evh[i].tag, evh[i].fmt, evh[i].count - evh[i].said);
+		}
+		evh[i].said = evh[i].count;
+		if (++n % 16 == 0 || at > sizeof(line) - 48) {
+			printf("wifi: evhist:%s\n", line);
+			at = 0;
+		}
+	}
+	if (at != 0) {
+		printf("wifi: evhist:%s\n", line);
+	}
+	printf("wifi: evhist: %u items so far, %u kinds of line (%u more not kept)\n", evh_items, evh_n, evh_lost);
+}
 static uint64_t edl_ring_pa;
 
 static void
@@ -1410,6 +1528,7 @@ info_poll(void)
 				}
 				printf("wifi: edl: item %u (#%u):%s\n", info.r, info.completions, hex);
 			}
+			edl_histogram(edl_ring + (uint32_t)info.r * EDL_ITEM_SIZE);
 			info.completions++;
 			info.r = (uint16_t)((info.r + 1) % EDL_ITEMS);
 			mb.idx[mb.d2h_r + info.d2h] = info.r;
@@ -1465,7 +1584,15 @@ wifi_edl(void)
 	static uint32_t edl = ~0u;
 
 	if (edl == ~0u) {
-		edl = 0;
+		/*
+		 * 11-12 EVENING: THE EDL MODE IS THE DEFAULT AGAIN -- its lost rx was never the EDL ring's doing: the driver
+		 * posted 256 rx buffers where the firmware asks for 1023 (rx_setup), the firmware took them all for the frames
+		 * its radio writes into host memory and had none for a frame it copies up itself, which is every unicast
+		 * frame outside an A-MPDU -- the ARP answer first of all. (The old mode "worked" because its piled-up event
+		 * logs kept the firmware from taking them all.) With the firmware's number posted (rxbufs-edl): 323 frames in
+		 * the first 30 s, every fetch 200 from the first, no trap. wifi_edl=0: the old mode.
+		 */
+		edl = 1;
 		PE_parse_boot_argn("wifi_edl", &edl, sizeof(edl));
 	}
 	return edl != 0;
@@ -2548,6 +2675,43 @@ counters_watch(void)
 	int err = iovar_get("counters", buf, sizeof(buf));
 	uint32_t datalen = get16(buf, 2), off = 4;
 
+	{
+		/*
+		 * wifi_counters_all=1 (11-12 evening, TODO 35e): every counter the firmware gives that is not 0, as "index=value"
+		 * for each record of its answer (id 0x100 = wl_cnt_wlc_t, the WLC layer's: bcmdhd's include/wlioctl.h names the
+		 * words in order; the others are the MAC's) -- two of these lines a while apart show which drop count grows.
+		 */
+		static uint32_t all = ~0u;
+		uint32_t o = 4;
+
+		if (all == ~0u) {
+			all = 0;
+			PE_parse_boot_argn("wifi_counters_all", &all, sizeof(all));
+		}
+		while (all != 0 && err == 0 && o + 4 <= 4 + datalen && o + 4 <= sizeof(buf)) {
+			uint32_t id = get16(buf, o), len = get16(buf, o + 2), n = 0;
+			char line[400];
+			unsigned at = 0;
+
+			for (uint32_t i = 0; 4 * i + 4 <= len && o + 4 + 4 * i + 4 <= sizeof(buf); i++) {
+				uint32_t v = get32(buf + o + 4, 4 * i);
+
+				if (v == 0) {
+					continue;
+				}
+				at += scnprintf(line + at, sizeof(line) - at, " %u=%u", i, v);
+				if (++n % 16 == 0 || at > sizeof(line) - 32) {
+					printf("wifi: counters all: id 0x%x:%s\n", id, line);
+					at = 0;
+				}
+			}
+			if (at != 0) {
+				printf("wifi: counters all: id 0x%x:%s\n", id, line);
+			}
+			o += 4 + ((len + 3) & ~3u);
+		}
+	}
+
 	while (err == 0 && off + 4 <= 4 + datalen && off + 4 <= sizeof(buf)) {
 		uint32_t id = get16(buf, off), len = get16(buf, off + 2);
 
@@ -2834,6 +2998,34 @@ en0_poll(void)
 						    "%08x %08x %08x %08x; reorder flushes %u, 0x5bc %u\n", head, tail, mem_rd(pd + 8), h[0], h[1], h[2],
 						    h[3], h[4], mem_rd(0x0079fb78), mem_rd(pd + 0x5bc));
 					}
+					{
+						/*
+						 * THE WL LAYER'S CHAIN OF RX COMPLETIONS (wl_sendup_rxcmpl: a frame whose payload is in the host's
+						 * buffer already is not sent to the bus -- its completion id is chained at wl + 0xa4 {first, last,
+						 * count} and the chain handed to the bus at the end of wl_dpc, for each entry of the table at
+						 * [[wl + 0x60] + 0xc] (count: the byte at +0x48), by wl_flush_rxreorderqeue_flow; frames of a
+						 * block-ack flow are held in the AMPDU reorder's own chain instead). wl = the softc of the device
+						 * wl_rte$bcmwl (hnd_dev + 0x1c; + 0x24 the bus device it is chained to).
+						 */
+#define IN_RAM(a, n) ((a) >= ram_base && (a) + (n) <= ram_base + ram_size)
+						uint32_t wl = mem_rd(0x0079ee4c + 0x1c), chained = mem_rd(0x0079ee4c + 0x24);
+
+						if (IN_RAM(wl, 0xb0)) {
+							uint32_t x = mem_rd(wl + 0x60), tbl = IN_RAM(x, 0x10) ? mem_rd(x + 0xc) : 0;
+							int n = IN_RAM(tbl, 0x4c) ? (int8_t)(mem_rd(tbl + 0x48) & 0xff) : -1;
+
+							printf("wifi: wl: at 0x%08x (chained to 0x%08x, its flags 0x%x), unit %u, its chain: ids %08x count "
+							    "%u; flush table 0x%08x with %d entries\n", wl, chained, IN_RAM(chained, 0x18) ?
+							    mem_rd(chained + 0x14) : 0, mem_rd(wl + 0x10), mem_rd(wl + 0xa4), mem_rd(wl + 0xa8), tbl, n);
+							for (int i = 0; i < n && i < 8; i++) {
+								uint32_t e = mem_rd(tbl + 4 * i), w = IN_RAM(e, 12) ? mem_rd(e + 8) : 0;
+
+								printf("wifi: wl: flush entry %d: 0x%08x -> 0x%08x: chain ids %08x count %u\n", i, e, w,
+								    IN_RAM(w, 0xb0) ? mem_rd(w + 0xa4) : 0, IN_RAM(w, 0xb0) ? mem_rd(w + 0xa8) : 0);
+							}
+						}
+#undef IN_RAM
+					}
 					if (edl >= ram_base && edl + 12 <= ram_base + ram_size) {
 						ring = mem_rd(edl);
 						st = mem_rd(edl + 8);
@@ -2870,6 +3062,7 @@ en0_poll(void)
 		if (msi_word != NULL) {
 			printf("wifi: en0: %u MSIs so far\n", msi_seen);
 		}
+		edl_histogram_say();
 		if (!fw_halted && mb.tcm_d2h_w != 0) {
 			/*
 			 * (11-12, TODO 35e: since the EDL ring, ~10 frames a minute come in where 400 did before -- iOS "offline":
