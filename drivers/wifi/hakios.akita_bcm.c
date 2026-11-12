@@ -1224,6 +1224,37 @@ rx_frame(const uint8_t *f, uint32_t len, uint16_t flags, uint8_t ifidx)
 }
 
 /* what the chip has put on the rx completion ring (and the tx completion ring: nothing sent by the host yet) */
+/*
+ * The D2H read doorbell (11-12, TODO 35e/35f): with the ring indices DMA'd (ours in host memory), bcmdhd does not only
+ * write its read index there -- after each batch it read it RINGS H2D doorbell 0 with 0xDD000000 | ring << 16 | rd
+ * (__dhd_prot_upd_read_idx: "for DMA indices case ring doorbell once n items are read to sync with dongle"); this driver
+ * never did, and the firmware learned how far the host had read only as a side effect of other work -- the 11-12
+ * night's "rx held unless the event logs keep it busy" and, perhaps, the old mode's trap (packet ids held by
+ * completions it thinks unread). wifi_rddb=0: as before. RING: the ring's id (2-4 the common completion rings; a
+ * later D2H ring: max submission rings + its D2H offset, as DHD_D2H_RING_OFFSET reads it).
+ */
+static bool
+wifi_rddb(void)
+{
+	static uint32_t v = ~0u;
+
+	if (v == ~0u) {
+		v = 1;
+		PE_parse_boot_argn("wifi_rddb", &v, sizeof(v));
+	}
+	return v != 0;
+}
+
+static void
+d2h_read_doorbell(unsigned ring, uint16_t rd)
+{
+	if (!wifi_rddb()) {
+		return;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	pcie_wr(PCIE_H2D_MAILBOX_0, 0xdd000000u | ((uint32_t)(ring & 0xff) << 16) | rd);
+}
+
 static unsigned
 d2h_rx_poll(void)
 {
@@ -1269,6 +1300,9 @@ d2h_rx_poll(void)
 		mb.r[RING_D2H_RXCPL] = (uint16_t)((mb.r[RING_D2H_RXCPL] + 1) % ring_items[RING_D2H_RXCPL]);
 		mb.idx[mb.d2h_r + (RING_D2H_RXCPL - 2)] = mb.r[RING_D2H_RXCPL];
 		n++;
+	}
+	if (n) {
+		d2h_read_doorbell(RING_D2H_RXCPL, mb.r[RING_D2H_RXCPL]);
 	}
 	return n;
 }
@@ -1381,6 +1415,9 @@ info_poll(void)
 			mb.idx[mb.d2h_r + info.d2h] = info.r;
 			n++;
 		}
+		if (n) {
+			d2h_read_doorbell(ring_counts.max_sub + info.d2h, info.r);
+		}
 		return n;
 	}
 	if (w >= INFO_ITEMS) {
@@ -1403,6 +1440,9 @@ info_poll(void)
 		info.r = (uint16_t)((info.r + 1) % INFO_ITEMS);
 		mb.idx[mb.d2h_r + info.d2h] = info.r;
 		n++;
+	}
+	if (n) {
+		d2h_read_doorbell(ring_counts.max_sub + info.d2h, info.r);
 	}
 	return n;
 }
@@ -1616,6 +1656,9 @@ d2h_ctrl_poll(void)
 		mb.r[RING_D2H_CTRL] = (uint16_t)((mb.r[RING_D2H_CTRL] + 1) % ring_items[RING_D2H_CTRL]);
 		mb.idx[mb.d2h_r + (RING_D2H_CTRL - 2)] = mb.r[RING_D2H_CTRL];
 		n++;
+	}
+	if (n) {
+		d2h_read_doorbell(RING_D2H_CTRL, mb.r[RING_D2H_CTRL]);
 	}
 	n += d2h_rx_poll();
 	n += d2h_tx_poll();
@@ -2447,6 +2490,9 @@ d2h_tx_poll(void)
 		mb.r[RING_D2H_TXCPL] = (uint16_t)((mb.r[RING_D2H_TXCPL] + 1) % ring_items[RING_D2H_TXCPL]);
 		mb.idx[mb.d2h_r + (RING_D2H_TXCPL - 2)] = mb.r[RING_D2H_TXCPL];
 		n++;
+	}
+	if (n) {
+		d2h_read_doorbell(RING_D2H_TXCPL, mb.r[RING_D2H_TXCPL]);
 	}
 	return n;
 }
