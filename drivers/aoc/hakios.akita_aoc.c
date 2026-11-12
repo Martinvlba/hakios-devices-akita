@@ -46,6 +46,9 @@
 #include <vm/pmap.h>
 #include <kern/thread.h>
 #include <sys/hakios.audio.h>
+#include <sys/conf.h>
+#include <sys/uio.h>
+#include <miscfs/devfs/devfs.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start, vm_offset_t end, vm_prot_t prot, unsigned int flags);
@@ -1237,6 +1240,175 @@ aoc_mic_stop(void)
 	(void)aoc_in_cmd("AP_INPUT_STOP", in, sizeof(in), 209);
 }
 
+/*
+ * aocrec=1: the microphone for Darwin -- /dev/hakios-mic, as redwood's hakios.mic.c (mic=4) gives it to
+ * HakiosAudio.driver's device "Codec" (userland/src/audio_plugin.c), of which the virtual audio device makes the
+ * built-in microphone: 16-bit samples, one channel (mic 0), 48 kHz; a read never waits, keeping the reader about 40 ms
+ * behind; nothing until that much is there. The AoC records (aoc_mic_start) only while the device is open -- an
+ * application records, iOS shows its orange dot -- and stops three seconds after the last close.
+ */
+#define MRING_FRAMES            16384           /* 341 ms; a power of two */
+#define MRING_KEEP              1920            /* 40 ms */
+#define MRING_MOST              4800            /* 100 ms: more waiting, and the oldest is skipped */
+
+static uint32_t aocrec;
+static int16_t mring[MRING_FRAMES];
+static volatile uint64_t mring_written;
+static uint64_t mring_read, mring_skipped, mring_dry;
+static bool mring_primed;
+static volatile uint32_t mic_wanted;
+
+static int
+aoc_mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint64_t written = __atomic_load_n(&mring_written, __ATOMIC_ACQUIRE), avail, want;
+	int error = 0;
+
+	if (uio_resid(uio) < 2) {
+		return 0;
+	}
+	want = (uint64_t)uio_resid(uio) / 2;
+	avail = written - mring_read;
+	if (avail > MRING_MOST) {
+		mring_skipped += avail - MRING_KEEP;
+		mring_read = written - MRING_KEEP;
+		avail = MRING_KEEP;
+	}
+	if (!mring_primed) {
+		if (avail < MRING_KEEP) {
+			return 0;
+		}
+		mring_primed = true;
+	}
+	if (avail < want) {
+		mring_dry++;
+		mring_primed = false;
+	}
+	while (want > 0 && avail > 0 && error == 0) {
+		uint64_t at = mring_read % MRING_FRAMES, n = want < avail ? want : avail;
+
+		n = n < MRING_FRAMES - at ? n : MRING_FRAMES - at;
+		error = uiomove((caddr_t)&mring[at], (int)(n * 2), uio);
+		mring_read += n;
+		want -= n;
+		avail -= n;
+	}
+	return error;
+}
+
+static int
+aoc_mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	mic_wanted = 1;
+	return 0;
+}
+
+static int
+aoc_mic_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	mic_wanted = 0;
+	return 0;
+}
+
+static const struct cdevsw aoc_mic_cdevsw = {
+	.d_open = aoc_mic_dev_open, .d_close = aoc_mic_dev_close, .d_read = aoc_mic_dev_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* the AoC's capture while Darwin has /dev/hakios-mic open */
+static void
+aoc_darwin_mic_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	static int16_t buf[4800 * 2];
+	vm_offset_t svc = aoc_service("audio_capture0");
+	vm_offset_t r = svc ? region(svc, AOC_UP) : 0;
+	uint32_t size = r ? rd(r, 4) : 0, off = r ? rd(r, 0) : 0;
+
+	if (!svc || size == 0 || (uint64_t)off + size > ipc_room) {
+		printf("akita aoc: mic for Darwin: no audio_capture0 ring\n");
+		return;
+	}
+	for (;;) {
+		while (!mic_wanted) {
+			delay(50000);
+		}
+		uint64_t t0 = now_us(), frames = 0, idle_since = 0;
+		uint32_t peak = 0;
+		bool rec = hakios_audio_recording_mic();
+
+		if (!aoc_mic_start()) {
+			printf("akita aoc: mic for Darwin: the AoC would not record; again in a second\n");
+			delay(1000000);
+			continue;
+		}
+		mring_primed = false;
+		mring_read = __atomic_load_n(&mring_written, __ATOMIC_ACQUIRE);
+		printf("akita aoc: mic for Darwin: LISTENING (/dev/hakios-mic opened)\n");
+		for (;;) {
+			if (!mic_wanted) {
+				if (idle_since == 0) {
+					idle_since = now_us();
+				} else if (now_us() - idle_since > 3000000ULL) {
+					break;
+				}
+			} else {
+				idle_since = 0;
+			}
+			uint32_t tx = rd(r, 12), rx = rd(r, 16), avail = tx - rx;
+			if (avail > size) {
+				wr(r, 16, tx - size / 2);
+				wr(r, 24, (rd(r, 20) + size - size / 2) % size);
+				continue;
+			}
+			if (avail < 4) {
+				delay(5000);
+				continue;
+			}
+			uint32_t n = avail & ~3u, rp = rd(r, 24);
+			__builtin_arm_dmb(0xf);
+			n = n < sizeof(buf) ? n : (uint32_t)sizeof(buf);
+			for (uint32_t i = 0; i < n; i += 4) {
+				*(uint32_t *)((uint8_t *)buf + i) = *(volatile uint32_t *)(ipc_base + off + (rp + i) % size);
+			}
+			__builtin_arm_dsb(0xf);
+			wr(r, 16, rx + n);
+			wr(r, 24, (rp + n) % size);
+			uint64_t at = mring_written;
+			for (uint32_t f = 0; f < n / 4; f++) {
+				int16_t v = buf[2 * f];                 /* mic 0 */
+				uint32_t a = (uint32_t)(v < 0 ? -(int32_t)v : v);
+				mring[(at + f) % MRING_FRAMES] = v;
+				peak = a > peak ? a : peak;
+			}
+			__atomic_store_n(&mring_written, at + n / 4, __ATOMIC_RELEASE);
+			frames += n / 4;
+			if (rec) {
+				hakios_audio_record_fed(buf, n / 4);
+			}
+		}
+		aoc_mic_stop();
+		printf("akita aoc: mic for Darwin: stopped after %llu ms, %llu frames, peak %u of 32768; %llu skipped, %llu reads "
+		    "found too little\n", (now_us() - t0) / 1000, frames, peak, mring_skipped, mring_dry);
+	}
+}
+
+static void
+aoc_darwin_mic_init(void)
+{
+	thread_t t;
+	int major = cdevsw_add(-1, &aoc_mic_cdevsw);
+
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-mic") == NULL) {
+		printf("akita aoc: mic for Darwin: /dev/hakios-mic cannot be made\n");
+		return;
+	}
+	if (kernel_thread_start_priority(aoc_darwin_mic_thread, NULL, 90, &t) == KERN_SUCCESS) {
+		thread_deallocate(t);
+	}
+	printf("akita aoc: mic for Darwin: /dev/hakios-mic is the built-in microphone (the AoC listens only while it is open)\n");
+}
+
 /* the AoC's firmware loaded by the GSA and started through Trusty (aoc=3) */
 static void
 aoc_boot(void)
@@ -1492,6 +1664,9 @@ aoc_boot(void)
 					delay(100000);
 				}
 				aoc_mic_stop();
+			}
+			if (PE_parse_boot_argn("aocrec", &aocrec, sizeof(aocrec)) && aocrec != 0) {
+				aoc_darwin_mic_init();
 			}
 			if (!PE_parse_boot_argn("aocsound", &aocsound, sizeof(aocsound))) {
 				uint32_t speaker = 0;
