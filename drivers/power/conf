@@ -37,3 +37,9 @@ driver AKITA_POWER
 	requires AKITA_RTC
 	help    the Pixel 8a's way down: iOS's Shut Down powers the phone off, Restart resets it into the active slot (PSCI),
 	help    instead of the way back to the loader (still taken for xl's runs: loader_return_after)
+
+driver AKITA_MCT
+	file    bsd/dev/hakios.akita_mct.c
+	help    zuma's multi-core timer (MCT v3 at 0x100d0000) as the wake of idle cores that power down (cpuidle=1,
+	help    osfmk/arm64/psci_smp.c): core N's comparator, its interrupt routed to it, armed for the core's next deadline
+	help    while its own timer is stopped; a line every 30 s of how often cores powered down
