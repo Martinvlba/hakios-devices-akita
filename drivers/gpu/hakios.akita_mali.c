@@ -1808,7 +1808,7 @@ vm_kernel_free(unsigned int vm, uint64_t va, vm_offset_t memory, vm_size_t size)
  * used up the firmware raises the queue's tiler out-of-memory event and waits: tiler_oom() gives it one chunk more
  * (heap_grow, panthor_heap_grow's), up to the heap's max_chunks.
  */
-#define MAX_HEAPS               16
+#define MAX_HEAPS               48      /* (11-13, was 16: a heap a client, and there are up to MAX_VMS of those) */
 #define MAX_HEAP_CHUNKS         64
 #define HEAP_INITIAL_BYTES      (64u << 20)     /* the most of a heap's initial chunks together */
 
