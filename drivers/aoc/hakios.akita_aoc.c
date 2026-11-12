@@ -53,6 +53,7 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern int akita_trusty_aoc_cmd(uint32_t cmd, uint32_t *state);
 extern int akita_amp_speaker(int on) __attribute__((weak));       /* drivers/audio (amp=2): the CS35L41s */
+extern int akita_amp_variant(int k) __attribute__((weak));        /* (their audio port set up the K-th way: a listening test) */
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
     thread_t *new_thread);
 
@@ -171,6 +172,7 @@ carveout_map(void)
 /* ---- the AoC's IPC: services, their queues, the doorbells (aoc-ipc's aoc_ipc_core.c, aoc's mailbox-wc.c) ---------- */
 
 static vm_offset_t ipc_base;                    /* the IPC block (carveout + the image's size), mapped */
+static uint32_t ipc_room;                       /* the bytes mapped from ipc_base on (the carveout's rest) */
 static vm_offset_t aoc_mbox[3];                 /* the AP->AoC doorbells: mbox@15200000/15220000/15240000, 16 each */
 #define AOC_UP                          0       /* the AoC to us */
 #define AOC_DOWN                        1       /* us to the AoC */
@@ -313,6 +315,39 @@ aoc_audio_cmd(const char *service, void *cmd, uint32_t len)
  * 48 kHz 16-bit stereo into audio_playback0's ring (a ring service: bytes at wp, tx counts them; the AoC moves rx). */
 
 static uint32_t aocplay;
+static uint32_t aocplay_amp = 2000;             /* aocplay_amp=N: the tone's peak (2000: about -24 dBFS; 32767 full scale) */
+static uint32_t aocplay_lr;                     /* aocplay_lr=1: the tone one second left only, one second right only, by turns */
+static uint32_t aocsink = ~0u;                  /* aocsink=M: the speaker sink's processing mode before each stream (CMD_AUDIO_OUTPUT_SINK2:
+                                                 * 0 idle, 1 active, 2 bypass -- Waves' chain left out); unset: as the AoC has it */
+static uint32_t aocep = 1;                      /* aocep=N: the entry point played into (aocplay and Darwin's sound), audio_playbackN.
+                                                 * 1: Android's low-latency playback (EP2), the AoC's "Primary" source -- what
+                                                 * sounds (11-12). 0: Android's mmap/AAudio one, "UltraLL": the speaker mixer
+                                                 * takes it but never gives the speaker anything ("Input 0 RB overflow") */
+static uint32_t aocplay_matrix;                 /* aocplay_matrix=1: a listening test -- six seconds for each amplifier setting
+                                                 * K (akita_amp_variant), K beeps twice in them; aocplay=38 for all six */
+#define MATRIX_SEG      (6u * 48000u)           /* frames for each setting */
+#define MATRIX_N        6u
+
+/* the tone's on/off in the listening test: K beeps of 0.2 s (0.2 s apart) from 0.5 s and again from 3.5 s into setting K's
+ * six seconds; always on otherwise */
+static bool
+aoc_tone_on(uint64_t frame)
+{
+	if (!aocplay_matrix) {
+		return true;
+	}
+	uint32_t k = (uint32_t)(frame / MATRIX_SEG) + 1, f = (uint32_t)(frame % MATRIX_SEG);
+	if (k > MATRIX_N) {
+		return false;
+	}
+	for (uint32_t g = 0; g < 2; g++) {
+		uint32_t start = 24000 + g * 144000;
+		if (f >= start && f < start + k * 19200) {
+			return (f - start) % 19200 < 9600;
+		}
+	}
+	return false;
+}
 
 static bool
 aoc_out_cmd(const char *what, void *cmd, uint32_t len, uint16_t id)
@@ -366,7 +401,8 @@ aoc_out_state(void)
 	}
 }
 
-/* a 440 Hz tone at about -24 dBFS (amplitude 2000), frame FRAME onwards, BYTES of it at ring offset AT (wrapping) */
+/* a 440 Hz tone (peak aocplay_amp: 2000 about -24 dBFS), frame FRAME onwards, BYTES of it at ring offset AT (wrapping);
+ * aocplay_lr=1: odd seconds left only, even seconds right only (which speaker plays which side) */
 static void
 aoc_tone(vm_offset_t ring, uint32_t size, uint32_t at, uint32_t bytes, uint64_t *frame)
 {
@@ -375,29 +411,208 @@ aoc_tone(vm_offset_t ring, uint32_t size, uint32_t at, uint32_t bytes, uint64_t 
 		                       2000 };
 	for (uint32_t i = 0; i + 4 <= bytes; i += 4) {
 		uint32_t ph = (uint32_t)((*frame * 440ULL * 64ULL / 48000ULL) % 64);    /* 64 steps a period */
-		int16_t v = ph < 16 ? q[ph] : ph < 32 ? q[32 - ph] : ph < 48 ? (int16_t)-q[ph - 32] : (int16_t)-q[64 - ph];
+		int32_t v = ph < 16 ? q[ph] : ph < 32 ? q[32 - ph] : ph < 48 ? -q[ph - 32] : -q[64 - ph];
+		v = aoc_tone_on(*frame) ? v * (int32_t)aocplay_amp / 2000 : 0;
+		uint16_t l = (uint16_t)(int16_t)v, r = l;
+		if (aocplay_lr) {
+			if ((*frame / 48000) % 2 == 0) {
+				r = 0;
+			} else {
+				l = 0;
+			}
+		}
 		uint32_t o = (at + i) % size;
-		*(volatile uint32_t *)(ring + o) = (uint16_t)v | ((uint32_t)(uint16_t)v << 16);
+		*(volatile uint32_t *)(ring + o) = l | ((uint32_t)r << 16);
 		(*frame)++;
+	}
+}
+
+/*
+ * aoclog=1: what the AoC wrote on service NAME towards us (its "logging" -- Android's aocd puts it in logcat -- and
+ * "debug"), as text lines (11-12: why its speaker output is silent). A ring: the last 4 KB; a queue: each message waiting.
+ */
+static uint32_t aoclog;
+
+static void
+aoc_text(const char *name, const uint8_t *b, uint32_t n, uint32_t *lines)
+{
+	char line[161];
+	uint32_t at = 0;
+
+	for (uint32_t i = 0; i <= n && *lines < 400; i++) {
+		uint8_t c = i < n ? b[i] : '\n';
+		if (c == '\n' || c == 0 || at == 160) {
+			if (at > 0) {
+				line[at] = 0;
+				printf("akita aoc: [%s] %s\n", name, line);
+				(*lines)++;
+			}
+			at = 0;
+			if (c == '\n' || c == 0) {
+				continue;
+			}
+		}
+		line[at++] = (c >= 32 && c < 127) ? (char)c : '.';
+	}
+}
+
+static void
+aoc_dump_service(const char *name)
+{
+	vm_offset_t svc = aoc_service(name);
+	static uint8_t buf[4096];
+	uint32_t lines = 0;
+
+	if (!svc) {
+		printf("akita aoc: [%s] no such service\n", name);
+		return;
+	}
+	vm_offset_t r = region(svc, AOC_UP);
+	uint32_t type = (rd(svc, 32) >> 16) & 7, off = rd(r, 0), size = rd(r, 4), slots = rd(r, 8), tx = rd(r, 12),
+	    rx = rd(r, 16);
+	printf("akita aoc: [%s] type %u, towards us: %u bytes at +0x%x, slots %u, tx %u rx %u wp %u rp %u\n", name, type, size,
+	    off, slots, tx, rx, rd(r, 20), rd(r, 24));
+	if (type == 1 && size != 0) {                   /* a ring: bytes; tx counts them */
+		uint32_t n = tx < sizeof(buf) ? tx : sizeof(buf);
+		n = n < size ? n : size;
+		for (uint32_t i = 0; i < n; i++) {
+			buf[i] = *(volatile uint8_t *)(ipc_base + off + (tx - n + i) % size);
+		}
+		aoc_text(name, buf, n, &lines);
+	} else if (slots != 0 && size > 8) {            /* a queue: messages with an 8-byte header */
+		for (uint32_t k = (tx - rx > slots ? tx - slots : rx); k != tx && lines < 400; k++) {
+			vm_offset_t slot = ipc_base + off + size * (k % slots);
+			uint32_t len = rd(slot, 0) & 0xffff;
+			len = len < size - 8 ? len : size - 8;
+			len = len < sizeof(buf) ? len : sizeof(buf);
+			for (uint32_t i = 0; i < len; i++) {
+				buf[i] = *(volatile uint8_t *)(slot + 8 + i);
+			}
+			aoc_text(name, buf, len, &lines);
+		}
+	}
+	printf("akita aoc: [%s] %u lines\n", name, lines);
+}
+
+/* aoclog=1: the AoC's "logging" queue drained every 20 ms into the kernel log from its start on (what Android's aocd puts
+ * in logcat: plain text, one message a slot; a core's "F1: " prefix comes as a message of its own) -- left alone it fills
+ * at 256 messages and the AoC says nothing more */
+static void
+aoc_log_thread(__unused void *arg, __unused wait_result_t wr_)
+{
+	vm_offset_t svc = aoc_service("logging");
+	static uint8_t buf[512];
+	char prefix[8] = "";
+	uint32_t lines = 0;
+
+	if (!svc) {
+		return;
+	}
+	vm_offset_t r = region(svc, AOC_UP);
+	for (;;) {
+		uint32_t off = rd(r, 0), size = rd(r, 4), slots = rd(r, 8), tx = rd(r, 12), rx = rd(r, 16);
+
+		if (slots == 0 || size <= 8 || tx == rx) {
+			delay(20000);
+			continue;
+		}
+		vm_offset_t slot = ipc_base + off + size * (rx % slots);
+		uint32_t len = rd(slot, 0) & 0xffff;
+		len = len < size - 8 ? len : size - 8;
+		len = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+		for (uint32_t i = 0; i < len; i++) {
+			uint8_t c = *(volatile uint8_t *)(slot + 8 + i);
+			buf[i] = (c >= 32 && c < 127) ? c : (c == 0 ? 0 : ' ');
+		}
+		buf[len] = 0;
+		wr(r, 16, rx + 1);
+		wr(r, 24, (rd(r, 24) + 1) % size);
+		uint32_t n = (uint32_t)strlen((const char *)buf);
+		while (n > 0 && buf[n - 1] == ' ') {
+			buf[--n] = 0;
+		}
+		if (n == 0) {
+			continue;
+		}
+		if (n <= 3 && buf[n - 1] == ':') {      /* "F1:", "H0:", "A3:" -- the core of the next message */
+			strlcpy(prefix, (const char *)buf, sizeof(prefix));
+			continue;
+		}
+		printf("akita aoc: [log %u] %s%s%s\n", ++lines, prefix, prefix[0] ? " " : "", buf);
+		prefix[0] = 0;
+	}
+}
+
+/*
+ * aocasp=M: the speaker mixer's post-processing (Google's "AoC Speaker Mixer ASP Mode": SET_PARAMETER block 16, component
+ * 2, key 0 -- 0 off, 1 on, 2 bypass, 3 ground). 11-12, the AoC's own log: the speaker mixer AMixSPKR (core H0, "PostProcessing
+ * Config: WAVES") takes our samples but gives the speaker's TDM nothing ("HF overrun. RP not 384 bytes behind WP", then
+ * "Input 0 RB overflow"): Waves, which Android's HAL sets up with its tunings, never set up here.
+ */
+static uint32_t aocasp = ~0u;
+
+static void
+aoc_speaker_asp(void)
+{
+	uint8_t g[18] = { 0 }, p[18] = { 0 };
+	uint32_t key = 0, val = 0;
+
+	if (aocasp > 3) {
+		return;
+	}
+	g[8] = 16;
+	g[9] = 2;
+	memcpy(g + 10, &key, 4);
+	if (aoc_out_cmd("GET_PARAMETER (speaker mixer ASP mode)", g, sizeof(g), 211)) {
+		memcpy(&val, g + 14, 4);
+		printf("akita aoc: the speaker mixer's ASP mode: %u (0 off, 1 on, 2 bypass, 3 ground), as found\n", val);
+	}
+	p[8] = 16;
+	p[9] = 2;
+	memcpy(p + 10, &key, 4);
+	memcpy(p + 14, &aocasp, 4);
+	aoc_out_cmd(aocasp == 2 ? "SET_PARAMETER (speaker mixer ASP BYPASS)" : "SET_PARAMETER (speaker mixer ASP mode)", p, sizeof(p),
+	    209);
+	memset(g + 14, 0, 4);
+	if (aoc_out_cmd("GET_PARAMETER (speaker mixer ASP mode)", g, sizeof(g), 211)) {
+		memcpy(&val, g + 14, 4);
+		printf("akita aoc: the speaker mixer's ASP mode: %u, after ours (%u)\n", val, aocasp);
+	}
+}
+
+/* the speaker sink's processing mode (aocsink=M), before a stream's EP_SETUP: Google's "Audio Sink 0 Processing State" */
+static void
+aoc_sink_mode(void)
+{
+	aoc_speaker_asp();
+	if (aocsink <= 2) {
+		uint8_t sk[11] = { 0 };                 /* struct CMD_AUDIO_OUTPUT_SINK2: sink, mode, timestamping */
+		sk[8] = 0;                              /* SINK_SPEAKER */
+		sk[9] = (uint8_t)aocsink;
+		aoc_out_cmd(aocsink == 2 ? "SINK2 speaker BYPASS" : aocsink == 1 ? "SINK2 speaker active" : "SINK2 speaker idle", sk,
+		    sizeof(sk), 270);
 	}
 }
 
 static void
 aoc_play(void)
 {
-	vm_offset_t svc = aoc_service("audio_playback0");
+	char svcname[24];
+
+	snprintf(svcname, sizeof(svcname), "audio_playback%u", aocep);
+	vm_offset_t svc = aoc_service(svcname);
 
 	if (!svc) {
-		printf("akita aoc: no audio_playback0\n");
+		printf("akita aoc: no %s\n", svcname);
 		return;
 	}
 	vm_offset_t r = region(svc, AOC_DOWN);
 	uint32_t size = rd(r, 4), off = rd(r, 0);
-	printf("akita aoc: audio_playback0: flags 0x%x (type %u, mailbox %u), down: %u bytes at +0x%x, slots %u, tx %u rx %u wp %u rp %u\n",
-	    rd(svc, 32), (rd(svc, 32) >> 16) & 7, (rd(svc, 32) >> 19) & 0x1f, size, off, rd(r, 8), rd(r, 12), rd(r, 16), rd(r, 20),
-	    rd(r, 24));
-	if (size < 7680 || ((rd(svc, 32) >> 16) & 7) != 1) {        /* (15360 here: four 20 ms periods) */
-		printf("akita aoc: audio_playback0 is not the ring expected; no sound\n");
+	printf("akita aoc: %s: flags 0x%x (type %u, mailbox %u), down: %u bytes at +0x%x, slots %u, tx %u rx %u wp %u rp %u\n",
+	    svcname, rd(svc, 32), (rd(svc, 32) >> 16) & 7, (rd(svc, 32) >> 19) & 0x1f, size, off, rd(r, 8), rd(r, 12), rd(r, 16),
+	    rd(r, 20), rd(r, 24));
+	if (size < 7680 || ((rd(svc, 32) >> 16) & 7) != 1 || (uint64_t)off + size > ipc_room) {   /* (15360 here: four 20 ms periods) */
+		printf("akita aoc: %s is not the ring expected; no sound\n", svcname);
 		return;
 	}
 	uint32_t period = 3840, buffer = (size / period) * period;  /* 20 ms periods */
@@ -420,27 +635,28 @@ aoc_play(void)
 	ep[22] = 5;                                     /* SR_48KHZ */
 	ep[23] = 1;                                     /* FRMT_FIXED_POINT */
 	ep[24] = 0;                                     /* offset */
-	ep[25] = 0;                                     /* channel: entry point 0 */
+	ep[25] = (uint8_t)aocep;                        /* channel: the entry point (aocep=N; 0 Android's mmap/ULL one) */
 	ep[26] = 1;                                     /* wraparound */
 	ep[27] = 0;                                     /* ENTRYPOINT_MODE_PLAYBACK */
 	uint8_t ep2[18] = { 0 };                        /* struct CMD_AUDIO_OUTPUT_EP_SETUP2 */
-	ep2[8] = 0;
+	ep2[8] = (uint8_t)aocep;
 	*(uint32_t *)(ep2 + 9) = buffer;
 	*(uint32_t *)(ep2 + 13) = period;
 	ep2[17] = 0;
 	uint8_t bind[11] = { 0 };                       /* struct CMD_AUDIO_OUTPUT_BIND: src, dst, bind */
-	bind[8] = 0;
+	bind[8] = (uint8_t)aocep;
 	bind[9] = 0;                                    /* SINK_SPEAKER */
 	bind[10] = 1;
 	uint8_t src[10] = { 0 };                        /* struct CMD_AUDIO_OUTPUT_SOURCE: source, on */
-	src[8] = 0;
+	src[8] = (uint8_t)aocep;
 	src[9] = 1;
 
+	aoc_sink_mode();
 	if (!aoc_out_cmd("EP_SETUP", ep, sizeof(ep), 206) || !aoc_out_cmd("EP_SETUP2", ep2, sizeof(ep2), 298) ||
 	    !aoc_out_cmd("BIND2 to the speaker", bind, sizeof(bind), 271)) {
 		return;
 	}
-	(void)aoc_volume(0, 0);                         /* (entry point 0 at SINK_SPEAKER, as Google's driver at prepare) */
+	(void)aoc_volume((uint8_t)aocep, 0);            /* (the entry point at SINK_SPEAKER, as Google's driver at prepare) */
 
 	/* the ring filled half before the source goes on, then kept half full for AOCPLAY seconds */
 	vm_offset_t ring = ipc_base + off;
@@ -455,11 +671,13 @@ aoc_play(void)
 	if (!aoc_out_cmd("SOURCE on", src, sizeof(src), 201)) {
 		return;
 	}
+	aoc_sink_mode();                                /* (again once bound and on: the bind set the sink active, 11-12) */
 	aoc_out_state();
 
 	uint32_t rx0 = rd(r, 16);
 	uint64_t t0 = mach_absolute_time(), ns;
 	bool amps = false;
+	uint32_t seg = ~0u;                             /* (the listening test's setting now, from 0) */
 	for (uint32_t ms = 0; ms < aocplay * 1000; ms += 10) {
 		delay(10000);
 		uint32_t tx = rd(r, 12), rx = rd(r, 16);
@@ -477,13 +695,27 @@ aoc_play(void)
 			aoc_out_state();
 		}
 		if (ms == 200 && rd(r, 16) != rx0 && akita_amp_speaker) {     /* the AoC reading: its TDM runs, the amps' PLL can lock */
-			amps = akita_amp_speaker(1) == 0;
+			amps = (aocplay_matrix && akita_amp_variant ? akita_amp_variant(1) : akita_amp_speaker(1)) == 0;
+			seg = 0;
+		}
+		if (aocplay_matrix && akita_amp_variant && seg != ~0u) {
+			/* the frame the AoC is at: what was made less what waits in the ring */
+			uint64_t now = frame - (uint64_t)((rd(r, 12) - rd(r, 16)) / 4);
+			uint32_t s = (uint32_t)(now / MATRIX_SEG);
+			if (s != seg && s < MATRIX_N) {
+				seg = s;
+				amps = akita_amp_variant((int)s + 1) == 0;
+			}
 		}
 		if (ms % 1000 == 990) {
 			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 			printf("akita aoc: playing: the AoC has read %u bytes in %llu ms (%llu bytes/s; 192000 is 48 kHz stereo 16-bit), "
 			    "queued %u\n", rx - rx0, ns / 1000000, ns ? (uint64_t)(rx - rx0) * 1000000000ULL / ns : 0, queued);
 		}
+	}
+	if (aocplay_matrix && akita_amp_variant && seg != ~0u) {
+		akita_amp_variant(0);                   /* (the amplifiers as set up again, down) */
+		amps = false;
 	}
 	if (amps) {
 		akita_amp_speaker(0);
@@ -492,6 +724,9 @@ aoc_play(void)
 	aoc_out_cmd("SOURCE off", src, sizeof(src), 201);
 	bind[10] = 0;
 	aoc_out_cmd("BIND2 off", bind, sizeof(bind), 271);
+	if (aoclog) {
+		aoc_dump_service("debug");
+	}
 }
 
 /* the first conversation: CMD_AUDIO_OUTPUT_GET_DSP_STATE (233) on audio_output_control */
@@ -604,6 +839,8 @@ aoc_stream(bool on, vm_offset_t svc, vm_offset_t r, vm_offset_t ring, uint32_t s
 	static int16_t silence[BLOCK_FRAMES * 2];
 	uint8_t ep[28] = { 0 }, ep2[18] = { 0 }, bind[11] = { 0 }, src[10] = { 0 };
 
+	bind[8] = (uint8_t)aocep;
+	src[8] = (uint8_t)aocep;
 	bind[9] = 0;                                    /* SINK_SPEAKER */
 	if (!on) {
 		src[9] = 0;
@@ -615,18 +852,24 @@ aoc_stream(bool on, vm_offset_t svc, vm_offset_t r, vm_offset_t ring, uint32_t s
 		wr(r, 20, 0);
 	}
 	*(uint32_t *)(ep + 12) = 48000;
-	ep[20] = 2; ep[21] = 1; ep[22] = 5; ep[23] = 1; ep[25] = 0; ep[26] = 1; ep[27] = 0;     /* as aoc_play's */
+	ep[20] = 2; ep[21] = 1; ep[22] = 5; ep[23] = 1; ep[25] = (uint8_t)aocep; ep[26] = 1; ep[27] = 0;     /* as aoc_play's */
+	ep2[8] = (uint8_t)aocep;
 	*(uint32_t *)(ep2 + 9) = buffer;
 	*(uint32_t *)(ep2 + 13) = BLOCK_BYTES;
 	bind[10] = 1;
 	src[9] = 1;
+	aoc_sink_mode();
 	if (!aoc_out_cmd("EP_SETUP", ep, sizeof(ep), 206) || !aoc_out_cmd("EP_SETUP2", ep2, sizeof(ep2), 298) ||
 	    !aoc_out_cmd("BIND2 to the speaker", bind, sizeof(bind), 271)) {
 		return false;
 	}
-	(void)aoc_volume(0, 0);
+	(void)aoc_volume((uint8_t)aocep, 0);
 	aoc_ring_put(svc, r, ring, size, silence, BLOCK_BYTES);
-	return aoc_out_cmd("SOURCE on", src, sizeof(src), 201);
+	if (!aoc_out_cmd("SOURCE on", src, sizeof(src), 201)) {
+		return false;
+	}
+	aoc_sink_mode();                                /* (again once bound and on: the bind set the sink active, 11-12) */
+	return true;
 }
 
 /*
@@ -639,21 +882,24 @@ static void
 aoc_sound_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	static int16_t block[BLOCK_FRAMES * 2];
-	vm_offset_t svc = aoc_service("audio_playback0");
+	char svcname[24];
+
+	snprintf(svcname, sizeof(svcname), "audio_playback%u", aocep);
+	vm_offset_t svc = aoc_service(svcname);
 	vm_offset_t r = svc ? region(svc, AOC_DOWN) : 0;
 	uint32_t size = r ? rd(r, 4) : 0, period = BLOCK_BYTES, buffer = (size / period) * period;
 	vm_offset_t ring = r ? ipc_base + rd(r, 0) : 0;
 
 	if (!svc || buffer < 3 * period) {
-		printf("akita aoc: sound: no audio_playback0 ring to play into (%u bytes)\n", size);
+		printf("akita aoc: sound: no %s ring to play into (%u bytes)\n", svcname, size);
 		return;
 	}
 	hakios_guard_configure(true, aocsound_gain);
 	hakios_guard_attenuation(0);
 	hakios_audio_set_sink("the speakers (the AoC and two CS35L41s, hakios.akita_aoc.c)", aoc_darwin_sink);
-	printf("akita aoc: sound: WHAT DARWIN PLAYS GOES TO THE SPEAKERS from here on (the AoC's entry point 0, started while "
-	    "there is sound: 48 kHz 16-bit stereo, three 20 ms blocks ahead; the guard's gain %u.%03u dB; the amplifiers %s)\n",
-	    aocsound_gain / 8, aocsound_gain % 8 * 125, akita_amp_speaker ? "on while there is sound (with speaker=1)" :
+	printf("akita aoc: sound: WHAT DARWIN PLAYS GOES TO THE SPEAKERS from here on (the AoC's entry point %u, %s, started "
+	    "while there is sound: 48 kHz 16-bit stereo, three 20 ms blocks ahead; the guard's gain %u.%03u dB; the amplifiers %s)\n",
+	    aocep, svcname, aocsound_gain / 8, aocsound_gain % 8 * 125, akita_amp_speaker ? "on while there is sound (with speaker=1)" :
 	    "NOT BUILT: unheard");
 
 	bool streaming = false, on = false, muted = false, tried = false;
@@ -911,6 +1157,7 @@ aoc_boot(void)
 				printf("akita aoc: services:%s\n", line);
 			}
 			ipc_base = dram + image_size;
+			ipc_room = AOC_DRAM_SIZE - image_size;
 			aoc_talk();
 			{
 				/* (aocvol_probe=1: the volume command once, no stream -- does the AoC take it? silent) */
@@ -936,7 +1183,49 @@ aoc_boot(void)
 					}
 				}
 			}
+			PE_parse_boot_argn("aocsink", &aocsink, sizeof(aocsink));
+			PE_parse_boot_argn("aocasp", &aocasp, sizeof(aocasp));
+			PE_parse_boot_argn("aocep", &aocep, sizeof(aocep));
+			if (aocep > 6) {
+				aocep = 0;
+			}
+			PE_parse_boot_argn("aoclog", &aoclog, sizeof(aoclog));
+			if (aoclog) {
+				thread_t lt;
+				char nm[24];
+
+				/* where each playback ring is, both ways (11-12: aocep=1 froze the phone) -- said before anything
+				 * touches them, the log given time to get out */
+				for (uint32_t k = 0; k <= 6; k++) {
+					snprintf(nm, sizeof(nm), "audio_playback%u", k);
+					vm_offset_t v = aoc_service(nm);
+					if (v) {
+						vm_offset_t dn = region(v, AOC_DOWN), up = region(v, AOC_UP);
+						printf("akita aoc: %s: flags 0x%x type %u; down %u bytes at +0x%x slots %u tx %u rx %u; up %u at "
+						    "+0x%x; room 0x%x\n", nm, rd(v, 32), (rd(v, 32) >> 16) & 7, rd(dn, 4), rd(dn, 0), rd(dn, 8),
+						    rd(dn, 12), rd(dn, 16), rd(up, 4), rd(up, 0), ipc_room);
+					}
+				}
+				delay(500000);
+
+				if (kernel_thread_start_priority(aoc_log_thread, NULL, 80, &lt) == KERN_SUCCESS) {
+					thread_deallocate(lt);
+				}
+				delay(300000);                  /* (the boot's 256 messages out before ours start) */
+			}
 			if (PE_parse_boot_argn("aocplay", &aocplay, sizeof(aocplay)) && aocplay != 0) {
+				PE_parse_boot_argn("aocplay_amp", &aocplay_amp, sizeof(aocplay_amp));
+				if (aocplay_amp > 32767) {
+					aocplay_amp = 32767;
+				}
+				PE_parse_boot_argn("aocplay_lr", &aocplay_lr, sizeof(aocplay_lr));
+				PE_parse_boot_argn("aocplay_matrix", &aocplay_matrix, sizeof(aocplay_matrix));
+				if (aocplay_matrix) {
+					printf("akita aoc: aocplay_matrix: THE LISTENING TEST -- for each amplifier setting K (1-%u) K beeps, "
+					    "twice, in %u s\n", MATRIX_N, MATRIX_SEG / 48000);
+				}
+				printf("akita aoc: aocplay: a 440 Hz tone for %u s, peak %u of 32767%s\n", aocplay, aocplay_amp,
+				    aocplay_lr ? ", left only and right only by turns (left first)" : ", both sides");
 				aoc_play();
 			}
 			if (!PE_parse_boot_argn("aocsound", &aocsound, sizeof(aocsound))) {

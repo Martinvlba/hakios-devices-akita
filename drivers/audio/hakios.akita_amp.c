@@ -110,6 +110,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define L41_GLOBAL_CLK_CTRL          0x00002c0c
 #define L41_PLL_CLK_CTRL             0x00002c04
 #define L41_SP_ENABLES               0x00004800
+#define L41_INPUT_SRC_VMON_EARLY     0x18            /* (ASP TX sources: VMON, IMON -- L41_INPUT_SRC_* below, for the DSP) */
+#define L41_INPUT_SRC_IMON_EARLY     0x19
 #define L41_SP_RATE_CTRL             0x00004804
 #define L41_SP_FORMAT                0x00004808
 #define L41_SP_HIZ_CTRL              0x0000480c
@@ -586,6 +588,28 @@ amp_setup(int chip)
 	}
 	/* the left amplifier plays slot 0, the right slot 1 (RX1 bits 5:0, RX2 bits 13:8) */
 	amp_update(chip, L41_SP_FRAME_RX_SLOT, 0x3f3f, chip ? 0x0001 : 0x0100);
+	{
+		/*
+		 * amp_vi=1: the speakers' voltage and current back to the AoC on TDM_0_TX, as Android's mixer has them (ASP TX1
+		 * VMON, TX2 IMON; left TX1 slot 0 / TX2 slot 2, right 1 / 3; 32-bit) -- 11-12, the AoC sending silence: does its
+		 * speaker chain wait for the feedback? (This driver never sent it: SDOUT high-impedance.)
+		 */
+		uint32_t vi = 0;
+
+		PE_parse_boot_argn("amp_vi", &vi, sizeof(vi));
+		if (vi) {
+			amp_write(chip, 0x00004c20, L41_INPUT_SRC_VMON_EARLY);     /* ASP_TX1_SRC */
+			amp_write(chip, 0x00004c24, L41_INPUT_SRC_IMON_EARLY);     /* ASP_TX2_SRC */
+			amp_update(chip, L41_SP_FRAME_TX_SLOT, 0x3f3f, chip ? 0x0301 : 0x0200);
+			amp_update(chip, L41_SP_FORMAT, 0x00ff0000, 32u << 16);    /* ASP_WIDTH_TX */
+			amp_update(chip, L41_SP_TX_WL, 0x3f, 32);
+			amp_update(chip, L41_PWR_CTRL2, 0x3000, 0x3000);           /* VMON, IMON on */
+			amp_update(chip, L41_SP_ENABLES, 0x3, 0x3);                /* ASP TX1, TX2 */
+			if (chip == 0) {
+				printf("akita amp: amp_vi=1: VMON/IMON back to the AoC on TDM_0_TX (slots 0-3)\n");
+			}
+		}
+	}
 
 	/* the PLL from SCLK (6.144 MHz = 48 kHz x 4 slots x 32 bits); the frame-sync monitor for that clock */
 	amp_update(chip, L41_PLL_CLK_CTRL, L41_PLL_OPENLOOP_MASK, L41_PLL_OPENLOOP_MASK);
@@ -1114,6 +1138,44 @@ akita_amp_speaker(int on)
 		}
 	}
 	return 0;
+}
+
+/*
+ * A listening test (11-12, the speakers silent though the AoC streams and both amplifiers run): akita_amp_variant(K)
+ * powers both down, sets their audio port up the K-th way, powers them up -- the AoC's driver (aocplay_matrix=1) plays
+ * K beeps with each K, so the tester's "I heard N beeps" names the setting that works. 1 as set up (DSP-A, 32-bit slots
+ * and words, left slot 0 / right slot 1), 2 I2S, 3 slots 2 and 3, 4 SCLK inverted, 5 LRCLK inverted, 6 16-bit slots and
+ * words. Anything else: as set up, powered down.
+ */
+int akita_amp_variant(int k);
+int
+akita_amp_variant(int k)
+{
+	static const char *what[] = { "as set up", "as set up (DSP-A, 32-bit, left slot 0 / right slot 1)", "I2S",
+		                      "slots 2 and 3", "SCLK inverted", "LRCLK inverted", "16-bit slots and words" };
+
+	if (!amps_ready || !speaker_allowed) {
+		return -1;
+	}
+	akita_amp_speaker(0);
+	for (int chip = 0; chip < 2; chip++) {
+		uint32_t fmt = 0, inv = 0, width = 32, wl = 32, slots = chip ? 0x0001 : 0x0100;
+
+		switch (k) {
+		case 2: fmt = 2; break;
+		case 3: slots = chip ? 0x0203 : 0x0302; break;
+		case 4: inv = L41_SCLK_INV_MASK; break;
+		case 5: inv = L41_LRCLK_INV_MASK; break;
+		case 6: width = 16; wl = 16; break;
+		default: break;
+		}
+		amp_update(chip, L41_SP_FORMAT, L41_ASP_FMT_MASK | L41_SCLK_INV_MASK | L41_LRCLK_INV_MASK | L41_ASP_WIDTH_RX_MASK,
+		    (fmt << L41_ASP_FMT_SHIFT) | inv | (width << L41_ASP_WIDTH_RX_SHIFT));
+		amp_update(chip, L41_SP_FRAME_RX_SLOT, 0x3f3f, slots);
+		amp_update(chip, L41_SP_RX_WL, L41_ASP_RX_WL_MASK, wl << L41_ASP_RX_WL_SHIFT);
+	}
+	printf("akita amp: VARIANT %d: %s\n", k, (k >= 1 && k <= 6) ? what[k] : what[0]);
+	return (k >= 1 && k <= 6) ? akita_amp_speaker(1) : 0;
 }
 
 /* chip CHIP out of reset and asked who it is (cs35l41_probe's first half) */
