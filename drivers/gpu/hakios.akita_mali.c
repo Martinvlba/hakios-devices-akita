@@ -1378,6 +1378,11 @@ struct mali_queue {
 	volatile uint64_t *seqno;       /* the sequence page: the last number the queue reached */
 	uint64_t seqno_va, submitted;
 	uint64_t seen;                  /* the last sequence number a completion check saw */
+	/* submissions a restart counted done without the GPU having done them (group_restart): the last LOST_RANGES
+	 * runs, each (after, upto] -- akita_mali_lost says so to whoever waited for one */
+#define LOST_RANGES             4
+	struct { uint64_t after, upto; } lost[LOST_RANGES];
+	unsigned int lost_next;
 };
 
 static struct mali_vm {
@@ -1840,6 +1845,8 @@ akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, u
 		mq->ring_size = size;
 		grp->user_va[q] = mcu_va;
 		mq->seen = mq->submitted;       /* (a group's slot used again: nothing outstanding on it) */
+		bzero(mq->lost, sizeof(mq->lost));
+		mq->lost_next = 0;
 		*mq->seqno = mq->submitted;     /* (the ring adds 1 a submission to it) */
 		to_gpu((void *)mq->seqno, 8);
 		mq->user_in = (volatile uint32_t *)user;
@@ -2191,7 +2198,16 @@ group_restart(unsigned int g)
 		struct mali_queue *mq = &grp->q[q];
 		uint64_t *r = (uint64_t *)mq->ring;
 
-		/* everything it was given counted done; the ring from its start again, as group_new left it */
+		/* everything it was given counted done; the ring from its start again, as group_new left it -- what the GPU
+		 * had not reached is kept as lost (the faulting submission and those queued behind it) */
+		from_gpu((void *)mq->seqno, 8);
+		if (*mq->seqno < mq->submitted) {
+			mq->lost[mq->lost_next % LOST_RANGES].after = *mq->seqno;
+			mq->lost[mq->lost_next % LOST_RANGES].upto = mq->submitted;
+			mq->lost_next++;
+			printf("mali: group %u queue %u: submissions %llu..%llu are lost with the restart\n", g, q, *mq->seqno + 1,
+			    mq->submitted);
+		}
 		*mq->seqno = mq->submitted;
 		to_gpu((void *)mq->seqno, 8);
 		mq->seen = mq->submitted;
@@ -2385,6 +2401,23 @@ tiler_oom(void)
 		}
 	}
 	busy = 0;
+}
+
+/* was the submission counted done by a restart after a fault, its work never done (one of the queue's last
+ * LOST_RANGES such runs) */
+bool akita_mali_lost(int g, unsigned int q, uint64_t seqno);
+bool
+akita_mali_lost(int g, unsigned int q, uint64_t seqno)
+{
+	if (g < 0 || g >= MAX_GROUPS || !groups[g].used || q >= groups[g].queues) {
+		return false;
+	}
+	for (unsigned int i = 0; i < LOST_RANGES; i++) {
+		if (seqno > groups[g].q[q].lost[i].after && seqno <= groups[g].q[q].lost[i].upto) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /* the last sequence number the queue reached (what the GPU wrote is read after its caches are flushed) */

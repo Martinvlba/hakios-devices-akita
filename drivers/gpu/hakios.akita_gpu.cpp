@@ -51,6 +51,7 @@ int akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_size
 void akita_mali_group_free(int g);
 uint64_t akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size);
 uint64_t akita_mali_reached(int g, unsigned int q);
+bool akita_mali_lost(int g, unsigned int q, uint64_t seqno);
 void akita_mali_flush(void);
 int akita_mali_heap_new(int vm, uint32_t chunk_size, uint32_t initial, uint32_t max_chunks, uint32_t in_flight,
     uint64_t *ctx_va, uint64_t *first_chunk_va);
@@ -216,7 +217,8 @@ akita_gpu_start(void)
 
 /* ---- a client ---- */
 
-#define MAX_BOS                 1024
+#define MAX_BOS                 8192    /* (11-12, was 1024: a client's buffers -- mediaserverd's MetalPerformanceShaders
+                                         * networks hold more than a thousand at once and were told "no GPU memory") */
 #define MAX_SYNCS               1024
 #define MAX_POINTS              32
 #define MAX_CLIENT_VMS          4
@@ -1221,6 +1223,17 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		if (timeline) {
 			r.syncTlWait.first_signaled = first;
 		} else {
+			/* not Linux's: pad = 1 when a binary sync object waited for stands for a submission a restart after
+			 * a GPU fault counted done, its work lost (hakios-metal ends that command buffer in error) */
+			r.syncWait.pad = 0;
+			for (uint32_t i = 0; ret == kIOReturnSuccess && i < count; i++) {
+				struct syncobj *s = handles[i] && handles[i] <= MAX_SYNCS ? &fSyncs[handles[i] - 1] : NULL;
+
+				if (s != NULL && s->used && s->binary_set && s->binary.group >= 0 &&
+				    akita_mali_lost(s->binary.group, s->binary.queue, s->binary.seqno)) {
+					r.syncWait.pad = 1;
+				}
+			}
 			r.syncWait.first_signaled = first;
 		}
 		break;
