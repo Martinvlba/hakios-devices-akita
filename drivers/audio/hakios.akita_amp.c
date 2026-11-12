@@ -998,7 +998,7 @@ protection_start(int chip)
 
 	amp_update(chip, L41_PWR_CTRL2, L41_MONITORS_EN, L41_MONITORS_EN);
 	amp_write(chip, L41_DSP1_RX1_SRC, L41_INPUT_SRC_ASPRX1);
-	amp_write(chip, L41_DSP1_RX1_SRC + 4, L41_INPUT_SRC_ASPRX2);
+	amp_write(chip, L41_DSP1_RX1_SRC + 4, L41_INPUT_SRC_ASPRX1);   /* (Android: DSP RX1 and RX2 both ASPRX1) */
 	amp_write(chip, L41_DSP1_RX1_SRC + 8, L41_INPUT_SRC_VMON);
 	amp_write(chip, L41_DSP1_RX1_SRC + 12, L41_INPUT_SRC_IMON);
 	if (!protection_running[chip]) {

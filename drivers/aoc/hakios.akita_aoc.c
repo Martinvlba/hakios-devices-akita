@@ -435,7 +435,9 @@ static const uint16_t sweep_peak[6] = { 1036, 2067, 4125, 8231, 11627, 16423 }; 
 static int32_t
 tone_sample(uint64_t frame)
 {
-	uint32_t inc = (uint32_t)(((uint64_t)aocplay_hz << 32) / 48000u);
+	/* (aocplay_sweep=2: the six levels at aocplay_hz, then the six again at 440 Hz) */
+	uint32_t hz = (aocplay_sweep == 2 && frame / SWEEP_STEP >= 6) ? 440 : aocplay_hz;
+	uint32_t inc = (uint32_t)(((uint64_t)hz << 32) / 48000u);
 	uint32_t phase = (uint32_t)(frame * (uint64_t)inc), u = phase & 0x3fffffffu, q = phase >> 30;
 
 	if (q & 1) {
@@ -455,6 +457,9 @@ aoc_tone(vm_offset_t ring, uint32_t size, uint32_t at, uint32_t bytes, uint64_t 
 		uint32_t peak = aocplay_amp;
 		if (aocplay_sweep) {
 			uint64_t step = *frame / SWEEP_STEP;
+			if (aocplay_sweep == 2 && step >= 6 && step < 12) {
+				step -= 6;
+			}
 			peak = step < 6 ? sweep_peak[step] : 0;
 		}
 		int32_t v = aoc_tone_on(*frame) ? (int32_t)(((int64_t)tone_sample(*frame) * peak) / 32767) : 0;
@@ -806,9 +811,13 @@ aoc_talk(void)
  * waiting); a feeder thread keeps audio_playback0's ring (80 ms) three 20 ms blocks full, each block from our ring (the
  * rest silence) through the speakers' guard (drivers/audio/hakios.guard.c: the CS35L41s run without their protection
  * DSP), so the AoC's stream never stops; the amplifiers are powered up when a write is not silence and down after three
- * seconds of silence, and off while Darwin's volume is 0. Their level is fixed at the CS35L41's least analog gain (0.5
- * dB): a full-scale sample is about a volt at the speaker, which no phone speaker minds -- "the loudest" for the guard,
- * which then adds aocsound_gain eighths of a dB (default 96, at most 96) before its limits. */
+ * seconds of silence, and off while Darwin's volume is 0. The guard's limits are against the amplifiers at Android's
+ * level (AMP PCM Gain 17, what CONFIG_DEFAULTS gives with amp_gain=17): with a lower amp_gain it is told the difference
+ * (hakios_guard_attenuation). Before its limits it adds aocsound_gain eighths of a dB (default 0, at most 96): 11-12,
+ * measured with the phone's own microphones (aocmic, aocplay_sweep), the speakers distort from about -15 dBFS at
+ * Android's level -- 2.4 % at -18, 5.6 % at -12, 9.5 % at -6 (1 kHz), the same at a lower amp gain for the same
+ * loudness: the speakers' own limit -- and Darwin at its top volume gives a full-scale tone at about -13 dBFS; the old
+ * default, +12 dB, put Darwin's loud sounds at the peak limiter, 9-10 % distortion. */
 
 #define DRING_FRAMES            32768           /* 0.68 s; a power of two, the indices run on and wrap */
 #define SILENCE                 8
@@ -816,7 +825,7 @@ aoc_talk(void)
 #define BLOCK_BYTES             (BLOCK_FRAMES * 4)
 #define QUIET_BEFORE_OFF_US     3000000ull
 
-static uint32_t aocsound, aocsound_gain = HAKIOS_GUARD_MAX_GAIN;
+static uint32_t aocsound, aocsound_gain = 0;
 static int16_t dring[DRING_FRAMES * 2];
 static volatile uint32_t dring_head, dring_tail;
 static volatile uint64_t last_sound_us;
@@ -939,8 +948,21 @@ aoc_sound_thread(__unused void *parameter, __unused wait_result_t result)
 		printf("akita aoc: sound: no %s ring to play into (%u bytes)\n", svcname, size);
 		return;
 	}
-	hakios_guard_configure(true, aocsound_gain);
-	hakios_guard_attenuation(0);
+	{
+		/* the amplifiers' level under Android's (AMP PCM Gain 17): what the guard's limits are measured against */
+		uint32_t g = 0;
+
+		PE_parse_boot_argn("amp_gain", &g, sizeof(g));
+		if (g > 20) {
+			g = 0;
+		}
+		hakios_guard_configure(true, aocsound_gain);
+		hakios_guard_attenuation(g < 17 ? (17 - g) * 8 : 0);
+		if (g > 17) {
+			printf("akita aoc: sound: amp_gain=%u is %u dB over Android's level: the guard's limits hold %u dB too loud\n", g,
+			    g - 17, g - 17);
+		}
+	}
 	hakios_audio_set_sink("the speakers (the AoC and two CS35L41s, hakios.akita_aoc.c)", aoc_darwin_sink);
 	printf("akita aoc: sound: WHAT DARWIN PLAYS GOES TO THE SPEAKERS from here on (the AoC's entry point %u, %s, started "
 	    "while there is sound: 48 kHz 16-bit stereo, three 20 ms blocks ahead; the guard's gain %u.%03u dB; the amplifiers %s)\n",
@@ -1057,7 +1079,9 @@ aoc_sound_thread(__unused void *parameter, __unused wait_result_t result)
  * distortion").
  */
 static uint32_t aocmic;
-static volatile bool mic_done;
+static volatile bool mic_done, mic_self_stop;   /* (without aocplay the thread stops the capture itself: Darwin's sound
+                                                 * goes on meanwhile -- the mics hear iOS's own sounds) */
+static void aoc_mic_stop(void);
 
 static bool
 aoc_in_cmd(const char *what, void *cmd, uint32_t len, uint16_t id)
@@ -1152,6 +1176,9 @@ aoc_mic_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	printf("akita aoc: mic: %llu frames in %u s (48000 a second expected)\n", frames, aocmic);
+	if (mic_self_stop) {
+		aoc_mic_stop();
+	}
 	mic_done = true;
 }
 
@@ -1424,11 +1451,14 @@ aoc_boot(void)
 				delay(300000);                  /* (the boot's 256 messages out before ours start) */
 			}
 			bool mic = false;
+			uint32_t play = 0;
 
+			PE_parse_boot_argn("aocplay", &play, sizeof(play));
 			if (PE_parse_boot_argn("aocmic", &aocmic, sizeof(aocmic)) && aocmic != 0 && aoc_mic_start()) {
 				thread_t mt;
 
 				mic_done = false;
+				mic_self_stop = play == 0;
 				mic = kernel_thread_start_priority(aoc_mic_thread, NULL, 90, &mt) == KERN_SUCCESS;
 				if (mic) {
 					thread_deallocate(mt);
@@ -1451,12 +1481,13 @@ aoc_boot(void)
 					printf("akita aoc: aocplay_matrix: THE LISTENING TEST -- for each amplifier setting K (1-%u) K beeps, "
 					    "twice, in %u s\n", MATRIX_N, MATRIX_SEG / 48000);
 				}
-				printf("akita aoc: aocplay: a %u Hz tone for %u s, %s%s\n", aocplay_hz, aocplay, aocplay_sweep ?
+				printf("akita aoc: aocplay: a %u Hz tone for %u s, %s%s\n", aocplay_hz, aocplay, aocplay_sweep == 2 ?
+				    "1.5 s each at -30 -24 -18 -12 -9 -6 dBFS, then the same at 440 Hz" : aocplay_sweep ?
 				    "1.5 s each at -30 -24 -18 -12 -9 -6 dBFS" : "peak as aocplay_amp", aocplay_lr ?
 				    ", left only and right only by turns (left first)" : ", both sides");
 				aoc_play();
 			}
-			if (mic) {
+			if (mic && !mic_self_stop) {
 				while (!mic_done) {
 					delay(100000);
 				}
