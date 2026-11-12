@@ -3791,6 +3791,25 @@ bcm_steps(void)
 				}
 				printf("wifi: 6: the firmware's event logs off (tags %u-%u, %u refused) in %llu ms\n", lo, hi, failed,
 				    micros_since(t0) / 1000);
+				/*
+				 * wifi_evlog_print=1 (11-12): the tags left on (0 to lo-1) to the firmware's CONSOLE only (PRINT, 0x40)
+				 * instead of LOG (0x80, records kept for a host that has no ring for them: the old mode's leak) -- the
+				 * firmware keeps logging (rx flowed only while it did) without a packet id a record?
+				 */
+				uint32_t print_only = 0;
+
+				PE_parse_boot_argn("wifi_evlog_print", &print_only, sizeof(print_only));
+				if (print_only) {
+					failed = 0;
+					for (uint16_t tag = 0; tag < lo && tag <= 482; tag++) {
+						uint8_t el[4] = { (uint8_t)tag, (uint8_t)(tag >> 8), 0, 0x40 };
+
+						if (iovar_set("event_log_tag_control", el, sizeof(el)) != 0) {
+							failed++;
+						}
+					}
+					printf("wifi: 6: event-log tags 0-%u to the console only (PRINT), %u refused\n", lo ? lo - 1 : 0, failed);
+				}
 				/* ("ecounters_suspend", to stop its statistics reports too: -47, not taken) */
 			}
 		}
