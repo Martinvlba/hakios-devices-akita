@@ -27,6 +27,15 @@ DIR = 'hakios-klog'
 def summary(paths):
     for path in paths:
         text = open(path, errors='replace').read()
+        if os.path.basename(path).startswith('wired_'):
+            lines = [l for l in text.splitlines() if l.startswith('memsay: at')]
+            print('%s: %d lines; the first, one in the middle and the last:' % (os.path.basename(path), len(lines)))
+            for l in ([lines[0], lines[len(lines) // 2], lines[-1]] if lines else []):
+                print('  ' + l[:400])
+            continue
+        # (klogsave before 11-13 10:30 wrote the ring anew when it lost its place: each line once, by its time)
+        seen = set()
+        text = '\n'.join(l for l in text.splitlines() if not (l in seen or seen.add(l)))
         stamp = lambda line: float(re.search(r'\[\s*([0-9.]+)\]', line).group(1)) if re.search(r'\[\s*([0-9.]+)\]', line) else None
         battery = [(stamp(l), int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5)) for l in text.splitlines()
                    for m in [re.search(r'akita battery say: (-?\d+) mA \(mean (-?\d+) mA\), (\d+) mV, charge (-?\d+) uAh, (.*)', l)] if m]
@@ -62,9 +71,12 @@ def main():
     os.makedirs(out, exist_ok=True)
     afc = base.Afc(base.Phone().service('com.apple.afc'))
     _, data = afc.call(AFC_READ_DIR, DIR.encode() + b'\0')
-    names = sorted(n.decode() for n in data.split(b'\0') if n.startswith(b'kernel_'))
+    every = [n.decode() for n in data.split(b'\0')]
+    names = sorted(n for n in every if n.startswith('kernel_'))
+    wired = sorted(n for n in every if n.startswith('wired_'))      # (memsay's: where the kernel's memory is)
     if '--all' not in sys.argv:
-        names = names[-3:]
+        names, wired = names[-3:], wired[-3:]
+    names += wired
     got = []
     for name in names:
         _, data = afc.call(base.AFC_OPEN, struct.pack('<Q', 1) + ('%s/%s' % (DIR, name)).encode() + b'\0')   # 1: read
