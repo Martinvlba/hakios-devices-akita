@@ -206,6 +206,23 @@ static uint32_t anim_fps = 50, anim_ms = 250, anim_flips_last, anim_boosts;
  * every swap late, the GPU 75 % busy -- under its row's own threshold (95 %). As Android's missed-frame boosts.
  */
 static int anim_row = -1;               /* the frame boost's GPU row (-1: none, the touch row alone) */
+/*
+ * FRAMES THAT COST A LOT, COMING SLOWLY (11-13): the WebGL aquarium stood at 10 frames a second with the GPU 40-60 %
+ * busy at its lowest clock (160 MHz; that row's own threshold is 90 %), the memory at 421 MHz and the clusters' busiest
+ * core at 60-70 % of 1418 MHz -- a frame goes through WebKit's content process, its GPU process, the GPU and the window
+ * server one after another, so no stage is ever busy all the time and neither governor moved; with every clock at its
+ * top the same page gave 36. The boost above does not see it either: it starts at 50 frames a second.
+ * So, every look, over the last five: frames coming (4 a second or more) but under 90 % of the panel's rate, and the
+ * GPU's time a frame, counted as at the lowest shader clock (its busy time x the clock now / 150 MHz), dvfs_heavy_us
+ * (16000) or more -- the Clock icon's ten redraws a second cost a fraction of that. Then, for dvfs_heavy_ms (600) on:
+ * the GPU's row the slowest that would do a frame's GPU work in dvfs_heavy_goal_us (5500, a third of a 60 Hz frame),
+ * the memory's floor that row has, the touch boost's floors for the clusters, and their governor aiming at twice the
+ * busy share instead of 1.25 times (a core 60 % busy in such a chain is the chain's pace). The thermal caps apply as
+ * ever. dvfs_heavy_us=0: not done.
+ */
+static uint32_t heavy_us = 16000, heavy_ms = 600, heavy_goal_us = 5500, heavy_boosts;
+static uint64_t heavy_until, heavy_busy_last, heavy_busy_ring[5];
+static int heavy_row = -1;
 static int gpu_fixed_row = -1;          /* dvfs_gpu_row=N (a test, 11-10): the governor's GPU row fixed (0 the fastest) */
 static uint32_t anim_mif = 1352000;     /* the memory's floor meanwhile, kHz (dvfs_anim_mif; MHz under 10000; 0 none) */
 static uint32_t anim_ring[5], anim_ring_at, anim_raised;
@@ -625,6 +642,10 @@ gpu_govern(void)
 		gpu_want = anim_row;            /* (the frame boost's row: faster while the frames come late) */
 		gpu_low_looks = 0;
 	}
+	if (heavy_row >= 0 && mach_absolute_time() < heavy_until && gpu_want > heavy_row) {
+		gpu_want = heavy_row;           /* (frames that cost a lot, coming slowly) */
+		gpu_low_looks = 0;
+	}
 	if (gpu_fixed_row >= 0 && gpu_fixed_row < (int)NGPUROWS) {
 		gpu_want = gpu_fixed_row;       /* (dvfs_gpu_row=N, a test) */
 	}
@@ -733,7 +754,8 @@ govern(struct cluster *c)
 	}
 	c->share = share;
 	/* the lowest step at or above 1.25 times the busy share of the top */
-	target = (uint32_t)((uint64_t)c->steps[c->nsteps - 1] * (uint32_t)share * 125 / 10000);
+	target = (uint32_t)((uint64_t)c->steps[c->nsteps - 1] * (uint32_t)share *
+	    (mach_absolute_time() < heavy_until ? 200 : 125) / 10000);
 	while (want < c->nsteps - 1 && c->steps[want] < target) {
 		want++;
 	}
@@ -863,7 +885,48 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 			uint32_t f = akita_display_flip_count(), d = f - anim_flips_last;
 
 			anim_flips_last = f;
+			{
+				uint64_t busy = akita_mali_busy_abs();
+
+				heavy_busy_ring[anim_ring_at % 5] = busy - heavy_busy_last;
+				heavy_busy_last = busy;
+			}
 			anim_ring[anim_ring_at++ % 5] = d;
+			if (heavy_us != 0 && anim_ring_at >= 5 && gpu_boot[0]) {
+				uint32_t frames = 0, hz = akita_display_refresh();
+				uint64_t busy_abs = 0, busy_ns, t = mach_absolute_time(), span;
+
+				for (int k = 0; k < 5; k++) {
+					frames += anim_ring[k];
+					busy_abs += heavy_busy_ring[k];
+				}
+				absolutetime_to_nanoseconds(busy_abs, &busy_ns);
+				if (frames >= 2 && hz >= 50 && (uint64_t)frames * 1000 * 10 < (uint64_t)hz * 9 * 5 * period_ms) {
+					uint32_t khz = gpu_applied >= 0 ? gpu_rows[gpu_applied][1] : gpu_boot[1];
+					uint64_t cost_us = busy_ns / 1000 / frames * khz / 150000;
+
+					if (cost_us >= heavy_us) {
+						uint64_t want_khz = cost_us * 150000 / (heavy_goal_us ? heavy_goal_us : 1);
+						int row = (int)NGPUROWS - 1;
+
+						while (row > 0 && gpu_rows[row][1] < want_khz) {
+							row--;
+						}
+						if (t >= heavy_until) {
+							heavy_boosts++;
+						}
+						heavy_row = row;
+						nanoseconds_to_absolutetime((uint64_t)heavy_ms * NSEC_PER_MSEC, &span);
+						heavy_until = t + span;
+						if (heavy_until > touch_until) {
+							touch_until = heavy_until;
+						}
+					}
+				}
+				if (t >= heavy_until) {
+					heavy_row = -1;
+				}
+			}
 			if (d * 1000 >= anim_fps * period_ms) {
 				uint64_t t = mach_absolute_time(), span;
 
@@ -940,8 +1003,8 @@ akita_dvfs_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		if (now >= next_log) {
 			next_log = now + minute;
-			printf("akita dvfs: %s (%d changes, %u touch boosts, %u frame boosts (row %d, %u raised), %u MIF switches; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d, "
-			    "GPU %d %%\n", dvfs_mhz, dvfs_changes_value, touch_boosts, anim_boosts, anim_row, anim_raised, mif_switches, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
+			printf("akita dvfs: %s (%d changes, %u touch boosts, %u frame boosts (row %d, %u raised), %u heavy-frame boosts (row %d), %u MIF switches; %s); busy LITTLE %d %d %d %d, MID %d %d %d %d, "
+			    "GPU %d %%\n", dvfs_mhz, dvfs_changes_value, touch_boosts, anim_boosts, anim_row, anim_raised, heavy_boosts, heavy_row, mif_switches, hot_cap < 0 ? (big_cap ? "BIG held to its middle: warm" : "not held down") : hot_cap ? "held to the middle: hot" :
 			    "held to the lowest: hot", clusters[0].core_share[0], clusters[0].core_share[1],
 			    clusters[0].core_share[2], clusters[0].core_share[3], clusters[1].core_share[0],
 			    clusters[1].core_share[1], clusters[1].core_share[2], clusters[1].core_share[3], gpu_util_pct);
@@ -1009,6 +1072,9 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 	}
 	PE_parse_boot_argn("dvfs_touch_cpu", &touch_cpu, sizeof(touch_cpu));
 	PE_parse_boot_argn("dvfs_anim_fps", &anim_fps, sizeof(anim_fps));
+	PE_parse_boot_argn("dvfs_heavy_us", &heavy_us, sizeof(heavy_us));
+	PE_parse_boot_argn("dvfs_heavy_ms", &heavy_ms, sizeof(heavy_ms));
+	PE_parse_boot_argn("dvfs_heavy_goal_us", &heavy_goal_us, sizeof(heavy_goal_us));
 	PE_parse_boot_argn("dvfs_anim_ms", &anim_ms, sizeof(anim_ms));
 	PE_parse_boot_argn("dvfs_gpu_row", &gpu_fixed_row, sizeof(gpu_fixed_row));
 	if (PE_parse_boot_argn("dvfs_anim_mif", &anim_mif, sizeof(anim_mif)) && anim_mif < 10000) {

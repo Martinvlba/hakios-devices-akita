@@ -241,6 +241,32 @@ charge_limit_apply(void)
 	    "heat" : "back to the charger's own", value, cc_own);
 }
 
+/*
+ * charge=0 (a boot argument for power tests on the cable): the charger's mode (CHG_CNFG_00 bits 3:0; Google's
+ * max77759_charger.c: 0 everything off, 5 charger and buck on) to 0 -- the phone then runs from its battery with the
+ * cable in, and the gauge's current is the phone's draw, as off the cable. Said with what it was; the next boot's
+ * bootloader sets its own again.
+ */
+#define CHG_CNFG_00             0xb9
+static void
+charge_off_for_tests(void)
+{
+	uint32_t charge = 1;
+	uint8_t mode = 0, now = 0;
+
+	if (!PE_parse_boot_argn("charge", &charge, sizeof(charge)) || charge != 0) {
+		return;
+	}
+	if (!read_regs(CHARGER, CHG_CNFG_00, &mode, 1)) {
+		printf("akita battery: charge=0: CHG_CNFG_00 not read\n");
+		return;
+	}
+	bool ok = write_reg(CHARGER, CHG_CNFG_00, (uint8_t)(mode & 0xf0));
+	(void)read_regs(CHARGER, CHG_CNFG_00, &now, 1);
+	printf("akita battery: charge=0: the charger and its buck off for this boot (CHG_CNFG_00 %#x -> %#x, %s): the phone "
+	    "runs from the battery with the cable in\n", mode, now, ok ? "written" : "NOT written");
+}
+
 static bool
 gauge_word(uint8_t reg, int32_t *value, bool is_signed)
 {
@@ -424,6 +450,9 @@ akita_battery_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("battery_say", &say, sizeof(say));
 	for (unsigned tick = 0;; tick++) {
 		if (battery_read(&s)) {
+			if (reads == 0) {
+				charge_off_for_tests();
+			}
 			reads++;
 			hakios_battery_report(&s);
 			usb_repeater_check(s.external, was_external);

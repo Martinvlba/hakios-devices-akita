@@ -208,6 +208,34 @@ mct_report(__unused void *p, __unused wait_result_t w)
 		}
 		printf("akita mct: the firmware's permission (PMU INFORM0) reads 0x%llx\n",
 		    pmu_smc(TENSOR_SMC_PMU_SEC_REG, PMU_INFORM0, 0, 0));
+		{
+			/* zuma's power domains (the device tree's samsung,exynos-pd nodes: PMU + offset, the domain's CONFIGURATION,
+			 * and STATUS at + 4, bit 0 on): which of them the bootloader left on -- this port turns none off. Twice:
+			 * the first report and the fifth (pd_say=1: every report). */
+			static const struct { const char *name; uint32_t at; } pd[] = {
+				{ "g3d", 0x1a80 }, { "embedded_g3d", 0x1c80 }, { "dpub", 0x1d00 }, { "dpuf0", 0x1d80 }, { "dpuf1", 0x1e00 },
+				{ "g2d", 0x1e80 }, { "gdc", 0x1f00 }, { "gse", 0x1f80 }, { "mcsc", 0x2000 }, { "mfc", 0x2080 },
+				{ "rgbp", 0x2100 }, { "tnr", 0x2180 }, { "yuvp", 0x2200 }, { "aoc", 0x2280 }, { "aur", 0x2300 },
+				{ "bw", 0x2380 }, { "eh", 0x2400 }, { "ispfe", 0x2480 }, { "tpu", 0x2500 }, { "hsi0", 0x2a80 },
+				{ "hsi1", 0x2b00 },
+			};
+			static unsigned reports;
+			uint32_t every = 0;
+
+			PE_parse_boot_argn("pd_say", &every, sizeof(every));
+			if (reports == 0 || reports == 4 || every) {
+				char line[512];
+				int n = 0;
+
+				for (unsigned i = 0; i < sizeof(pd) / sizeof(pd[0]) && n < (int)sizeof(line) - 40; i++) {
+					n += snprintf(line + n, sizeof(line) - n, " %s %llx/%llx", pd[i].name,
+					    pmu_smc(TENSOR_SMC_PMU_SEC_REG, 0x15460000ULL + pd[i].at, 0, 0),
+					    pmu_smc(TENSOR_SMC_PMU_SEC_REG, 0x15460000ULL + pd[i].at + 4, 0, 0));
+				}
+				printf("akita mct: power domains (configuration/status, bit 0 on):%s\n", line);
+			}
+			reports++;
+		}
 	}
 }
 
