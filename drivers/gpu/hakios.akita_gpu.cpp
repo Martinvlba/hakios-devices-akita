@@ -47,6 +47,8 @@ bool akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags);
 void akita_mali_vm_unmap(int vm, uint64_t va, uint64_t size);
 void akita_mali_vm_flush(int vm);
 void akita_mali_vm_flush_later(int vm);
+int akita_mali_vm_unflushed(int vm, uint64_t *stamp_now);
+int akita_mali_vm_stale(int vm, uint64_t stamp);
 int akita_mali_group_new(int vm, unsigned int nqueues, const uint32_t *ring_sizes, uint8_t priority);
 void akita_mali_group_free(int g);
 uint64_t akita_mali_submit(int g, unsigned int q, uint64_t stream, uint32_t size);
@@ -543,6 +545,9 @@ static uint32_t gBoCount;
 /* (11-13) buffers given back while something else still had their memory (a mapping in the program not undone): how
  * many, their bytes -- the kernel's wired memory grew by gigabytes that no count here showed */
 static uint64_t gBoHeldBytes, gBoHeldCount, gBoSurfaceHeldCount;
+/* (11-13) buffers given back and kept until their VM's update (boRelease, gKept): now, the most, all so far */
+static uint32_t gKeptCount, gKeptMost;
+static uint64_t gKeptBytes, gKeptEver;
 extern "C" uint64_t akita_mali_kernel_bytes(void);     /* hakios.akita_mali.c */
 
 bool
@@ -651,8 +656,10 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		    gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages, gIdleStages, gIdleGraces);
 		IOLog("HakiosGPU: memory of the phone's RAM the GPU holds: %llu MB in %u buffers of programs (the most so far %llu "
 		    "MB), %llu MB the driver's own (firmware, page tables, tiler heaps); IOSurfaces apart; given back while "
-		    "something else still had the memory: %llu buffers of %llu MB in all, %llu surfaces' buffers\n", gBoBytes >> 20,
-		    gBoCount, gBoPeak >> 20, akita_mali_kernel_bytes() >> 20, gBoHeldCount, gBoHeldBytes >> 20, gBoSurfaceHeldCount);
+		    "something else still had the memory: %llu buffers of %llu MB in all, %llu surfaces' buffers; kept until "
+		    "their VM's update: %u now (%llu MB), %u at most, %llu so far\n", gBoBytes >> 20,
+		    gBoCount, gBoPeak >> 20, akita_mali_kernel_bytes() >> 20, gBoHeldCount, gBoHeldBytes >> 20, gBoSurfaceHeldCount,
+		    gKeptCount, gKeptBytes >> 20, gKeptMost, gKeptEver);
 	}
 	return done;
 }
@@ -836,10 +843,16 @@ HakiosGPUUserClient::vmBind(struct drm_panthor_vm_bind *b)
 			}
 		}
 	}
-	if (unmapped) {
-		akita_mali_vm_flush((int)b->vm_id);             /* (at once: the memory may be freed after) */
+	/* before the VM's next submission (akita_mali_submit) -- an unmap too since 11-13: the memory it leaves is kept
+	 * until then (boRelease, the kept ones). gpu_unmap_now=1: an unmap updates at once, as before */
+	static uint32_t unmap_now = 0xffffffff;
+	if (unmap_now == 0xffffffff && !PE_parse_boot_argn("gpu_unmap_now", &unmap_now, sizeof(unmap_now))) {
+		unmap_now = 0;
+	}
+	if (unmapped && unmap_now) {
+		akita_mali_vm_flush((int)b->vm_id);
 	} else {
-		akita_mali_vm_flush_later((int)b->vm_id);       /* (before the VM's next submission: akita_mali_submit) */
+		akita_mali_vm_flush_later((int)b->vm_id);
 	}
 	return kIOReturnSuccess;
 }
@@ -932,6 +945,53 @@ HakiosGPUUserClient::groupSubmit(struct drm_panthor_group_submit *s)
 	return kIOReturnSuccess;
 }
 
+/*
+ * BUFFERS GIVEN BACK WHOSE MEMORY THE GPU MAY STILL REACH (11-13): the client's unmap waits for its VM's next update
+ * (vmBind), so the memory is kept here until every VM of the client that had binds waiting has been updated -- or has
+ * lost its address space, or is gone. Looked through at each call of any client and after a buffer is given back;
+ * when a quarter of the places or 64 MB are taken the VMs are updated at once. (gLock held)
+ */
+#define KEPT_BOS        1024
+static struct kept_bo {
+	IOMemoryDescriptor *memory;
+	MiniIOSurface *surface;
+	uint64_t size;
+	int vm[MAX_CLIENT_VMS];
+	uint64_t stamp[MAX_CLIENT_VMS];
+} gKept[KEPT_BOS];
+
+static void
+keptRelease(bool force)
+{
+	for (uint32_t i = 0; i < KEPT_BOS && gKeptCount != 0; i++) {
+		struct kept_bo *k = &gKept[i];
+		bool stale = false;
+
+		if (k->memory == NULL) {
+			continue;
+		}
+		for (int v = 0; v < MAX_CLIENT_VMS; v++) {
+			if (k->vm[v] > 0 && akita_mali_vm_stale(k->vm[v], k->stamp[v])) {
+				if (force) {
+					akita_mali_vm_flush(k->vm[v]);
+				} else {
+					stale = true;
+				}
+			}
+		}
+		if (stale) {
+			continue;
+		}
+		OSSafeReleaseNULL(k->memory);
+		if (k->surface != NULL) {
+			MiniIOSurfaceDrop(k->surface);
+			k->surface = NULL;
+		}
+		gKeptBytes -= k->size;
+		gKeptCount--;
+	}
+}
+
 /* a buffer given back: its memory released, and its surface let go if it was one's (gLock held) */
 void
 HakiosGPUUserClient::boRelease(int i)
@@ -950,6 +1010,47 @@ HakiosGPUUserClient::boRelease(int i)
 			gBoHeldCount++;
 		} else {
 			gBoSurfaceHeldCount++;
+		}
+	}
+	/* (kept while a VM of this client has binds waiting for its update: see gKept) */
+	if (fBos[i].memory != NULL) {
+		struct kept_bo k;
+		bool waiting = false;
+
+		bzero(&k, sizeof(k));
+		for (int v = 0; v < MAX_CLIENT_VMS; v++) {
+			k.vm[v] = fVms[v];
+			if (fVms[v] > 0 && akita_mali_vm_unflushed(fVms[v], &k.stamp[v])) {
+				waiting = true;
+			} else {
+				k.vm[v] = -1;
+			}
+		}
+		if (waiting && (gKeptCount >= KEPT_BOS / 4 || gKeptBytes >= (64ULL << 20))) {
+			keptRelease(true);              /* (too many: the VMs updated now, these freed) */
+			for (int v = 0; v < MAX_CLIENT_VMS; v++) {
+				if (k.vm[v] > 0) {
+					akita_mali_vm_flush(k.vm[v]);
+				}
+			}
+			waiting = false;
+		}
+		if (waiting) {
+			for (uint32_t at = 0; at < KEPT_BOS; at++) {
+				if (gKept[at].memory == NULL) {
+					k.memory = fBos[i].memory;
+					k.surface = fBos[i].surface;
+					k.size = fBos[i].size;
+					gKept[at] = k;
+					gKeptCount++;
+					gKeptBytes += k.size;
+					gKeptEver++;
+					gKeptMost = gKeptCount > gKeptMost ? gKeptCount : gKeptMost;
+					fBos[i].memory = NULL;
+					fBos[i].surface = NULL;
+					break;
+				}
+			}
 		}
 	}
 	OSSafeReleaseNULL(fBos[i].memory);
@@ -1094,6 +1195,9 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	if (!akita_mali_ready()) {
 		IOLockUnlock(gLock);
 		return kIOReturnNotReady;
+	}
+	if (gKeptCount != 0) {
+		keptRelease(false);
 	}
 	switch (selector) {
 	case kDevQuery:

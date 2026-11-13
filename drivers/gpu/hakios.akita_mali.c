@@ -1414,7 +1414,9 @@ static struct mali_vm {
 	bool flush_pending;             /* pages mapped since its last update: flushed before its next submission */
 	unsigned int as;                /* the address space it has now (1..7), 0: none */
 	uint64_t last_used;             /* mach absolute time of its groups' last submission */
+	uint64_t flushed;               /* a number that changes whenever the GPU is given its tables anew (11-13) */
 } vms[MAX_VMS];
+static uint64_t flush_stamp;
 
 static struct mali_group {
 	bool used;
@@ -1601,6 +1603,7 @@ as_update(unsigned int vm)
 		as_program(0, level0);
 	} else if (vm < MAX_VMS && vms[vm].as != 0) {
 		as_program(vms[vm].as, vms[vm].root);
+		vms[vm].flushed = ++flush_stamp;
 	}
 }
 
@@ -1643,6 +1646,7 @@ vm_bind(unsigned int vm)
 	vms[vm].as = as;
 	vms[vm].flush_pending = false;
 	as_program(as, vms[vm].root);
+	vms[vm].flushed = ++flush_stamp;
 	return true;
 }
 
@@ -1676,6 +1680,7 @@ akita_mali_vm_new(void)
 			vms[i].kernel_next = KVM_BASE;
 			vms[i].as = 0;                  /* (its address space at its group's first submission: vm_bind) */
 			vms[i].flush_pending = false;
+			vms[i].flushed = ++flush_stamp;
 			vms[i].last_used = mach_absolute_time();
 			return (int)i;
 		}
@@ -1746,6 +1751,30 @@ akita_mali_vm_flush(int vm)
  * running work, and the panel's frame stood still 25-46 ms each time (the tester's slow-motion clip, sb_debug's counter
  * against the log). An unmap is still flushed at once (its memory may be freed right after).
  */
+/*
+ * UNMAPS WAIT TOO (11-13), their memory kept by HakiosGPU until the update: the update at once cost ~10 ms each under
+ * a busy GPU, and WebKit's WebGL (ANGLE) gives a buffer back for every draw -- the aquarium's 611 draws a frame took 12
+ * s. akita_mali_vm_stale: the GPU may still hold translations older than STAMP for this VM (it has an address space,
+ * binds wait, and no update came since); *STAMP_NOW for the asker to keep.
+ */
+int akita_mali_vm_unflushed(int vm, uint64_t *stamp_now);
+int
+akita_mali_vm_unflushed(int vm, uint64_t *stamp_now)
+{
+	if (vm <= 0 || vm >= MAX_VMS || !vms[vm].used) {
+		return 0;
+	}
+	*stamp_now = vms[vm].flushed;
+	return vms[vm].as != 0 && vms[vm].flush_pending;
+}
+
+int akita_mali_vm_stale(int vm, uint64_t stamp);
+int
+akita_mali_vm_stale(int vm, uint64_t stamp)
+{
+	return vm > 0 && vm < MAX_VMS && vms[vm].used && vms[vm].as != 0 && vms[vm].flushed == stamp;
+}
+
 void akita_mali_vm_flush_later(int vm);
 void
 akita_mali_vm_flush_later(int vm)
