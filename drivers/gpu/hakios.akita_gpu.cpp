@@ -134,6 +134,8 @@ struct hakios_surface {
 #define kHakiosDescribe         0xffffffffu
 /* kHakiosSurfaceBusy: HakiosMetal's mark on a surface while a command buffer that draws into it is being recorded or run */
 struct hakios_surface_busy { uint32_t surface; int32_t delta; };
+/* kHakiosMap: a buffer mapped for the calling program; the address comes back (the mapping goes with the buffer) */
+struct hakios_map { uint32_t handle, pad; uint64_t address, size; };
 struct drm_syncobj_create { uint32_t handle, flags; };
 #define SYNCOBJ_CREATE_SIGNALED 1u
 struct drm_syncobj_destroy { uint32_t handle, pad; };
@@ -158,6 +160,7 @@ enum {
 	kBoSync, kBoQueryInfo,
 	kSyncobjCreate = 0xbf, kSyncobjDestroy = 0xc0, kSyncobjWait = 0xc3, kSyncobjReset = 0xc4, kSyncobjSignal = 0xc5,
 	kSyncobjTimelineWait = 0xca, kSyncobjQuery = 0xcb, kSyncobjTransfer = 0xcc, kSyncobjTimelineSignal = 0xcd,
+	kHakiosMap = 0x7c,              /* not Linux's: a buffer mapped for the program, the mapping kept HERE (see boMap) */
 	kHakiosSurfaceBusy = 0x7d,      /* not Linux's: a command buffer draws into an IOSurface (+1) or is done (-1) */
 	kHakiosSurfaceGate = 0x80,      /* not Linux's: wait until an IOSurface is not on the panel (before a submission) */
 	kHakiosSurface = 0x7e,          /* not Linux's: an IOSurface's memory as a buffer (as the Adreno service's) */
@@ -245,7 +248,8 @@ class HakiosGPUUserClient : public IOUserClient
 	OSDeclareDefaultStructors(HakiosGPUUserClient);
 
 	/* a buffer: memory of its own, or an IOSurface's (held while the buffer is there) */
-	struct bo { IOMemoryDescriptor *memory; uint64_t size; MiniIOSurface *surface; } *fBos;
+	struct bo { IOMemoryDescriptor *memory; uint64_t size; MiniIOSurface *surface; IOMemoryMap *map; } *fBos;
+	IOReturn boMap(struct hakios_map *request);
 	void boRelease(int i);
 	IOReturn surfaceBuffer(struct hakios_surface *request);
 	struct syncobj *fSyncs;
@@ -536,6 +540,9 @@ busyNow(uint32_t sid)
 static uint64_t gDrawnWaits, gDrawnWaitAbs, gDrawnLate;
 static uint64_t gBoBytes, gBoPeak;      /* (11-10) the programs' GPU buffers (kBoCreate) now, and the most at once */
 static uint32_t gBoCount;
+/* (11-13) buffers given back while something else still had their memory (a mapping in the program not undone): how
+ * many, their bytes -- the kernel's wired memory grew by gigabytes that no count here showed */
+static uint64_t gBoHeldBytes, gBoHeldCount, gBoSurfaceHeldCount;
 extern "C" uint64_t akita_mali_kernel_bytes(void);     /* hakios.akita_mali.c */
 
 bool
@@ -643,8 +650,9 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		    "later stages caught in the grace (%llu of them after an idle GPU, %llu such graces)\n", gBusyWaits,
 		    gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages, gIdleStages, gIdleGraces);
 		IOLog("HakiosGPU: memory of the phone's RAM the GPU holds: %llu MB in %u buffers of programs (the most so far %llu "
-		    "MB), %llu MB the driver's own (firmware, page tables, tiler heaps); IOSurfaces apart\n", gBoBytes >> 20, gBoCount,
-		    gBoPeak >> 20, akita_mali_kernel_bytes() >> 20);
+		    "MB), %llu MB the driver's own (firmware, page tables, tiler heaps); IOSurfaces apart; given back while "
+		    "something else still had the memory: %llu buffers of %llu MB in all, %llu surfaces' buffers\n", gBoBytes >> 20,
+		    gBoCount, gBoPeak >> 20, akita_mali_kernel_bytes() >> 20, gBoHeldCount, gBoHeldBytes >> 20, gBoSurfaceHeldCount);
 	}
 	return done;
 }
@@ -935,12 +943,54 @@ HakiosGPUUserClient::boRelease(int i)
 		gBoBytes -= fBos[i].size;               /* (a surface's buffer is the surface's memory: not counted) */
 		gBoCount--;
 	}
+	OSSafeReleaseNULL(fBos[i].map);         /* (the program's mapping of it goes with it: boMap) */
+	if (fBos[i].memory != NULL && fBos[i].memory->getRetainCount() != 1) {
+		if (fBos[i].surface == NULL) {
+			gBoHeldBytes += fBos[i].size;
+			gBoHeldCount++;
+		} else {
+			gBoSurfaceHeldCount++;
+		}
+	}
 	OSSafeReleaseNULL(fBos[i].memory);
 	if (fBos[i].surface != NULL) {
 		MiniIOSurfaceDrop(fBos[i].surface);
 		fBos[i].surface = NULL;
 	}
 	fBos[i].size = 0;
+}
+
+/*
+ * A buffer mapped for the calling program, the mapping kept with the buffer and undone when it is given back (11-13).
+ * IOConnectMapMemory64 / IOConnectUnmapMemory64 LEAKED EVERY SURFACE'S BUFFER: an IOSurface's buffer is an
+ * IOSubMemoryDescriptor of the surface's memory, whose mappings are kept with the PARENT -- where the same program's
+ * IOSurface mapping of the whole surface is too. The unmap call looks for "a mapping of this memory in this task"
+ * (kIOMapReference, any address) and found that one, made a sub-mapping of it and released that: the buffer's real
+ * mapping stayed in this user client's set until the program ended, and with it the surface's memory, wired, after
+ * the surface was gone. In backboardd, which draws every program's surfaces and never ends: the kernel's wired memory
+ * went from 0.8 to 4.6 GB in four minutes of Speedometer 3 (27 MB a second; WebKit's tiles) and the phone reset --
+ * the tester's run of 11-13, and probably the whole-phone crash of 11-12. Here the mapping is this driver's own
+ * (kIOMapUnique: made afresh, never looked up) and boRelease lets it go. (gLock held)
+ */
+IOReturn
+HakiosGPUUserClient::boMap(struct hakios_map *request)
+{
+	struct bo *bo = request->handle >= 1 && request->handle <= MAX_BOS ? &fBos[request->handle - 1] : NULL;
+
+	if (bo == NULL || bo->memory == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (bo->map == NULL) {
+		/* (a scan-out slot's pixels: write-combined, as clientMemoryForType says; a buffer of ours is by its descriptor) */
+		bo->map = bo->memory->createMappingInTask(current_task(), 0, kIOMapAnywhere | kIOMapUnique |
+		    (bo->surface != NULL && bo->surface->scanoutSlot > 0 ? kIOMapWriteCombineCache : 0));
+		if (bo->map == NULL) {
+			return kIOReturnNoMemory;
+		}
+	}
+	request->address = bo->map->getAddress();
+	request->size = bo->map->getLength();
+	return kIOReturnSuccess;
 }
 
 /*
@@ -1023,6 +1073,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		struct drm_gem_close gemClose;
 		struct hakios_surface surface;
 		struct hakios_surface_busy surfaceBusy;
+		struct hakios_map map;
 		struct drm_syncobj_create syncCreate;
 		struct drm_syncobj_destroy syncDestroy;
 		struct drm_syncobj_wait syncWait;
@@ -1321,6 +1372,9 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	}
 	case kHakiosSurface:
 		ret = surfaceBuffer(&r.surface);
+		break;
+	case kHakiosMap:
+		ret = boMap(&r.map);
 		break;
 	case kHakiosSurfaceBusy: {
 		int at = -1;
