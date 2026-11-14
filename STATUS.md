@@ -28,19 +28,19 @@ what was seen on the one phone this port is developed on.
 
 ### Metal, in detail
 
-`MetalTest`, a test application that comes with the image, draws 23 pages, one feature each. 22 are right:
+`MetalTest`, a test application that comes with the image, draws 23 pages, one feature each. All 23 are right:
 
 clears, vertex buffers, indexed draws (16 and 32 bit), textures (nearest, linear, mipmaps, generated mipmaps), alpha
 blending, depth, stencil, instancing, 4x multisampling, float render targets, several render targets in one pass,
 compute kernels, ASTC textures (sRGB included), array / cube / 3D textures, the common pixel formats, points with a
 size, lines, strips, viewports and scissors, discard and derivatives, blit copies and read-back, 400 draws a frame,
-UIKit views animating over a Metal layer.
+layered rendering (one draw into several layers of an array texture), UIKit views animating over a Metal layer.
 
 ## Works in part
 
 | | |
 |---|---|
-| Metal: layered rendering | not served: a pass with more than one layer (`renderTargetArrayLength`) is refused |
+| Metal: layered rendering | up to 8 layers of one colour attachment; not yet with a depth attachment (shadow cube maps in one pass), multisampling, or a pass that loads what was there |
 | Metal: frame rate | an application's own Metal layer shows 75-105 frames a second, not the panel's 120 (its drawables come back late; the drawing itself takes a fraction of a millisecond) |
 | WebGL | works; heavy pages are slow (a 600-draw aquarium demo: about 30 frames a second) |
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.5 A with the screen off |
