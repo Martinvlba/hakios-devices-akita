@@ -66,3 +66,26 @@ layered rendering (one draw into several layers of an array texture), UIKit view
   screen, once.
 - Touch scrolling feels faster than on Android.
 - Opening Spotlight drops to 30-40 frames a second for half a second.
+
+## How it is put together
+
+- **Start:** slot b holds one boot image: U-Boot, our loader, the XNU kernel, a small RAM disk with our programs,
+  the drivers' firmware and a seed of compiled shaders. The `darwin` partition holds Apple's root volume as it comes
+  from the IPSW, the cryptexes, and a data volume for `/private/var`.
+- **Apple's files are not changed on disk.** What has to differ is put in place at start (`userland/src/init.c`:
+  bind mounts and synthetic directories) and by small libraries inserted into a few daemons (`userland/src/inject*.c`).
+- **Drivers** for this phone are in `drivers/` (display, touch, GPU, storage, USB, Wi-Fi, audio, power, thermal ...).
+- **Graphics:** `hakios-metal/` in the main repository is a Metal driver of our own. Its Mali back end writes the
+  GPU's command streams directly (Mesa's panvk is the reference) and compiles shaders with Mesa's Panfrost compiler
+  from the Metal libraries' bitcode; `userland/src/HakiosMetalCA.m` is the Metal plug-in iOS loads.
+- **Testing** is over the USB cable (`tools/`: logs, one-frame screenshots, restart, shader cache) with test boots from
+  RAM that flash nothing (`tools/bootrun.sh`), driven by job files of taps and test programs (`userland/rc.jobs.*`).
+
+### For a port to another phone
+
+Carries over as it is: the loader and U-Boot path, the way of running Apple's untouched root volume, the inserted
+libraries, the USB side that answers as an iPhone, the software passcode store, the Metal plug-in above the driver's C
+interface, the shader front end, MetalTest, the tools and job files.
+
+To write anew for another chip: everything in `drivers/`, and for a different GPU family the part of `hakios-metal`
+below its C interface. The Mali back end here and the Adreno one beside it show what that takes.
