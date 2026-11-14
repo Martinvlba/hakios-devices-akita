@@ -235,41 +235,70 @@ screen_thread(void *parameter, __unused wait_result_t result)
 		if (copy == NULL) {
 			goto done;
 		}
-		/* ... and taken again if the display went to another buffer meanwhile (up to 8 times): a picture whose
-		 * buffer stayed the one shown from the copy's start to its end is one frame -- unless something draws into
-		 * the buffer on the screen, which is then what the picture shows ("tries", "ms" in the comment line) */
-		uint32_t tries = 0;
-		uint64_t t0, t1, phys2 = 0;
+		/* ... and it has to be ONE frame: the display goes round three buffers, 12 ms each at 80 frames a second, and
+		 * the one on the screen now is drawn into again two flips later -- "the DMA's base is the same after the copy
+		 * as before" was true after two flips too, and such pictures had the next frame's tiles in them (a "half-drawn
+		 * frame" that the GPU never showed). So: wait for a flip, and copy the buffer the display has just LEFT -- whole,
+		 * and not drawn into before the next flip -- its rows as they lie first (10 ms), their order of bytes
+		 * afterwards; if the display flipped again before the rows were out, once more (up to 8 times). The comment
+		 * line says the tries, the copy's time, and "one frame" or not. */
+		extern uint32_t akita_display_flip_count(void);
+		uint32_t tries = 0, flips0 = 0, flips1 = 0;
+		uint64_t t0 = 0, t1 = 0, phys2 = 0;
 		const uint8_t *pixels2;
 		uint32_t w2, h2, rb2;
+		uint8_t *raw = kalloc_data((uint64_t)w * h * 4, Z_WAITOK);
+		bool one = false;
 
+		if (raw == NULL) {
+			kfree_data(copy, bytes);
+			goto done;
+		}
 		do {
-			to = copy;
+			/* the next flip (50 ms at the most: a still screen does not flip, and is whole as it is) */
+			uint32_t before = akita_display_flip_count();
+			bool flipped = false;
+
+			for (int wait = 0; wait < 250; wait++) {
+				if (akita_display_flip_count() != before) {
+					flipped = true;
+					break;
+				}
+				delay_for_interval(200, NSEC_PER_USEC);
+			}
+			if (flipped) {
+				/* (pixels, phys: the buffer that was shown until now) */
+				flips0 = akita_display_flip_count();
+			} else {
+				flips0 = before;
+			}
 			t0 = mach_absolute_time();
 			for (uint32_t y = 0; y < h; y++) {
-				/* (a row at a time out of the scan-out area, which is mapped as a device's: read a byte at a time
-				 * the picture took 0.7 s, some sixty frames) */
-				static uint8_t line[4 * 4096];
-				const uint8_t *row = line;
-
-				bcopy(pixels + (uint64_t)y * rb, line, (size_t)w * 4 <= sizeof(line) ? (size_t)w * 4 : sizeof(line));
-				for (uint32_t x = 0; x < w; x++) {
-					*to++ = row[4 * x + 2];                 /* BGRA in memory */
-					*to++ = row[4 * x + 1];
-					*to++ = row[4 * x + 0];
-				}
+				bcopy(pixels + (uint64_t)y * rb, raw + (uint64_t)y * w * 4, (size_t)w * 4);
 			}
 			t1 = mach_absolute_time();
+			flips1 = akita_display_flip_count();
 			tries++;
-			if (akita_display_snapshot(&pixels2, &phys2, &w2, &h2, &rb2) != 0 || phys2 == phys) {
+			one = flips1 == flips0;
+			if (one) {
+				break;
+			}
+			/* (for the next try: the buffer on the screen now, which the next flip leaves) */
+			if (akita_display_snapshot(&pixels2, &phys2, &w2, &h2, &rb2) != 0 || w2 != w || h2 != h) {
 				break;
 			}
 			pixels = pixels2;
 			phys = phys2;
 		} while (tries < 8);
+		for (uint64_t at = 0; at < (uint64_t)w * h; at++) {
+			*to++ = raw[4 * at + 2];                        /* BGRA in memory */
+			*to++ = raw[4 * at + 1];
+			*to++ = raw[4 * at + 0];
+		}
+		kfree_data(raw, (uint64_t)w * h * 4);
 		absolutetime_to_nanoseconds(t1 - t0, &t0);
-		n = (uint32_t)snprintf(chunk, sizeof(chunk), "P6\n# base %#llx stride %u size %ux%u tries %u%s copy %llu us\n%u %u\n255\n",
-		    phys, rb, w, h, tries, phys2 == phys ? "" : " (FLIPPED each time)", t0 / 1000, w, h);
+		n = (uint32_t)snprintf(chunk, sizeof(chunk), "P6\n# base %#llx stride %u size %ux%u tries %u copy %llu us, %s\n%u %u\n255\n",
+		    phys, rb, w, h, tries, t0 / 1000, one ? "one frame" : "NOT surely one frame", w, h);
 		screen_send(c, chunk, n);
 		n = 0;
 		for (uint64_t at = 0; at < bytes && c->open;) {
