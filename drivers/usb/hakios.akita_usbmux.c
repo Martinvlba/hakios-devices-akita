@@ -223,20 +223,64 @@ screen_thread(void *parameter, __unused wait_result_t result)
 		    "outside the scan-out area\n", phys, w, h, rb);
 		screen_send(c, chunk, n);
 	} else {
+		/* the whole picture taken at once into memory of our own, then sent: read row by row while it went over the
+		 * cable (seconds) it was many frames in one -- shapes cut along rows, one scene's text over the next one's
+		 * picture -- since the buffer the DMA reads is drawn into again a few frames later */
+		uint64_t bytes = (uint64_t)w * h * 3;
+		uint8_t *copy = kalloc_data(bytes, Z_WAITOK);
+		uint8_t *to = copy;
+
 		n = (uint32_t)snprintf(chunk, sizeof(chunk), "P6\n# base %#llx stride %u size %ux%u\n%u %u\n255\n", phys, rb, w, h,
 		    w, h);
-		for (uint32_t y = 0; y < h && c->open; y++) {
-			const uint8_t *row = pixels + (uint64_t)y * rb;
-			for (uint32_t x = 0; x < w; x++) {
-				if (n + 3 > sizeof(chunk)) {
-					if (!screen_send(c, chunk, n)) goto done;
-					n = 0;
-				}
-				chunk[n++] = (char)row[4 * x + 2];      /* BGRA in memory */
-				chunk[n++] = (char)row[4 * x + 1];
-				chunk[n++] = (char)row[4 * x + 0];
-			}
+		if (copy == NULL) {
+			goto done;
 		}
+		/* ... and taken again if the display went to another buffer meanwhile (up to 8 times): a picture whose
+		 * buffer stayed the one shown from the copy's start to its end is one frame -- unless something draws into
+		 * the buffer on the screen, which is then what the picture shows ("tries", "ms" in the comment line) */
+		uint32_t tries = 0;
+		uint64_t t0, t1, phys2 = 0;
+		const uint8_t *pixels2;
+		uint32_t w2, h2, rb2;
+
+		do {
+			to = copy;
+			t0 = mach_absolute_time();
+			for (uint32_t y = 0; y < h; y++) {
+				/* (a row at a time out of the scan-out area, which is mapped as a device's: read a byte at a time
+				 * the picture took 0.7 s, some sixty frames) */
+				static uint8_t line[4 * 4096];
+				const uint8_t *row = line;
+
+				bcopy(pixels + (uint64_t)y * rb, line, (size_t)w * 4 <= sizeof(line) ? (size_t)w * 4 : sizeof(line));
+				for (uint32_t x = 0; x < w; x++) {
+					*to++ = row[4 * x + 2];                 /* BGRA in memory */
+					*to++ = row[4 * x + 1];
+					*to++ = row[4 * x + 0];
+				}
+			}
+			t1 = mach_absolute_time();
+			tries++;
+			if (akita_display_snapshot(&pixels2, &phys2, &w2, &h2, &rb2) != 0 || phys2 == phys) {
+				break;
+			}
+			pixels = pixels2;
+			phys = phys2;
+		} while (tries < 8);
+		absolutetime_to_nanoseconds(t1 - t0, &t0);
+		n = (uint32_t)snprintf(chunk, sizeof(chunk), "P6\n# base %#llx stride %u size %ux%u tries %u%s copy %llu us\n%u %u\n255\n",
+		    phys, rb, w, h, tries, phys2 == phys ? "" : " (FLIPPED each time)", t0 / 1000, w, h);
+		screen_send(c, chunk, n);
+		n = 0;
+		for (uint64_t at = 0; at < bytes && c->open;) {
+			uint32_t part = (uint32_t)(bytes - at < MAX_DATA ? bytes - at : MAX_DATA);
+
+			if (!screen_send(c, copy + at, part)) {
+				break;
+			}
+			at += part;
+		}
+		kfree_data(copy, bytes);
 		if (n != 0) {
 			screen_send(c, chunk, n);
 		}
