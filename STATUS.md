@@ -14,6 +14,7 @@ what was seen on the one phone this port is developed on.
 | Screen | 1080 x 2400 at 120 Hz, drawn by the GPU, applications' own Metal layers at the full 120 frames a second; brightness slider; screen off and on with the side button |
 | Touch and buttons | touch, power, volume |
 | GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it (a 600-draw WebGL aquarium demo at the page's full 60 frames a second); Maps draws its map (land, water, roads, labels) |
+| Bluetooth | on: Settings' switch, discoverable as "iPhone", finds nearby devices, another phone connected to it; pairing, audio and accessories not tried yet |
 | Wi-Fi | joins WPA2 networks, DHCP, HTTPS; joined by the time the home screen is up; each phone has its own address |
 | Sound | both speakers |
 | Vibration | yes |
@@ -47,7 +48,6 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | Metal: layered rendering | up to 8 layers, colour and depth; not yet with stencil, multisampling, several colour targets, or a pass that loads what was there |
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.47 A with the screen off. Idle cores are powered down and the unused power domains turned off; Wi-Fi's PCIe link (no low-power state yet) is 0.06 A of it, where the rest goes is not found yet |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
-| Bluetooth | the controller is switched on and runs its firmware (asked from the kernel with `bt=1`); not yet given to iOS |
 | Microphone | reaches the kernel; iOS does not record from it yet |
 | Camera | both sensors answer; no picture yet |
 
@@ -76,6 +76,10 @@ layered rendering (one draw into several layers of an array texture, colour or d
 - **Apple's files are not changed on disk.** What has to differ is put in place at start (`userland/src/init.c`:
   bind mounts and synthetic directories) and by small libraries inserted into a few daemons (`userland/src/inject*.c`).
 - **Drivers** for this phone are in `drivers/` (display, touch, GPU, storage, USB, Wi-Fi, audio, power, thermal ...).
+- **Bluetooth:** the kernel switches the BCM4383 on and loads its firmware (`drivers/bluetooth/` here), and gives the
+  controller to iOS's own `bluetoothd` through the chip-independent half in the main repository (`drivers/bluetooth/`:
+  the kernel control and Skywalk pipe `bluetoothd` opens, from upstream's MediaTek work); BlueTool's service is
+  answered by a small inserted library (`userland/src/inject_bt.c`).
 - **Graphics:** `hakios-metal/` in the main repository is a Metal driver of our own. Its Mali back end writes the
   GPU's command streams directly (Mesa's panvk is the reference) and compiles shaders with Mesa's Panfrost compiler
   from the Metal libraries' bitcode; `userland/src/HakiosMetalCA.m` is the Metal plug-in iOS loads.
