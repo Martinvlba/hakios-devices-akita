@@ -1,10 +1,10 @@
 /*
  * The Pixel 8a's Bluetooth: the BCM4383 (the Wi-Fi chip's other half) speaks HCI in H4 on a UART of its own --
  * Android's device tree: odm/btbcm "goog,nitrous" and serial@155D0000 (uart18: a USI of the APM block in UART mode,
- * four pins, RTS/CTS). So far a look, with boot-arg bt=1:
+ * no pins of its own: an internal UART, see below). So far a look, with boot-arg bt=1:
  *
  *   1. what the bootloader left: the UART's clocks (CMU_APM), the USI's mode, the pins, the UART's registers;
- *   2. the clocks on, the USI a UART, the pins the UART's;
+ *   2. the clocks on, the USI a UART; what Android's HAL says to the AoC first (hakios_aoc_bt_prepare);
  *   3. the UART's source clock MEASURED (Android's clk_summary cannot be read: reading it panics Android's kernel):
  *      the UART in loop-back at a known divisor sends a FIFO's worth and the time it takes says the rate;
  *   4. 115200 8N1 with automatic RTS/CTS, the chip's BT_REG_ON low then high, device-wake held;
@@ -28,6 +28,7 @@
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern bool hakios_aoc_bt_prepare(void);            /* hakios.akita_aoc.c: what Android's HAL says to the AoC first */
 
 #define CMU_APM_PHYS            0x15400000ULL
 #define CMU_MUX_APM_FUNC        0x1000
@@ -42,7 +43,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define SYSREG_USI_MODE         0x4e4           /* syscon@154204E0, samsung,usi-offset 4 */
 #define USI_MODE_UART           0x1
 #define GPIO_ALIVE_PHYS         0x154d0000ULL
-#define GPA3                    0x060           /* pins 0-3: the UART's (function 2) */
+#define GPA3                    0x060           /* read only: NOT the UART (pins 0/1 are a bit-banged SPMI bus) */
 #define GPIO_CUSTOM_PHYS        0x15060000ULL
 #define GPN6                    0x0c0           /* pin 0: host wake (the chip's, an input) */
 #define GPN8                    0x100           /* pin 0: BT_REG_ON */
@@ -253,9 +254,10 @@ akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 	delay_for_interval(1, NSEC_PER_MSEC);
 	v = rd(uart + USI_OPTION);
 	wr(uart + USI_OPTION, (v & ~(1u << 2)) | (1u << 1));    /* (as the I2C buses: clock request on, clock stop off) */
-	for (unsigned pin = 0; pin < 4; pin++) {
-		pin_set(gpio_alive + GPA3, pin, 2, 0, -1);
-	}
+	/* NO PINS for the UART: the tree's "uart18-bus" (gpa3 0-3) is selected by nobody, and gpa3-0/1 are a bit-banged SPMI
+	 * bus's clock and data on this phone (Android's /sys/kernel/debug/gpio). Its clock's name says where it goes:
+	 * APM_USI1_UART_INT, a UART inside the chip -- towards the AoC, which has the Bluetooth chip's UART and its power
+	 * (aoc.bin: platform_bt_uart_driver.cc, platform_bt_power_control.cc, a Pigweed btproxy). */
 	pin_set(gpio_custom + GPN6, 0, 0, 1, -1);               /* host wake: an input, pulled down as Android has it */
 	say_state("set up");
 
@@ -268,6 +270,7 @@ akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 		src_hz = v;
 	}
 
+	printf("akita bt: the AoC %s\n", hakios_aoc_bt_prepare() ? "answered all three" : "did NOT answer as it answers Android");
 	/* the chip: off, then on (the HAL's reg_on_delay_ms is 100), awake */
 	uart_setup(115200, false, true);
 	/* the four lines' levels at each step (gpa3's DAT: which of them the chip moves says whether it lives) */

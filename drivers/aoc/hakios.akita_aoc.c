@@ -276,6 +276,108 @@ aoc_read(vm_offset_t svc, void *buf, uint32_t cap, int ms)
 	return -1;
 }
 
+static void
+aoc_say_bytes(const char *what, const uint8_t *b, int n)
+{
+	char text[3 * 64 + 1];
+	unsigned at = 0;
+
+	text[0] = 0;
+	for (int i = 0; i < n && i < 64; i++) {
+		at += (unsigned)snprintf(text + at, sizeof(text) - at, "%02x ", b[i]);
+	}
+	printf("akita aoc: bt: %s: %d bytes: %s\n", what, n, text);
+}
+
+/*
+ * What Android's Bluetooth HAL says to the AoC before it switches the chip's power on (its file I/O traced on this
+ * phone, 11-15: /dev/acd-chre_bt_offload_ctl and _data_tx/_data_rx, in this order, then rfkill on, then the UART) --
+ * without it the chip stays silent under BT_REG_ON. Replayed as it was, the answers said. True when all three were
+ * answered.
+ */
+bool hakios_aoc_bt_prepare(void);
+bool
+hakios_aoc_bt_prepare(void)
+{
+	static const uint8_t hello[48] = { 0 };
+	static const uint8_t setup[48] = { 0x02, 0x11, 0x00, 0x00, 0x00, 0x01, 0x02 };
+	static const uint8_t request[64] = {
+		0x08, 0x58, 0x02, 0x72, 0xcc, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x27, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x07, 0x00, 0x08,
+		0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04,
+		0x00, 0x04, 0x00, 0x00, 0x00,
+	};
+	static const char *const names[] = { "chre_bt_offload_ctl", "chre_bt_offload_data_tx", "chre_bt_offload_data_rx" };
+	vm_offset_t svc[3];
+	uint8_t answer[128];
+	int n, good = 0;
+
+	if (!ipc_base) {
+		printf("akita aoc: bt: the AoC is not up\n");
+		return false;
+	}
+	for (int i = 0; i < 3; i++) {
+		svc[i] = aoc_service(names[i]);
+		if (!svc[i]) {
+			printf("akita aoc: bt: no service %s\n", names[i]);
+			return false;
+		}
+		printf("akita aoc: bt: %s: flags %#x; up: size %u slots %u tx %u rx %u; down: size %u slots %u tx %u rx %u\n", names[i],
+		    rd(svc[i], 32), rd(region(svc[i], AOC_UP), 4), rd(region(svc[i], AOC_UP), 8), rd(region(svc[i], AOC_UP), 12),
+		    rd(region(svc[i], AOC_UP), 16), rd(region(svc[i], AOC_DOWN), 4), rd(region(svc[i], AOC_DOWN), 8),
+		    rd(region(svc[i], AOC_DOWN), 12), rd(region(svc[i], AOC_DOWN), 16));
+	}
+	while ((n = aoc_read(svc[0], answer, sizeof(answer), 0)) >= 0) {
+		aoc_say_bytes("ctl, waiting there", answer, n);
+	}
+	if (!aoc_write(svc[0], hello, sizeof(hello))) {
+		printf("akita aoc: bt: ctl takes no message\n");
+		return false;
+	}
+	n = aoc_read(svc[0], answer, sizeof(answer), 500);
+	aoc_say_bytes("ctl, to the first (Android: 01 00 ...)", answer, n < 0 ? 0 : n);
+	good += n > 0 && answer[0] == 0x01;
+	(void)aoc_write(svc[0], setup, sizeof(setup));
+	n = aoc_read(svc[0], answer, sizeof(answer), 500);
+	aoc_say_bytes("ctl, to the second (Android: 03 00 00 04 00 00 00 04 00 1e 00 00 00 01 05)", answer, n < 0 ? 0 : n);
+	good += n > 0 && answer[0] == 0x03;
+	/* the data services are rings of bytes (size 262144, one slot): the request's 64 bytes onto ours, the answer off the
+	 * AoC's (tx - rx bytes from rp on) */
+	{
+		vm_offset_t down = region(svc[1], AOC_DOWN), up = region(svc[2], AOC_UP);
+		uint32_t size = rd(down, 4), wp = rd(down, 20);
+
+		for (uint32_t i = 0; i < sizeof(request); i++) {
+			*(volatile uint8_t *)(ipc_base + rd(down, 0) + (wp + i) % size) = request[i];
+		}
+		__builtin_arm_dsb(0xf);
+		wr(down, 12, rd(down, 12) + (uint32_t)sizeof(request));
+		wr(down, 20, (wp + (uint32_t)sizeof(request)) % size);
+		__builtin_arm_dsb(0xf);
+		aoc_signal(svc[1]);
+		n = -1;
+		for (int ms = 0; ms < 500; ms++) {
+			uint32_t have = rd(up, 12) - rd(up, 16), usize = rd(up, 4), rp = rd(up, 24);
+
+			if (have != 0 && usize != 0) {
+				delay(2000);                    /* (the rest of it) */
+				have = rd(up, 12) - rd(up, 16);
+				n = have < sizeof(answer) ? (int)have : (int)sizeof(answer);
+				for (int i = 0; i < n; i++) {
+					answer[i] = *(volatile uint8_t *)(ipc_base + rd(up, 0) + (rp + (uint32_t)i) % usize);
+				}
+				wr(up, 16, rd(up, 16) + have);
+				wr(up, 24, (rp + have) % usize);
+				break;
+			}
+			delay(1000);
+		}
+	}
+	aoc_say_bytes("data_rx (Android: 32 bytes, 2f b8 26 21 05 ...)", answer, n < 0 ? 0 : n);
+	good += n > 0;
+	return good == 3;
+}
+
 /* an audio command round trip on SERVICE (aoc_alsa_hw.c's aoc_audio_control): old replies dropped, the command, its reply */
 static int
 aoc_audio_cmd(const char *service, void *cmd, uint32_t len)
