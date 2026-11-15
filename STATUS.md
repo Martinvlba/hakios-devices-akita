@@ -1,6 +1,6 @@
 # Pixel 8a (akita): status
 
-HakiOS (iOS 16.7.16 userland on XNU) on the Google Pixel 8a (Tensor G3, Mali-G715). Last update: 2026-11-14.
+HakiOS (iOS 16.7.16 userland on XNU) on the Google Pixel 8a (Tensor G3, Mali-G715). Last update: 2026-11-15.
 
 The phone starts iOS from its own storage (slot b) in about 45 seconds; Android stays on slot a. Everything below is
 what was seen on the one phone this port is developed on.
@@ -11,7 +11,7 @@ what was seen on the one phone this port is developed on.
 |---|---|
 | Boot | from the phone's storage, straight to the lock or home screen; iOS's data is kept between starts |
 | Safety net | a start that does not reach the home screen in 4 minutes restarts into the bootloader (fastboot) |
-| Screen | 1080 x 2400 at 120 Hz, drawn by the GPU; brightness slider; screen off and on with the side button |
+| Screen | 1080 x 2400 at 120 Hz, drawn by the GPU, applications' own Metal layers at the full 120 frames a second; brightness slider; screen off and on with the side button |
 | Touch and buttons | touch, power, volume |
 | GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it |
 | Wi-Fi | joins WPA2 networks, DHCP, HTTPS; each phone has its own address |
@@ -41,7 +41,6 @@ layered rendering (one draw into several layers of an array texture), UIKit view
 | | |
 |---|---|
 | Metal: layered rendering | up to 8 layers of one colour attachment; not yet with a depth attachment (shadow cube maps in one pass), multisampling, or a pass that loads what was there |
-| Metal: frame rate | an application's own Metal layer shows 75-105 frames a second, not the panel's 120 (its drawables come back late; the drawing itself takes a fraction of a millisecond) |
 | WebGL | works; heavy pages are slow (a 600-draw aquarium demo: about 30 frames a second) |
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.5 A with the screen off |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
