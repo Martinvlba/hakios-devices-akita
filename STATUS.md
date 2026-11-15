@@ -28,19 +28,20 @@ what was seen on the one phone this port is developed on.
 
 ### Metal, in detail
 
-`MetalTest`, a test application that comes with the image, draws 23 pages, one feature each. All 23 are right:
+`MetalTest`, a test application that comes with the image, draws 25 pages, one feature each. All 25 are right:
 
 clears, vertex buffers, indexed draws (16 and 32 bit), textures (nearest, linear, mipmaps, generated mipmaps), alpha
 blending, depth, stencil, instancing, 4x multisampling, float render targets, several render targets in one pass,
 compute kernels, ASTC textures (sRGB included), array / cube / 3D textures, the common pixel formats, points with a
 size, lines, strips, viewports and scissors, discard and derivatives, blit copies and read-back, 400 draws a frame,
-layered rendering (one draw into several layers of an array texture), UIKit views animating over a Metal layer.
+layered rendering (one draw into several layers of an array texture, colour or depth), passes of depth alone
+(shadow maps: a pipeline with no fragment function), UIKit views animating over a Metal layer.
 
 ## Works in part
 
 | | |
 |---|---|
-| Metal: layered rendering | up to 8 layers of one colour attachment; not yet with a depth attachment (shadow cube maps in one pass), multisampling, or a pass that loads what was there |
+| Metal: layered rendering | up to 8 layers, colour and depth; not yet with stencil, multisampling, several colour targets, or a pass that loads what was there |
 | WebGL | works; heavy pages are slow (a 600-draw aquarium demo: about 30 frames a second) |
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.5 A with the screen off |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
