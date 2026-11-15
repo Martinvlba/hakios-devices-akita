@@ -37,6 +37,7 @@
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
 #include <kern/startup.h>
+#include <kern/thread.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -781,6 +782,34 @@ pcie_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	}
 }
 
+/*
+ * The steps on a thread of their own (11-15), not on the timer's: the firmware's 1.27 MB go to the chip a register
+ * write at a time and are read back the same way, 1.2 s of work without a wait in it -- and a thread call that does
+ * not block keeps every other call of its group waiting: the display stood still for 1.18 s once a boot, the window
+ * server's timers and the GPU's among them (the framebuffer's "1 pause" in the window when the Wi-Fi comes up; an
+ * application's Metal layer saw its display link silent that long).
+ */
+extern kern_return_t thread_terminate(thread_t thread);
+
+static void
+pcie_thread(__unused void *a, __unused wait_result_t w)
+{
+	pcie_run(NULL, NULL);
+	thread_terminate(current_thread());
+}
+
+static void
+pcie_start(__unused thread_call_param_t a, __unused thread_call_param_t b)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(pcie_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		pcie_run(NULL, NULL);
+	}
+}
+
 static void
 akita_pcie_init(void)
 {
@@ -793,7 +822,7 @@ akita_pcie_init(void)
 	}
 	PE_parse_boot_argn("pcie_delay", &delay_s, sizeof(delay_s));
 	printf("pcie: steps 1 to %u in %u s\n", steps, delay_s);
-	call = thread_call_allocate(pcie_run, NULL);
+	call = thread_call_allocate(pcie_start, NULL);
 	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(call, deadline);
 }
