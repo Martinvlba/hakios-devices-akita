@@ -36,7 +36,9 @@ USBSER=""; [ -s ~/akita/usb_serial ] && USBSER="usb_serial=$(head -1 ~/akita/usb
 HW=""; case "$BOOTARGS" in *torch=*) ;; *) HW="torch=3";; esac
 # (sound is built in since 11-12: aoc=3 amp=2 speaker=1. QUIET=1 -- a run with nobody there, the tester's rule: nothing
 # audible unless he is with the phone -- adds speaker=0: the amplifiers stay off, the AoC still runs)
-[ -n "$QUIET" ] && HW="$HW speaker=0"
+# ... and restart_fastboot=1: a restart of the test boot by itself (its time limit, the USB host gone) ends in the
+# bootloader, which is silent, not in the installed image, which is not
+[ -n "$QUIET" ] && HW="$HW speaker=0 restart_fastboot=1"
 LC_ALL=C grep -aq "touchscreen=1 buttons=1" hakios-kernel || { echo "bootrun: hakios-kernel has no built-in arguments (CONFIG_DEFAULTS, 11-12): make kernel"; exit 1; }
 CMDLINE="debug=0x8 $SAFE cpus=9 $USBSER ${THERMAL:+$THERMAL }ufs=2 ufs_write=1 $HW $BOOTARGS"
 [ ${#CMDLINE} -gt 490 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the kernel gets whole (490: at 491 its last character was lost, 11-10); shorten BOOTARGS"; exit 1; }

@@ -167,6 +167,20 @@ hakios_platform_halt(int reboot)
 		return;                 /* xl's run: the loader takes it back */
 	}
 	if (reboot) {
+		/*
+		 * Boot-arg restart_fastboot=1 (11-15; tools/bootrun.sh gives it with QUIET=1): every restart of this boot
+		 * goes into the bootloader, not into the active slot -- a test boot that restarts by itself (its time limit,
+		 * a USB host gone quiet) started the installed image, which plays its start sound and buzzes: in the night,
+		 * twice. The bootloader is silent, and the computer reaches it.
+		 */
+		uint32_t fastboot = 0;
+
+		if (PE_parse_boot_argn("restart_fastboot", &fastboot, sizeof(fastboot)) && fastboot != 0) {
+			printf("akita: restart: into the bootloader (restart_fastboot=1), a warm reset\n");
+			smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 1, REBOOT_BOOTLOADER);
+			smc(PSCI_SYSTEM_RESET2, 0, 0, 0);
+			smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+		}
 		printf("akita: restart: a normal start next (reboot command 0), a warm reset\n");
 		smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 1, 0);
 		smc(PSCI_SYSTEM_RESET2, 0, 0, 0);
