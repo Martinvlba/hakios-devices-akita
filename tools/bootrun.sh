@@ -60,4 +60,15 @@ for i in $(seq 1 20); do timeout 2 python3 devices/akita/tools/usbmux-log.py /de
 timeout ${SECS:-90} python3 devices/akita/tools/usbmux-log.py $S/test-console.log >/dev/null 2>&1 &
 timeout ${SECS:-90} python3 devices/akita/tools/usbmux-log.py -k $S/test-k.log >/dev/null 2>&1
 wait
+# no log at all: nearly always the computer's usbmuxd ("RX transfer stalled"), not the phone -- which then restarts
+# itself (usb_lost_reboot), with QUIET=1 into the bootloader
+if [ ! -s $S/test-console.log ] && [ ! -s $S/test-k.log ]; then
+  echo "bootrun: NO LOG CAME. usbmuxd is $(systemctl is-active usbmuxd 2>/dev/null); if the phone is on the bus (usb: $(lsusb | grep -o '05ac:[0-9a-f]*\|18d1:[0-9a-f]*')) restart it first: sudo systemctl restart usbmuxd"
+fi
+# a quiet run whose log is not the test boot's: the test image reset before its kernel was up and the bootloader
+# started the installed one (11-15: with its start sound). Out of it at once.
+if [ -n "$QUIET" ] && [ -s $S/test-k.log ] && ! grep -aq "restart_fastboot=1" $S/test-k.log; then
+  echo "bootrun: THIS LOG IS NOT THE TEST BOOT'S (no restart_fastboot=1 in its line): the installed image is running -- sent to the bootloader"
+  timeout 30 python3 devices/akita/tools/usbmux-reboot.py bootloader >/dev/null 2>&1
+fi
 echo "usb now: $(lsusb | grep -o '05ac:[0-9a-f]*\|18d1:[0-9a-f]*')"
