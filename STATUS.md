@@ -87,5 +87,19 @@ Carries over as it is: the loader and U-Boot path, the way of running Apple's un
 libraries, the USB side that answers as an iPhone, the software passcode store, the Metal plug-in above the driver's C
 interface, the shader front end, MetalTest, the tools and job files.
 
+Things that cost days here and are the same on any phone:
+
+- Nothing long in a kernel timer callback (thread call) that does not block: it holds up every other timer of the
+  system. A Wi-Fi firmware load done there froze the display for a second.
+- A missing Apple service must answer "not there", not stay silent or say yes with nothing: SpringBoard retrying a
+  telephony daemon that never answers reset the idle timer every second (no auto-lock); a sandbox call answered
+  "success" with an empty buffer made Safari's history service abort at every start.
+- "Setup is done" is asked by many processes, not only SpringBoard (`purplebuddy.sentinel`, see
+  `userland/src/inject_sb.c`): without it no button screenshots and no deferred background work.
+- The bootloader leaves every power domain on; turn off what no driver uses (`drivers/power/hakios.akita_power.c`).
+- A test boot from RAM that resets early falls into the installed image. Keep that in mind for what is flashed.
+- Tools that found most faults: the kernel log beside a process's own times, `tools/dsc-backtrace.py` and
+  `tools/dsc-disasm.py` on the shared cache (names for an abort's frames, then the code around them).
+
 To write anew for another chip: everything in `drivers/`, and for a different GPU family the part of `hakios-metal`
 below its C interface. The Mali back end here and the Adreno one beside it show what that takes.
