@@ -14,7 +14,7 @@ what was seen on the one phone this port is developed on.
 | Screen | 1080 x 2400 at 120 Hz, drawn by the GPU, applications' own Metal layers at the full 120 frames a second; brightness slider; screen off and on with the side button |
 | Touch and buttons | touch, power, volume |
 | GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it (a 600-draw WebGL aquarium demo at the page's full 60 frames a second); Maps draws its map (land, water, roads, labels) |
-| Bluetooth | on: Settings' switch, discoverable as "iPhone", finds nearby devices, another phone connected to it; pairing, audio and accessories not tried yet |
+| Bluetooth | on: Settings' switch, discoverable as "iPhone", finds nearby devices; earbuds pair and play (YouTube in Safari heard through Nothing Ear (3)); calls' audio, keyboards and LE accessories not tried yet |
 | Wi-Fi | joins WPA2 networks, DHCP, HTTPS; joined by the time the home screen is up; each phone has its own address |
 | Sound | both speakers |
 | Vibration | yes |
