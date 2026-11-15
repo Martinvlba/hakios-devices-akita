@@ -42,7 +42,7 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | | |
 |---|---|
 | Metal: layered rendering | up to 8 layers, colour and depth; not yet with stencil, multisampling, several colour targets, or a pass that loads what was there |
-| WebGL | works; heavy pages are slow (a 600-draw aquarium demo: about 30 frames a second) |
+| WebGL | works; a 600-draw aquarium demo runs at 43-49 frames a second (the panel's rate is 120) |
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.5 A with the screen off |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
 | Microphone | reaches the kernel; iOS does not record from it yet |
