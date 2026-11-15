@@ -1,0 +1,6 @@
+# devices/akita/drivers/bluetooth/conf: the Pixel 8a's Bluetooth (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_BT
+	file    bsd/dev/hakios.akita_bt.c
+	help    the Pixel 8a's Bluetooth: the BCM4383's HCI on zuma's serial@155D0000 (USI1 of the APM block, H4 with RTS/CTS);
+	help    a look so far (bt=1): the UART brought up, its clock measured, the chip out of reset and asked HCI_Reset
