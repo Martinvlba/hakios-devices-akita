@@ -23,6 +23,7 @@ what was seen on the one phone this port is developed on.
 | Clock | keeps the time |
 | Shut down / restart | yes |
 | Passcode | can be set, changed and removed in Settings; the phone locks and asks for it (kept in software, see below) |
+| Auto-lock | the screen goes off and the phone locks after the time set in Settings |
 | Stock applications | all installed, the removable ones (Mail, Maps, Notes, ...) included; those of the first page and the dock were opened and draw, the rest not yet gone through |
 | Screenshots | side button with volume up, saved to Photos; also from a computer over USB |
 | USB | seen as an iPhone by a computer: pairing, the usual iPhone tools, the system log, screenshots |
