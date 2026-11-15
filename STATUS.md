@@ -27,6 +27,7 @@ what was seen on the one phone this port is developed on.
 | Stock applications | all installed, the removable ones (Mail, Maps, Notes, ...) included; every one was opened and draws its first screen (News loads its stories). Without their hardware or service: Magnifier and Measure are black and Camera has no picture (no camera yet), Compass does not turn (no sensor), Music says it is offline, Weather has no data |
 | Screenshots | side button with volume up, saved to Photos; also from a computer over USB |
 | USB | seen as an iPhone by a computer: pairing, the usual iPhone tools, the system log, screenshots |
+| Crash reports | a crashed process leaves Apple's usual `.ips` report; `idevicecrashreport -k DIR` on a computer collects them |
 
 ### Metal, in detail
 
