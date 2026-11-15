@@ -131,6 +131,26 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, bomb_init);
  */
 extern int reboot_kernel(int howto, char *message);
 
+/*
+ * restart_fastboot=1 (11-15), from the kernel's start on: the bootloader's reboot command says "fastboot" all through
+ * such a boot, not only when this driver restarts the phone -- a reset that comes another way (a watchdog while the
+ * file systems are synced, a fault) then ends in the bootloader as well. In the night of 11-15 a quiet test boot
+ * whose USB host had stalled was found in the installed image afterwards, the restart's own setting of the command
+ * (hakios_platform_halt) notwithstanding.
+ */
+static void
+restart_fastboot_init(void)
+{
+	uint32_t fastboot = 0;
+
+	if (PE_parse_boot_argn("restart_fastboot", &fastboot, sizeof(fastboot)) && fastboot != 0) {
+		smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 1, REBOOT_BOOTLOADER);
+		printf("akita: restart_fastboot=1: the bootloader's reboot command is fastboot from now on (reads %#llx)\n",
+		    smc(TENSOR_SMC_PMU_SEC_REG, PMU_REBOOT_CMD, 0, 0));
+	}
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, restart_fastboot_init);
+
 static void
 test_time_up(__unused thread_call_param_t a, __unused thread_call_param_t b)
 {
