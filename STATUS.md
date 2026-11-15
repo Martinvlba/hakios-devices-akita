@@ -13,7 +13,7 @@ what was seen on the one phone this port is developed on.
 | Safety net | a start that does not reach the home screen in 4 minutes restarts into the bootloader (fastboot) |
 | Screen | 1080 x 2400 at 120 Hz, drawn by the GPU, applications' own Metal layers at the full 120 frames a second; brightness slider; screen off and on with the side button |
 | Touch and buttons | touch, power, volume |
-| GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it |
+| GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it (a 600-draw WebGL aquarium demo at the page's full 60 frames a second) |
 | Wi-Fi | joins WPA2 networks, DHCP, HTTPS; each phone has its own address |
 | Sound | both speakers |
 | Vibration | yes |
@@ -42,7 +42,6 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | | |
 |---|---|
 | Metal: layered rendering | up to 8 layers, colour and depth; not yet with stencil, multisampling, several colour targets, or a pass that loads what was there |
-| WebGL | works; a 600-draw aquarium demo runs at 43-49 frames a second (the panel's rate is 120) |
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.5 A with the screen off |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
 | Microphone | reaches the kernel; iOS does not record from it yet |
