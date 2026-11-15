@@ -235,14 +235,16 @@ screen_thread(void *parameter, __unused wait_result_t result)
 		if (copy == NULL) {
 			goto done;
 		}
-		/* ... and it has to be ONE frame: the display goes round three buffers, 12 ms each at 80 frames a second, and
-		 * the one on the screen now is drawn into again two flips later -- "the DMA's base is the same after the copy
-		 * as before" was true after two flips too, and such pictures had the next frame's tiles in them (a "half-drawn
-		 * frame" that the GPU never showed). So: wait for a flip, and copy the buffer the display has just LEFT -- whole,
-		 * and not drawn into before the next flip -- its rows as they lie first (10 ms), their order of bytes
-		 * afterwards; if the display flipped again before the rows were out, once more (up to 8 times). The comment
+		/* ... and it has to be ONE frame: the display goes round three buffers, 8 to 12 ms each, and a buffer it has
+		 * left is drawn into again at once ("the DMA's base is the same after the copy" held after two flips too: such
+		 * pictures had the next frame's tiles in them). So the display is HELD on the frame it shows (akita_display_hold:
+		 * the next scan-out waits, 40 ms at the most; the buffer on the panel is not drawn into, the GPU service sees
+		 * to that), once no switch is on its way; that buffer's rows are copied as they lie (15 ms), their bytes turned
+		 * afterwards, and the display let go. If it flipped all the same, once more (3 times at the most). The comment
 		 * line says the tries, the copy's time, and "one frame" or not. */
 		extern uint32_t akita_display_flip_count(void);
+		extern void akita_display_hold(int on);
+		extern int akita_display_settled(void);
 		uint32_t tries = 0, flips0 = 0, flips1 = 0;
 		uint64_t t0 = 0, t1 = 0, phys2 = 0;
 		const uint8_t *pixels2;
@@ -255,41 +257,26 @@ screen_thread(void *parameter, __unused wait_result_t result)
 			goto done;
 		}
 		do {
-			/* the next flip (50 ms at the most: a still screen does not flip, and is whole as it is) */
-			uint32_t before = akita_display_flip_count();
-			bool flipped = false;
-
-			for (int wait = 0; wait < 250; wait++) {
-				if (akita_display_flip_count() != before) {
-					flipped = true;
-					break;
-				}
+			akita_display_hold(1);
+			for (int wait = 0; wait < 100 && !akita_display_settled(); wait++) {
 				delay_for_interval(200, NSEC_PER_USEC);
 			}
-			if (flipped) {
-				/* (pixels, phys: the buffer that was shown until now) */
-				flips0 = akita_display_flip_count();
-			} else {
-				flips0 = before;
+			if (akita_display_snapshot(&pixels2, &phys2, &w2, &h2, &rb2) == 0 && w2 == w && h2 == h) {
+				pixels = pixels2;
+				phys = phys2;
+				rb = rb2;
 			}
+			flips0 = akita_display_flip_count();
 			t0 = mach_absolute_time();
 			for (uint32_t y = 0; y < h; y++) {
 				bcopy(pixels + (uint64_t)y * rb, raw + (uint64_t)y * w * 4, (size_t)w * 4);
 			}
 			t1 = mach_absolute_time();
 			flips1 = akita_display_flip_count();
+			akita_display_hold(0);
 			tries++;
 			one = flips1 == flips0;
-			if (one) {
-				break;
-			}
-			/* (for the next try: the buffer on the screen now, which the next flip leaves) */
-			if (akita_display_snapshot(&pixels2, &phys2, &w2, &h2, &rb2) != 0 || w2 != w || h2 != h) {
-				break;
-			}
-			pixels = pixels2;
-			phys = phys2;
-		} while (tries < 8);
+		} while (!one && tries < 3);
 		for (uint64_t at = 0; at < (uint64_t)w * h; at++) {
 			*to++ = raw[4 * at + 2];                        /* BGRA in memory */
 			*to++ = raw[4 * at + 1];

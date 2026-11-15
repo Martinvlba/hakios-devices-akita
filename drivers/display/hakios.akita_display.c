@@ -683,6 +683,19 @@ display_slot(unsigned i, uint64_t *size)
 	return i < SLOTS ? FB_FRONT + i * SLOT_SIZE : 0;
 }
 
+/*
+ * THE PICTURE HELD FOR A SCREENSHOT (11-15): akita_display_hold(1) keeps the frame on the panel there -- the next
+ * scan-out request waits (40 ms at the most) until akita_display_hold(0) -- so that hakios.akita_usbmux.c can copy the
+ * buffer the panel reads as ONE frame: at 120 flips a second its copy (15 ms) is longer than a frame, and the buffer
+ * the panel has left is drawn into again at once. The buffer ON the panel is not: the GPU service holds what would
+ * draw into it. akita_display_settled(): no switch is on its way (what was asked for is what the panel reads).
+ */
+static volatile uint32_t shot_hold;
+void akita_display_hold(int on);
+int akita_display_settled(void);
+
+void akita_display_hold(int on) { shot_hold = on != 0; }
+
 /* PHYS (inside a slot, its rows ROW_BYTES apart) scanned out from the panel's next refresh on; returns at once */
 static void
 display_scanout(uint64_t phys, uint32_t row_bytes)
@@ -690,6 +703,9 @@ display_scanout(uint64_t phys, uint32_t row_bytes)
 	if (phys < FB_FRONT || phys + (uint64_t)row_bytes * FB_HEIGHT > FB_FRONT + SLOTS * SLOT_SIZE || (row_bytes & 3) != 0 ||
 	    row_bytes < FB_WIDTH * 4) {
 		return;
+	}
+	for (int waited = 0; shot_hold && waited < 200; waited++) {
+		delay_for_interval(200, NSEC_PER_USEC);
 	}
 	lck_mtx_lock(flip_lock);
 	scan_stride = row_bytes;
@@ -699,6 +715,8 @@ display_scanout(uint64_t phys, uint32_t row_bytes)
 }
 
 static uint64_t display_scanned(void) { return scanned_phys; }
+
+int akita_display_settled(void) { return scan_phys == 0 || scanned_phys == scan_phys; }
 
 /* until DPP0 reads BASE (true), or US microseconds (false): woken by the flipper's switch, no polling */
 static bool
