@@ -331,9 +331,65 @@ struct hakios_bt_platform {                     /* (hakios.bthost.c's, field for
 	int     (*receive)(uint8_t *h4, unsigned room, unsigned wait_ms);
 	void    (*wake)(void);
 	int     (*wifi_address)(uint8_t out[6]);
+	bool    wakes;
 };
 extern void hakios_bthost_start(const struct hakios_bt_platform *platform);
+extern void hakios_bthost_wake(void);
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 
+/*
+ * The UART's interrupt (SPI 0x47 of the tree: INTID 103, level): bytes are in the receive FIFO, at its trigger level or
+ * after the receive time-out (UCON bit 7). Taken once the firmware runs; until then, and with bt_irq=0, the FIFO is
+ * read where it is asked for. The handler empties the FIFO into a ring and wakes the bridge; RTS holds the chip back
+ * meanwhile as before.
+ */
+#define UART_INTID              (32 + 0x47)
+#define RX_RING                 65536u
+static uint8_t rx_ring[RX_RING];
+static volatile uint32_t rx_head, rx_tail;      /* written by the handler, by the reader */
+static volatile uint32_t rx_interrupts, rx_lost;
+static bool rx_by_interrupt;
+
+static void
+akita_bt_interrupt(__unused void *context, __unused uint32_t intid)
+{
+	uint32_t pending = rd(uart + UINTP);
+
+	while (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) != 0) {
+		uint8_t byte = (uint8_t)rd(uart + URXH);
+
+		if (rx_head - rx_tail < RX_RING) {
+			rx_ring[rx_head % RX_RING] = byte;
+			rx_head++;
+		} else {
+			rx_lost++;
+		}
+	}
+	wr(uart + UINTP, pending);
+	rx_interrupts++;
+	hakios_bthost_wake();
+}
+
+/* the next byte the controller sent: from the ring, or (polled) from the FIFO; false if none */
+static bool
+rx_byte(uint8_t *byte)
+{
+	if (rx_by_interrupt) {
+		if (rx_tail == rx_head) {
+			return false;
+		}
+		*byte = rx_ring[rx_tail % RX_RING];
+		rx_tail++;
+		return true;
+	}
+	if (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) == 0) {
+		return false;
+	}
+	*byte = (uint8_t)rd(uart + URXH);
+	return true;
+}
+
+static bool want_interrupt = true;               /* bt_irq=0: the UART polled */
 static uint64_t last_traffic_ns;                /* the last byte either way: the polling slows when nothing moves */
 
 /* the chip switched on and answering at 115200 (nitrous_rfkill_set_power and the tty's open, as traced) */
@@ -391,13 +447,28 @@ akita_bt_function_on(void)
 	uart_baud(4000000);
 	delay_for_interval(5, NSEC_PER_MSEC);
 	last_traffic_ns = now_ns();
-	printf("akita bt: the firmware runs; 4000000 baud\n");
+	if (want_interrupt) {
+		static bool attached;
+
+		if (!attached && gic_v3_spi_attach(UART_INTID, false, akita_bt_interrupt, NULL) != KERN_SUCCESS) {
+			printf("akita bt: the UART's interrupt (intid %u) could not be taken\n", UART_INTID);
+			return EIO;                     /* (the bridge was told it would be woken) */
+		}
+		attached = true;
+		rx_head = rx_tail = 0;
+		rx_by_interrupt = true;
+		wr(uart + UINTP, 0xf);
+		wr(uart + UINTM, 0xe);                  /* the receive interrupt alone */
+	}
+	printf("akita bt: the firmware runs; 4000000 baud; %s\n", rx_by_interrupt ? "the UART's interrupt taken" : "the UART polled");
 	return 0;
 }
 
 static void
 akita_bt_function_off(void)
 {
+	wr(uart + UINTM, 0xf);
+	rx_by_interrupt = false;
 	pin_set(gpio_custom + GPN9, 0, 1, 0, 0);
 	power_pin(0);
 	printf("akita bt: the chip's power off\n");
@@ -428,9 +499,9 @@ h4_length(const uint8_t *b, unsigned have)
 }
 
 /*
- * One whole H4 packet from the UART, or 0 after wait_ms. The bytes of a packet not yet whole are kept for the next call.
- * Polled: the FIFO holds 256 bytes and RTS holds the chip back when it fills. With nothing moving for a second the
- * polling slows to once in 10 ms (the caller asks every 2 ms, for ever: a core woken 500 times a second for nothing).
+ * One whole H4 packet from the controller, or 0 after wait_ms. The bytes of a packet not yet whole are kept for the next
+ * call. With the interrupt the bridge asks with wait_ms 0 and sleeps itself; polled (bt_irq=0), with nothing moving
+ * for a second the polling slows to once in 10 ms. Once a minute of traffic the counts are said.
  */
 static int
 akita_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
@@ -438,11 +509,16 @@ akita_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
 	static uint8_t partial[4096];
 	static unsigned have;
 	static uint32_t said;
+	static uint64_t counted_ns;
 	uint64_t t0 = now_ns();
+	uint8_t byte;
 
+	if (rx_by_interrupt && t0 - counted_ns > 60 * NSEC_PER_SEC) {
+		counted_ns = t0;
+		printf("akita bt: %u interrupts so far, %u bytes from the controller, %u lost to a full ring\n", rx_interrupts, rx_head, rx_lost);
+	}
 	for (;;) {
-		while (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) != 0) {
-			uint8_t byte = (uint8_t)rd(uart + URXH);
+		while (rx_byte(&byte)) {
 			unsigned want;
 
 			last_traffic_ns = now_ns();
@@ -468,7 +544,7 @@ akita_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
 			}
 		}
 		if (now_ns() - t0 >= (uint64_t)wait_ms * NSEC_PER_MSEC) {
-			if (have == 0 && now_ns() - last_traffic_ns > NSEC_PER_SEC) {
+			if (!rx_by_interrupt && have == 0 && now_ns() - last_traffic_ns > NSEC_PER_SEC) {
 				delay_for_interval(10, NSEC_PER_MSEC);
 			}
 			return 0;
@@ -493,7 +569,7 @@ akita_bt_wifi_address(uint8_t out[6])
 	return 0;
 }
 
-static const struct hakios_bt_platform akita_bt_platform = {
+static struct hakios_bt_platform akita_bt_platform = {
 	.name = "zuma / akita / BCM4383",
 	.power_on = akita_bt_power_on,
 	.function_on = akita_bt_function_on,
@@ -511,6 +587,11 @@ akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 
 	PE_parse_boot_argn("bt", &mode, sizeof(mode));
 	if (mode >= 2) {
+		uint32_t irq = 1;
+
+		PE_parse_boot_argn("bt_irq", &irq, sizeof(irq));
+		want_interrupt = irq != 0;
+		akita_bt_platform.wakes = want_interrupt;
 		hakios_bthost_start(&akita_bt_platform);
 		return;
 	}
