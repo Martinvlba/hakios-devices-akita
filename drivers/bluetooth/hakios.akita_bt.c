@@ -30,6 +30,7 @@
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
 #define CMU_APM_PHYS            0x15400000ULL
 #define CMU_MUX_APM_FUNC        0x1000
@@ -230,6 +231,94 @@ power_pin(int on)
 }
 
 static void
+uart_baud(uint32_t baud)
+{
+	uint32_t quot = (src_hz + baud / 2) / baud;
+
+	/* (nothing left in the shifter first) */
+	for (int i = 0; i < 100 && !(rd(uart + UTRSTAT) & UTRSTAT_TX_EMPTY); i++) {
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	wr(uart + UBRDIV, quot / 16 - 1);
+	wr(uart + UFRACVAL, quot % 16);
+}
+
+/*
+ * The firmware, as Android's HAL loads it (its firmware_config.json; its writes traced): the rate up to 4 000 000
+ * (0xfc18), the fast download on (0xfe72: the records are not answered one by one, RTS/CTS paces them),
+ * Download_Minidriver (0xfc2e) and 50 ms, then BCM.hcd's records as they are -- each is an HCI command, opcode, length,
+ * data; 3631 Write_RAM (0xfc4c) and at the end Launch_RAM (0xfc4e) --, 250 ms, the UART back at 115200, HCI_Reset.
+ */
+static bool
+firmware_download(void)
+{
+	static const uint8_t rate[] = { 0x01, 0x18, 0xfc, 0x06, 0x00, 0x00, 0x00, 0x09, 0x3d, 0x00 };  /* 0x003d0900 */
+	static const uint8_t fast[] = { 0x01, 0x72, 0xfe, 0x02, 0x00, 0x01 };
+	static const uint8_t minidriver[] = { 0x01, 0x2e, 0xfc, 0x00 };
+	static const uint8_t reset[] = { 0x01, 0x03, 0x0c, 0x00 };
+	static const uint8_t name[] = { 0x01, 0x14, 0x0c, 0x00 };
+	static const uint8_t h4_command = 0x01;
+	uint64_t size = 0, at = 0, t0;
+	const uint8_t *file = hakios_image_file("fw", "BCM.hcd", &size, NULL);
+	uint8_t answer[300];
+	unsigned records = 0, came = 0, n;
+
+	if (file == NULL || size < 16) {
+		printf("akita bt: no fw/BCM.hcd in the image (from /vendor/firmware/brcm of the phone's Android into fw-wifi/)\n");
+		return false;
+	}
+	if (!hci_command("Update_Baudrate (0xfc18) 4000000", rate, sizeof(rate), 500)) {
+		return false;
+	}
+	uart_baud(4000000);
+	delay_for_interval(5, NSEC_PER_MSEC);
+	if (!hci_command("fast download (0xfe72)", fast, sizeof(fast), 500) ||
+	    !hci_command("Download_Minidriver (0xfc2e)", minidriver, sizeof(minidriver), 500)) {
+		return false;
+	}
+	delay_for_interval(50, NSEC_PER_MSEC);
+	t0 = now_ns();
+	while (at + 3 <= size) {
+		uint32_t length = 3u + file[at + 2];
+
+		if (at + length > size) {
+			printf("akita bt: BCM.hcd: record %u at %llu runs past the file's end\n", records, at);
+			return false;
+		}
+		if ((file[at] | file[at + 1] << 8) == 0xfc4e) {
+			printf("akita bt: firmware: %u records, %llu bytes in %llu ms, %u bytes came back meanwhile; Launch_RAM\n", records, at,
+			    (now_ns() - t0) / NSEC_PER_MSEC, came);
+		}
+		uart_send(&h4_command, 1);
+		uart_send(file + at, length);
+		at += length;
+		records++;
+		while (UFSTAT_RX_COUNT(rd(uart + UFSTAT)) != 0) {       /* (whatever it says meanwhile: read and counted) */
+			(void)rd(uart + URXH);
+			came++;
+		}
+	}
+	delay_for_interval(250, NSEC_PER_MSEC);
+	n = uart_receive(answer, sizeof(answer), 20);
+	uart_baud(115200);
+	wr(uart + UFCON, 0x117);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	wr(uart + UFCON, 0x111);
+	printf("akita bt: firmware: launched (%u more bytes came); UERSTAT %#x\n", n, rd(uart + UERSTAT));
+	if (!hci_command("HCI_Reset, the firmware's", reset, sizeof(reset), 1000)) {
+		return false;
+	}
+	/* Read_Local_Name: the firmware says its build ("BCM4383A3 ... FW:... CFG:..."; the ROM alone has another) */
+	uart_send(name, sizeof(name));
+	n = uart_receive(answer, sizeof(answer), 500);
+	if (n > 7) {
+		answer[n < sizeof(answer) ? n : sizeof(answer) - 1] = 0;
+		printf("akita bt: firmware: the controller's name (%u bytes): %s\n", n, (const char *)answer + 7);
+	}
+	return n > 7;
+}
+
+static void
 akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 {
 	static const uint8_t reset[] = { 0x01, 0x03, 0x0c, 0x00 };
@@ -271,6 +360,7 @@ akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 	(void)hci_command("Read_Chip_Id (0xfc79)", chip_id, sizeof(chip_id), 500);
 	(void)hci_command("Read_Local_Version_Information", version, sizeof(version), 500);
 	printf("akita bt: the controller answers\n");
+	printf("akita bt: the firmware %s\n", firmware_download() ? "runs" : "did NOT load");
 }
 
 static void

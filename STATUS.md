@@ -47,12 +47,12 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | Metal: layered rendering | up to 8 layers, colour and depth; not yet with stencil, multisampling, several colour targets, or a pass that loads what was there |
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.47 A with the screen off. Idle cores are powered down and the unused power domains turned off; Wi-Fi's PCIe link (no low-power state yet) is 0.06 A of it, where the rest goes is not found yet |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
+| Bluetooth | the controller is switched on and runs its firmware (asked from the kernel with `bt=1`); not yet given to iOS |
 | Microphone | reaches the kernel; iOS does not record from it yet |
 | Camera | both sensors answer; no picture yet |
 
 ## Not yet
 
-- Bluetooth
 - Mobile network (calls, SMS, data), GPS, NFC
 - Motion and light sensors: rotation, auto-brightness, proximity, compass
 - Sleep (suspend to RAM)
@@ -99,6 +99,9 @@ Things that cost days here and are the same on any phone:
   `userland/src/inject_sb.c`): without it no button screenshots and no deferred background work.
 - The bootloader leaves every power domain on; turn off what no driver uses (`drivers/power/hakios.akita_power.c`).
 - A test boot from RAM that resets early falls into the installed image. Keep that in mind for what is flashed.
+- When a chip stays silent and the vendor's driver source does not say why, trace the vendor's kernel on the phone:
+  Android's `events/rwmmio` logs every register it writes. That showed in one run that Bluetooth's power pin goes
+  through a latch (a second pin is pulsed after each change), which no public source for this phone says.
 - Tools that found most faults: the kernel log beside a process's own times, `tools/dsc-backtrace.py` and
   `tools/dsc-disasm.py` on the shared cache (names for an abort's frames, then the code around them).
 
