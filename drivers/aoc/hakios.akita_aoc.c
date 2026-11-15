@@ -649,6 +649,16 @@ aoc_dump_service(const char *name)
 	printf("akita aoc: [%s] %u lines\n", name, lines);
 }
 
+/* for the Bluetooth probe: what the AoC wrote on service NAME, into the log */
+void hakios_aoc_dump(const char *name);
+void
+hakios_aoc_dump(const char *name)
+{
+	if (ipc_base) {
+		aoc_dump_service(name);
+	}
+}
+
 /* aoclog=1: the AoC's "logging" queue drained every 20 ms into the kernel log from its start on (what Android's aocd puts
  * in logcat: plain text, one message a slot; a core's "F1: " prefix comes as a message of its own) -- left alone it fills
  * at 256 messages and the AoC says nothing more */

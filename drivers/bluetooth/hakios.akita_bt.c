@@ -1,22 +1,24 @@
 /*
  * The Pixel 8a's Bluetooth: the BCM4383 (the Wi-Fi chip's other half) speaks HCI in H4 on a UART of its own --
- * Android's device tree: odm/btbcm "goog,nitrous" and serial@155D0000 (uart18: a USI of the APM block in UART mode,
- * no pins of its own: an internal UART, see below). So far a look, with boot-arg bt=1:
+ * Android's device tree: odm/btbcm "goog,nitrous" and serial@155D0000 (uart18: the APM block's USI1 as a UART, RTS/CTS;
+ * no pins to set: its pads are its own). So far, with boot-arg bt=1: the chip switched on and asked HCI_Reset,
+ * Broadcom's Read_Chip_Id (0xfc79) and Read_Local_Version_Information.
  *
- *   1. what the bootloader left: the UART's clocks (CMU_APM), the USI's mode, the pins, the UART's registers;
- *   2. the clocks on, the USI a UART; what Android's HAL says to the AoC first (hakios_aoc_bt_prepare);
- *   3. the UART's source clock MEASURED (Android's clk_summary cannot be read: reading it panics Android's kernel):
- *      the UART in loop-back at a known divisor sends a FIFO's worth and the time it takes says the rate;
- *   4. 115200 8N1 with automatic RTS/CTS, the chip's BT_REG_ON low then high, device-wake held;
- *   5. HCI_Reset, Broadcom's Read_Chip_Id (0xfc79) and Read_Local_Version_Information, each answer said.
+ * How it was found (11-15), because none of it is in a public source for this phone: Android's kernel traced on the
+ * phone itself (events/rwmmio: every register it writes while Bluetooth is switched on) --
+ *   - BT_REG_ON (gpn8) goes through a LATCH: each change is followed by a pulse on gpp24-3 ("bt-ble-dbo-le");
+ *   - the UART's source clock is 200 MHz (UBRDIV 0x6b, UFRACVAL 8 for 115200);
+ *   - USI_OPTION is written 2, UCON 0xf3c5, UFCON 0x111, UMCON 0x30.
+ * The AoC has no part in it (Android's Bluetooth starts with the AoC never booted); gpa3, the tree's "uart18-bus", is
+ * not this UART's (gpa3-0/1 are a bit-banged SPMI bus: never to be touched).
  *
- * What Android does after that (its HAL's firmware_config.json): the baud rate up (0xfc18, 4 000 000), the fast
- * download switched on (0xfe72), Download_Minidriver (0xfc2e, 50 ms), the .hcd's records sent as they are (each is
- * an HCI command), Launch_RAM (0xfc4e, 250 ms), then the low-power mode (0xfc27) and the address (0xfc01). Not here yet.
+ * What Android's HAL does next (its firmware_config.json and its I/O traced): the baud rate up (0xfc18, 4 000 000), the
+ * fast download on (0xfe72), Download_Minidriver (0xfc2e, 50 ms), the .hcd's records sent as they are (each is an HCI
+ * command), Launch_RAM (0xfc4e, 250 ms), HCI_Reset, the low-power mode (0xfc27) and the address (0xfc01). Not here yet.
  *
- * Registers: Linux's drivers/tty/serial/samsung_tty.c; the clocks: Google's cal-if zuma cmucal-sfr.c / cmucal-node.c
- * (DIV_CLK_APM_USI1_UART under GATE_CLKCMU_APM_FUNC; the gates of APM_USI1_UART_INT); the pins: pinctrl-gs.c's zuma
- * tables (gpa3 in GPIO_ALIVE 0x154D0000 at 0x60; gpn6/8/9 in GPIO_CUSTOM_ALIVE 0x15060000 at 0xc0/0x100/0x120).
+ * Registers: Linux's drivers/tty/serial/exynos_tty.c; the clocks: Google's cal-if zuma cmucal-sfr.c (the gates of
+ * APM_USI1_UART_INT); the pins: pinctrl-gs.c's zuma tables (gpn6/8/9 in GPIO_CUSTOM_ALIVE 0x15060000 at 0xc0 / 0x100 /
+ * 0x120; gpp24 in GPIO_PERIC1 0x10C40000 at 0x60).
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -28,7 +30,6 @@
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-extern bool hakios_aoc_bt_prepare(void);            /* hakios.akita_aoc.c: what Android's HAL says to the AoC first */
 
 #define CMU_APM_PHYS            0x15400000ULL
 #define CMU_MUX_APM_FUNC        0x1000
@@ -44,6 +45,8 @@ extern bool hakios_aoc_bt_prepare(void);            /* hakios.akita_aoc.c: what 
 #define USI_MODE_UART           0x1
 #define GPIO_ALIVE_PHYS         0x154d0000ULL
 #define GPA3                    0x060           /* read only: NOT the UART (pins 0/1 are a bit-banged SPMI bus) */
+#define GPIO_PERIC1_PHYS        0x10c40000ULL
+#define GPP24                   0x060           /* pin 3: the latch enable of BT_REG_ON ("bt-ble-dbo-le") */
 #define GPIO_CUSTOM_PHYS        0x15060000ULL
 #define GPN6                    0x0c0           /* pin 0: host wake (the chip's, an input) */
 #define GPN8                    0x100           /* pin 0: BT_REG_ON */
@@ -71,9 +74,8 @@ extern bool hakios_aoc_bt_prepare(void);            /* hakios.akita_aoc.c: what 
 #define UTRSTAT_TX_EMPTY        (1u << 2)       /* the shifter too */
 #define UFSTAT_RX_COUNT(v)      ((v) & 0x1ffu)
 #define UFSTAT_TX_FULL          (1u << 24)
-#define UCON_LOOPBACK           (1u << 5)
 
-static vm_offset_t cmu, sysreg, gpio_alive, gpio_custom, uart;
+static vm_offset_t cmu, sysreg, gpio_alive, gpio_custom, gpio_peric1, uart;
 static uint32_t src_hz;
 
 static uint32_t rd(vm_offset_t a) { return *(volatile uint32_t *)a; }
@@ -119,61 +121,6 @@ now_ns(void)
 
 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
 	return ns;
-}
-
-static void
-uart_setup(uint32_t baud, bool loopback, bool flow)
-{
-	/* samsung_tty.c: quot = clk / baud; UBRDIV = quot / 16 - 1, UFRACVAL = quot % 16 */
-	uint32_t quot = (src_hz + baud / 2) / baud;
-
-	wr(uart + UINTM, 0xf);                          /* no interrupts: polled */
-	wr(uart + UFCON, 0x7);                          /* FIFOs on, both reset */
-	delay_for_interval(1, NSEC_PER_MSEC);
-	wr(uart + UFCON, 0x1);
-	wr(uart + ULCON, 0x3);                          /* 8N1 */
-	wr(uart + UBRDIV, quot / 16 - 1);
-	wr(uart + UFRACVAL, quot % 16);
-	wr(uart + UCON, 0x5 | (loopback ? UCON_LOOPBACK : 0));  /* receive and transmit: polled / interrupt mode */
-	wr(uart + UMCON, flow ? 0x10 : 0x1);            /* automatic RTS/CTS, or RTS held asserted */
-	wr(uart + UINTP, 0xf);
-}
-
-/* the source clock: a FIFO's worth of bytes in loop-back at divisor 1+DIV, timed */
-static uint32_t
-uart_measure(uint32_t ubrdiv)
-{
-	enum { BYTES = 200 };
-	uint64_t t0, t1;
-
-	wr(uart + UINTM, 0xf);
-	wr(uart + UFCON, 0x7);
-	delay_for_interval(1, NSEC_PER_MSEC);
-	wr(uart + UFCON, 0x1);
-	wr(uart + ULCON, 0x3);
-	wr(uart + UBRDIV, ubrdiv);
-	wr(uart + UFRACVAL, 0);
-	wr(uart + UMCON, 0x1);
-	wr(uart + UCON, 0x5 | UCON_LOOPBACK);
-	delay_for_interval(1, NSEC_PER_MSEC);
-	t0 = now_ns();
-	for (unsigned i = 0; i < BYTES; i++) {
-		wr(uart + UTXH, 0x55);
-	}
-	while (!(rd(uart + UTRSTAT) & UTRSTAT_TX_EMPTY)) {
-		if (now_ns() - t0 > 2 * NSEC_PER_SEC) {
-			printf("akita bt: the UART does not send (UTRSTAT %#x UFSTAT %#x after 2 s): no clock?\n", rd(uart + UTRSTAT),
-			    rd(uart + UFSTAT));
-			return 0;
-		}
-	}
-	t1 = now_ns();
-	/* BYTES * 10 bits in (t1 - t0); the clock is 16 * (1 + UBRDIV) times the bit rate */
-	uint64_t baud = (uint64_t)BYTES * 10 * NSEC_PER_SEC / (t1 - t0);
-
-	printf("akita bt: loop-back at UBRDIV %u: %u bytes in %llu us -> %llu baud -> the source clock %llu Hz; %u bytes came back\n",
-	    ubrdiv, BYTES, (t1 - t0) / 1000, baud, baud * 16 * (ubrdiv + 1), UFSTAT_RX_COUNT(rd(uart + UFSTAT)));
-	return (uint32_t)(baud * 16 * (ubrdiv + 1));
 }
 
 static void
@@ -233,97 +180,92 @@ hci_command(const char *name, const uint8_t *command, unsigned length, unsigned 
 	       answer[6] == 0;
 }
 
+/* Linux's exynos_serial_pm / _resetport / _startup / _set_termios for this port, as its register writes were traced on
+ * this phone (rwmmio events, Android's kernel): the USI into its reset and out, USI_OPTION 2, UMCON 0x20, UFCON 0x111,
+ * UCON 0x3c5 | 0xf000, the divisor for a 200 MHz clock (115200: UBRDIV 0x6b, UFRACVAL 8), UMCON 0x30 (RTS/CTS) */
+static void
+uart_open(uint32_t baud)
+{
+	uint32_t quot;
+
+	wr(cmu + CMU_GATE_PCLK, CMU_GATE_ON);
+	wr(cmu + CMU_GATE_RSTNSYNC, CMU_GATE_ON);
+	wr(cmu + CMU_GATE_IPCLK, CMU_GATE_ON);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	wr(sysreg + SYSREG_USI_MODE, USI_MODE_UART);
+	wr(uart + USI_CON, 1);
+	delay(10);
+	wr(uart + USI_CON, 0);
+	wr(uart + USI_OPTION, 2);
+	wr(uart + UMCON, 0x20);
+	wr(uart + UINTM, 0xf);                          /* polled here: every interrupt masked */
+	wr(uart + UFCON, 0x117);                        /* FIFOs on, both reset */
+	delay_for_interval(1, NSEC_PER_MSEC);
+	wr(uart + UFCON, 0x111);
+	wr(uart + UCON, 0xf3c5);
+	wr(uart + ULCON, 0x3);
+	quot = (src_hz + baud / 2) / baud;
+	wr(uart + UBRDIV, quot / 16 - 1);
+	wr(uart + UFRACVAL, quot % 16);
+	wr(uart + UMCON, 0x30);
+	wr(uart + UINTP, 0xf);
+}
+
+/*
+ * BT_REG_ON reaches the chip through a latch: after each change of gpn8 Android's kernel pulses gpp24-3 (the tree's
+ * "bt-ble-dbo-le": a latch enable -- the chip keeps its power state while the phone is off, for Find My) high and low.
+ * Traced: DAT of GPIO_PERIC1 +0x60 written 0x1, 0x9, 0x1 right after each write of gpn8. Without the pulse the chip
+ * never sees the pin: that was the silence of every run before.
+ */
+static void
+power_pin(int on)
+{
+	pin_set(gpio_custom + GPN8, 0, 1, 0, on);
+	delay(20);
+	pin_set(gpio_peric1 + GPP24, 3, 1, 0, 0);
+	delay(10);
+	pin_set(gpio_peric1 + GPP24, 3, 1, 0, 1);
+	delay(10);
+	pin_set(gpio_peric1 + GPP24, 3, 1, 0, 0);
+}
+
 static void
 akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 {
 	static const uint8_t reset[] = { 0x01, 0x03, 0x0c, 0x00 };
 	static const uint8_t chip_id[] = { 0x01, 0x79, 0xfc, 0x00 };
 	static const uint8_t version[] = { 0x01, 0x01, 0x10, 0x00 };
-	uint32_t wake = 1, v;
+	uint32_t v;
+	uint8_t junk[32];
+	unsigned n;
 
-	PE_parse_boot_argn("bt_wake", &wake, sizeof(wake));
-	say_state("as found");
-	/* the clocks: the bus clock and the reset synchroniser first, then the UART's own */
-	wr(cmu + CMU_GATE_PCLK, CMU_GATE_ON);
-	wr(cmu + CMU_GATE_RSTNSYNC, CMU_GATE_ON);
-	wr(cmu + CMU_GATE_IPCLK, CMU_GATE_ON);
-	delay_for_interval(1, NSEC_PER_MSEC);
-	say_uart("as found");
-	wr(sysreg + SYSREG_USI_MODE, USI_MODE_UART);
-	wr(uart + USI_CON, rd(uart + USI_CON) & ~1u);           /* out of the USI's reset */
-	delay_for_interval(1, NSEC_PER_MSEC);
-	v = rd(uart + USI_OPTION);
-	wr(uart + USI_OPTION, (v & ~(1u << 2)) | (1u << 1));    /* (as the I2C buses: clock request on, clock stop off) */
-	/* NO PINS for the UART: the tree's "uart18-bus" (gpa3 0-3) is selected by nobody, and gpa3-0/1 are a bit-banged SPMI
-	 * bus's clock and data on this phone (Android's /sys/kernel/debug/gpio). Its clock's name says where it goes:
-	 * APM_USI1_UART_INT, a UART inside the chip -- towards the AoC, which has the Bluetooth chip's UART and its power
-	 * (aoc.bin: platform_bt_uart_driver.cc, platform_bt_power_control.cc, a Pigweed btproxy). */
-	pin_set(gpio_custom + GPN6, 0, 0, 1, -1);               /* host wake: an input, pulled down as Android has it */
-	say_state("set up");
-
-	src_hz = uart_measure(15);
-	if (src_hz == 0) {
-		return;
-	}
-	(void)uart_measure(3);
+	src_hz = 200000000;                             /* (Linux's divisor for 115200 says so; the loop-back measured 196.5) */
 	if (PE_parse_boot_argn("bt_hz", &v, sizeof(v)) && v != 0) {
 		src_hz = v;
 	}
-
-	printf("akita bt: the AoC %s\n", hakios_aoc_bt_prepare() ? "answered all three" : "did NOT answer as it answers Android");
-	/* the chip: off, then on (the HAL's reg_on_delay_ms is 100), awake */
-	uart_setup(115200, false, true);
-	/* the four lines' levels at each step (gpa3's DAT: which of them the chip moves says whether it lives) */
-	printf("akita bt: lines: UART set up %#x", rd(gpio_alive + GPA3 + PIN_DAT));
-	pin_set(gpio_custom + GPN9, 0, 1, 0, (int)wake);
-	pin_set(gpio_custom + GPN8, 0, 1, 0, 0);
-	delay_for_interval(50, NSEC_PER_MSEC);
-	printf(", REG_ON low %#x", rd(gpio_alive + GPA3 + PIN_DAT));
-	pin_set(gpio_custom + GPN8, 0, 1, 0, 1);
-	delay_for_interval(2, NSEC_PER_MSEC);
-	printf(", high +2 ms %#x", rd(gpio_alive + GPA3 + PIN_DAT));
-	delay_for_interval(48, NSEC_PER_MSEC);
-	printf(", +50 ms %#x", rd(gpio_alive + GPA3 + PIN_DAT));
-	delay_for_interval(100, NSEC_PER_MSEC);
-	printf(", +150 ms %#x (gpn8 dat %#x)\n", rd(gpio_alive + GPA3 + PIN_DAT), rd(gpio_custom + GPN8 + PIN_DAT));
+	say_state("as found");
+	say_uart("as found");
+	/* nitrous_rfkill_set_power, as traced: off, 43 ms, on, device-wake high; the UART opened 26 ms later, the first
+	 * command ~150 ms after that */
+	pin_set(gpio_custom + GPN6, 0, 0, 1, -1);               /* host wake: an input, pulled down as Android has it */
+	pin_set(gpio_custom + GPN9, 0, 1, 0, 0);
+	power_pin(0);
+	delay_for_interval(43, NSEC_PER_MSEC);
+	power_pin(1);
+	pin_set(gpio_custom + GPN9, 0, 1, 0, 1);
+	delay_for_interval(26, NSEC_PER_MSEC);
+	uart_open(115200);
+	delay_for_interval(150, NSEC_PER_MSEC);
 	say_state("the chip on");
-	/* the chip says it listens by giving CTS (UMSTAT bit 0); if it does not, the other level of device-wake */
-	for (unsigned try = 0; try < 2; try++) {
-		uint64_t t0 = now_ns();
-		bool cts = false;
-
-		while (now_ns() - t0 < 1500 * NSEC_PER_MSEC) {
-			if (rd(uart + UMSTAT) & 1u) {
-				cts = true;
-				break;
-			}
-			delay_for_interval(5, NSEC_PER_MSEC);
-		}
-		printf("akita bt: device-wake %u: CTS %s after %llu ms (UMSTAT %#x, gpa3 dat %#x, host-wake %u)\n", wake,
-		    cts ? "given" : "NOT given", (now_ns() - t0) / NSEC_PER_MSEC, rd(uart + UMSTAT), rd(gpio_alive + GPA3 + PIN_DAT),
-		    rd(gpio_custom + GPN6 + PIN_DAT) & 1u);
-		if (cts) {
-			break;
-		}
-		wake = !wake;
-		pin_set(gpio_custom + GPN9, 0, 1, 0, (int)wake);
-	}
-	say_uart("115200 8N1");
-	{
-		uint8_t junk[32];
-		unsigned n = uart_receive(junk, sizeof(junk), 50);
-
-		if (n != 0) {
-			printf("akita bt: %u bytes came by themselves after power-on (first %02x)\n", n, junk[0]);
-		}
-	}
-	if (!(rd(uart + UMSTAT) & 1u)) {
-		/* no CTS: said anyway, with the flow control off (RTS held asserted) -- does anything come back? */
-		wr(uart + UMCON, 0x1);
-		printf("akita bt: no CTS: HCI_Reset sent without flow control\n");
+	say_uart("before HCI_Reset");
+	printf("akita bt: gpp24 con %#x dat %#x; CTS %s; host-wake %u\n", rd(gpio_peric1 + GPP24 + PIN_CON),
+	    rd(gpio_peric1 + GPP24 + PIN_DAT), (rd(uart + UMSTAT) & 1u) ? "given" : "NOT given", rd(gpio_custom + GPN6 + PIN_DAT) & 1u);
+	n = uart_receive(junk, sizeof(junk), 20);
+	if (n != 0) {
+		printf("akita bt: %u bytes came by themselves after power-on (first %02x)\n", n, junk[0]);
 	}
 	if (!hci_command("HCI_Reset", reset, sizeof(reset), 1000)) {
-		printf("akita bt: no answer to HCI_Reset at 115200 with the clock taken as %u Hz (bt_hz=, bt_wake=%u)\n", src_hz, wake);
+		printf("akita bt: no answer to HCI_Reset at 115200 with the clock taken as %u Hz (bt_hz=)\n", src_hz);
 		return;
 	}
 	(void)hci_command("Read_Chip_Id (0xfc79)", chip_id, sizeof(chip_id), 500);
@@ -356,13 +298,13 @@ akita_bt_init(void)
 	sysreg = ml_io_map(SYSREG_APM_PHYS, 0x1000);
 	gpio_alive = ml_io_map(GPIO_ALIVE_PHYS, 0x1000);
 	gpio_custom = ml_io_map(GPIO_CUSTOM_PHYS, 0x1000);
+	gpio_peric1 = ml_io_map(GPIO_PERIC1_PHYS, 0x1000);
 	uart = ml_io_map(UART_PHYS, 0x1000);
-	if (!cmu || !sysreg || !gpio_alive || !gpio_custom || !uart) {
+	if (!cmu || !sysreg || !gpio_alive || !gpio_custom || !gpio_peric1 || !uart) {
 		printf("akita bt: could not map its registers\n");
 		return;
 	}
 	start = thread_call_allocate(akita_bt_start, NULL);
-	/* well after the Wi-Fi half of the chip is up (pcie_delay=10 and its firmware) */
 	clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(start, deadline);
 }
