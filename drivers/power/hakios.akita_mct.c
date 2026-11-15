@@ -210,7 +210,7 @@ mct_report(__unused void *p, __unused wait_result_t w)
 		    pmu_smc(TENSOR_SMC_PMU_SEC_REG, PMU_INFORM0, 0, 0));
 		{
 			/* zuma's power domains (the device tree's samsung,exynos-pd nodes: PMU + offset, the domain's CONFIGURATION,
-			 * and STATUS at + 4, bit 0 on): which of them the bootloader left on -- this port turns none off. Twice:
+			 * and STATUS at + 4, bit 0 on): which of them the bootloader left on (hakios.akita_power.c turns the unused ones off). Twice:
 			 * the first report and the fifth (pd_say=1: every report). */
 			static const struct { const char *name; uint32_t at; } pd[] = {
 				{ "g3d", 0x1a80 }, { "embedded_g3d", 0x1c80 }, { "dpub", 0x1d00 }, { "dpuf0", 0x1d80 }, { "dpuf1", 0x1e00 },
@@ -220,17 +220,24 @@ mct_report(__unused void *p, __unused wait_result_t w)
 				{ "hsi1", 0x2b00 },
 			};
 			static unsigned reports;
+			static vm_offset_t pmu;
 			uint32_t every = 0;
 
+			/* the PMU is read as it is (Google's cal-if: readl), and written through the firmware alone (its
+			 * set_priv_reg); a read through the firmware is refused for the status registers (-22) */
+			if (pmu == 0) {
+				pmu = ml_io_map(0x15460000ULL, 0x4000);
+			}
 			PE_parse_boot_argn("pd_say", &every, sizeof(every));
 			if (reports == 0 || reports == 4 || every) {
 				char line[512];
 				int n = 0;
 
 				for (unsigned i = 0; i < sizeof(pd) / sizeof(pd[0]) && n < (int)sizeof(line) - 40; i++) {
-					n += snprintf(line + n, sizeof(line) - n, " %s %llx/%llx", pd[i].name,
-					    pmu_smc(TENSOR_SMC_PMU_SEC_REG, 0x15460000ULL + pd[i].at, 0, 0),
-					    pmu_smc(TENSOR_SMC_PMU_SEC_REG, 0x15460000ULL + pd[i].at + 4, 0, 0));
+					if (pmu != 0) {
+						n += snprintf(line + n, sizeof(line) - n, " %s %x/%x", pd[i].name,
+						    *(volatile uint32_t *)(pmu + pd[i].at), *(volatile uint32_t *)(pmu + pd[i].at + 4));
+					}
 				}
 				printf("akita mct: power domains (configuration/status, bit 0 on):%s\n", line);
 			}

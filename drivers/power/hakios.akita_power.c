@@ -19,6 +19,7 @@
 #include <sys/proc.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 #define PMU_REBOOT_CMD          0x15460810UL
 #define PMU_PS_HOLD_CONTROL     0x15463e9cUL    /* PMU 0x15460000 + 0x3e9c */
@@ -150,6 +151,77 @@ restart_fastboot_init(void)
 	}
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, restart_fastboot_init);
+
+/*
+ * THE POWER DOMAINS NOTHING HERE USES ARE TURNED OFF (11-15). The bootloader leaves all of zuma's power domains on,
+ * and no driver of this port uses the 2D scaler (g2d), the camera's processing blocks (gdc, gse, mcsc, rgbp, tnr,
+ * yuvp), the video codec (mfc), the two neural accelerators (aur, tpu) or bw: twenty seconds after the start they are
+ * turned off as Google's cal-if does it (flexpmu_cal_local_zuma.h, NAME_off): bit 24 of the domain's clock
+ * controller's CONTROLLER_OPTION cleared, bit 0 of the domain's CONFIGURATION in the PMU cleared -- the PMU is written
+ * through the firmware alone (cal-if's set_priv_reg), and read as it is -- and bit 0 of STATUS waited for. Measured on
+ * the battery (charge=0), the phone locked and dark: 506 mA before, 469 mA after (logs day15/pd-off1). Nothing turns
+ * them on again in this boot. pd_off=MASK: other domains (a bit for each of the list); pd_off=0: none.
+ * Left on: the GPU's, the display's (dpub, dpuf0, dpuf1), aoc (sound), eh, ispfe (the camera's sensors), hsi0 (USB),
+ * hsi1 (the Wi-Fi's PCIe).
+ */
+#define PMU_ALIVE               0x15460000ULL
+static const struct { const char *name; uint32_t at; uint64_t cmu; } unused_pd[] = {
+	{ "g2d", 0x1e80, 0x1a800000 }, { "gdc", 0x1f00, 0x1d400000 }, { "gse", 0x1f80, 0x1d800000 },
+	{ "mcsc", 0x2000, 0x1d000000 }, { "mfc", 0x2080, 0x1a400000 }, { "rgbp", 0x2100, 0x1c400000 },
+	{ "tnr", 0x2180, 0x1cc00000 }, { "yuvp", 0x2200, 0x1c800000 }, { "aur", 0x2300, 0x20a00000 },
+	{ "bw", 0x2380, 0x1a600000 }, { "tpu", 0x2500, 0x1a300000 },
+};
+static uint32_t pd_off_mask = 0x7ff;
+static thread_call_t pd_off_call;
+
+static void
+pd_off_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	vm_offset_t pmu = ml_io_map(PMU_ALIVE, 0x4000);
+	char line[256];
+	int n = 0;
+
+	if (pmu == 0) {
+		return;
+	}
+	line[0] = 0;
+	for (unsigned i = 0; i < sizeof(unused_pd) / sizeof(unused_pd[0]); i++) {
+		volatile uint32_t *configuration = (volatile uint32_t *)(pmu + unused_pd[i].at), *status = configuration + 1;
+		vm_offset_t cmu;
+		int waited = 0;
+
+		if ((pd_off_mask & (1u << i)) == 0 || (*status & 1) == 0) {
+			continue;
+		}
+		cmu = ml_io_map(unused_pd[i].cmu, 0x1000);
+		if (cmu == 0) {
+			continue;
+		}
+		*(volatile uint32_t *)(cmu + 0x800) &= ~(1u << 24);
+		(void)smc(TENSOR_SMC_PMU_SEC_REG, PMU_ALIVE + unused_pd[i].at, 1, *configuration & ~1u);
+		while ((*status & 1) != 0 && waited < 5000) {
+			delay(1);
+			waited++;
+		}
+		n += snprintf(line + n, sizeof(line) - n, " %s%s", unused_pd[i].name, (*status & 1) ? " (STILL ON)" : "");
+	}
+	printf("akita: power domains nothing here uses, turned off:%s\n", n ? line : " none");
+}
+
+static void
+pd_off_init(void)
+{
+	uint64_t deadline;
+
+	PE_parse_boot_argn("pd_off", &pd_off_mask, sizeof(pd_off_mask));
+	if (pd_off_mask == 0) {
+		return;
+	}
+	pd_off_call = thread_call_allocate(pd_off_run, NULL);
+	clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(pd_off_call, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, pd_off_init);
 
 static void
 test_time_up(__unused thread_call_param_t a, __unused thread_call_param_t b)
