@@ -93,6 +93,8 @@ wr(vm_offset_t a, uint32_t v)
 	*(volatile uint32_t *)a = v;
 }
 
+extern int akita_display_dark(void);            /* hakios.akita_display.c */
+
 static void
 sleep_ms(uint32_t ms)
 {
@@ -566,6 +568,7 @@ static void
 akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t poll_us = 4000, idle = 0, idle_looks;     /* 250 a second: about two looks in each 120 Hz refresh */
+	uint32_t dark_us = 30000;
 	uint32_t fast_us = 1000;                /* (11-11) while a finger is down, and 100 ms after: see below */
 	uint64_t fast_until = 0, fast_span;
 	bool found = false;
@@ -602,6 +605,7 @@ akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
+	PE_parse_boot_argn("touch_dark_us", &dark_us, sizeof(dark_us));
 	printf("akita touch: ready; the interrupt line is looked at every %u us\n", poll_us);
 	uint64_t next_say = 0, minute;
 
@@ -650,8 +654,12 @@ akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			next_say = mach_absolute_time() + minute;
 		}
-		/* (no leeway: a 1 ms sleep may otherwise be coalesced into a much later wake) */
-		delay_for_interval_with_leeway(fast ? fast_us : poll_us, 0, NSEC_PER_USEC);
+		/* (no leeway: a 1 ms sleep may otherwise be coalesced into a much later wake)
+		 * WHILE THE PANEL IS DARK (11-15) the line is looked at every dark_us (30 ms; touch_dark_us=N, 0: as when lit):
+		 * 250 wakes a second of a locked phone otherwise, half of what kept its cores from staying down. A tap is
+		 * still seen (a finger is down longer than that), and with a finger down the pace is the fast one at once. */
+		delay_for_interval_with_leeway(fast ? fast_us : dark_us != 0 && akita_display_dark() ? dark_us : poll_us, 0,
+		    NSEC_PER_USEC);
 	}
 }
 

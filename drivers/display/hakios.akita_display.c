@@ -213,6 +213,9 @@ static uint64_t display_scanned(void);
 static uint32_t measure_hz(void);
 static volatile uint32_t vblank_caught_hz;        /* frame dones the vblank thread caught in the last second */
 static volatile uint64_t vblank_at;
+static uint32_t dark_ms = 100, dark_beats;     /* (the beat while the panel is dark: see the vblank thread) */
+static bool panel_dark(void);
+static void panel_commands(void);
 static volatile uint32_t vblank_hz;
 static volatile uint64_t vblank_period;         /* the refresh's length (mach_absolute_time units): the vblank thread's sleep */
 static volatile bool vblank_paused;             /* measure_hz has the frame-done bit to itself */
@@ -242,6 +245,7 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	PE_parse_boot_argn("display_panel", &panel_on, sizeof(panel_on));
 	PE_parse_boot_argn("display_max_nits", &max_nits, sizeof(max_nits));
 	PE_parse_boot_argn("display_dimming", &dimming, sizeof(dimming));
+	PE_parse_boot_argn("display_dark_ms", &dark_ms, sizeof(dark_ms));
 	max_nits = max_nits < 100 ? 100 : max_nits > 1400 ? 1400 : max_nits;
 	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);     /* (the panel's commands: panel_commands) */
 	if (health_on) {
@@ -598,6 +602,23 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 		period_abs = vblank_period;
 		if (scan_phys != 0 || queued != NO_BUFFER) {
 			flip_pending(period_abs);
+			continue;
+		}
+
+		/*
+		 * THE BEAT WHILE THE PANEL IS DARK (11-15): nothing is shown, and this thread still woke for each of the
+		 * panel's 120 refreshes a second and looked for its frame done -- with the touch screen's looks most of what
+		 * kept the cores from staying down in a locked phone. Dark, with no switch waiting, it sleeps a tenth of a
+		 * second at a time; a queued switch and display_power() wake it, and the beat finds its phase again at the
+		 * first refresh after (need_sync). display_dark_ms=0: the beat as when lit.
+		 */
+		if (dark_ms != 0 && panel_dark()) {
+			assert_wait_timeout((event_t)&vblank_at, THREAD_UNINT, dark_ms, NSEC_PER_MSEC);
+			(void)thread_block(THREAD_CONTINUE_NULL);
+			need_sync = true;
+			dark_beats++;
+			panel_commands();
+			health_check();
 			continue;
 		}
 
@@ -982,7 +1003,14 @@ display_power(bool on)
 {
 	want_on = on ? 1 : 0;
 	printf("akita_display: the panel to be %s\n", on ? "lit" : "dark");
+	thread_wakeup((event_t)&vblank_at);             /* (the beat sleeps long while dark) */
 }
+
+static bool panel_dark(void) { return want_on == 0 && sent_on == 0; }
+
+/* for the touch screen's driver, which looks less often then (hakios.akita_touch.c) */
+int akita_display_dark(void);
+int akita_display_dark(void) { return panel_dark(); }
 
 static void
 panel_commands(void)
