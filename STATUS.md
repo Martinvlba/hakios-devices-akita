@@ -13,8 +13,8 @@ what was seen on the one phone this port is developed on.
 | Safety net | a start that does not reach the home screen in 4 minutes restarts into the bootloader (fastboot) |
 | Screen | 1080 x 2400 at 120 Hz, drawn by the GPU, applications' own Metal layers at the full 120 frames a second; brightness slider; screen off and on with the side button |
 | Touch and buttons | touch, power, volume |
-| GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it (a 600-draw WebGL aquarium demo at the page's full 60 frames a second) |
-| Wi-Fi | joins WPA2 networks, DHCP, HTTPS; each phone has its own address |
+| GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it (a 600-draw WebGL aquarium demo at the page's full 60 frames a second); Maps draws its map (land, water, roads, labels) |
+| Wi-Fi | joins WPA2 networks, DHCP, HTTPS; joined by the time the home screen is up; each phone has its own address |
 | Sound | both speakers |
 | Vibration | yes |
 | Flashlight | the LED works (Control Center's button not confirmed yet) |
@@ -42,7 +42,7 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | | |
 |---|---|
 | Metal: layered rendering | up to 8 layers, colour and depth; not yet with stencil, multisampling, several colour targets, or a pass that loads what was there |
-| Battery life | poor: the phone never sleeps (no suspend yet); about 0.5 A with the screen off |
+| Battery life | poor: the phone never sleeps (no suspend yet); about 0.47 A with the screen off. Idle cores are powered down and the unused power domains turned off; Wi-Fi's PCIe link (no low-power state yet) is 0.06 A of it, where the rest goes is not found yet |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
 | Microphone | reaches the kernel; iOS does not record from it yet |
 | Camera | both sensors answer; no picture yet |
@@ -55,7 +55,7 @@ layered rendering (one draw into several layers of an array texture, colour or d
 - Motion and light sensors: rotation, auto-brightness, proximity, compass
 - Sleep (suspend to RAM)
 - Fingerprint reader
-- Apple ID sign-in and the App Store; installing applications
+- Apple ID sign-in and the App Store; installing applications; Weather has no data (Apple's weather service wants a signed-in device)
 - Setup Assistant on first start, factory reset from Settings
 - Photos to Windows over USB
 
