@@ -540,6 +540,42 @@ android_thermal_step(void)
 	return changed;
 }
 
+/*
+ * A CPU-load-coupled floor for the memory's clock (dvfs_cpu_mif=1, default off). Android's devfreq raises MIF by the bus
+ * traffic the CPUs generate, which this port does not measure; as a stand-in, when a high-performance cluster (MID or
+ * BIG) runs near the top of its steps -- where a memory-bound thread drives it -- ask a MIF floor. This is only ever a
+ * floor: gpu_apply arbitrates it with the GPU-row and animation floors, raising at once and lowering after mif_down_ms,
+ * so a wrong guess costs a little power, never correctness. Off by default; MIF is otherwise governed exactly as before.
+ */
+static uint32_t cpu_mif;                /* dvfs_cpu_mif: 1 on */
+
+static uint32_t
+cpu_mif_floor(void)
+{
+	uint32_t floor = 0;
+
+	if (!cpu_mif) {
+		return 0;
+	}
+	for (unsigned i = 1; i < NCLUSTERS; i++) {      /* MID and BIG only; the LITTLE cluster never drives memory hard */
+		struct cluster *c = &clusters[i];
+		unsigned top = c->nsteps - 1;
+		uint32_t f = 0;
+
+		if (c->now >= top - top / 4) {
+			f = 1716000;                    /* top quarter of the cluster's steps */
+		} else if (c->now >= top - top / 2) {
+			f = 1352000;                    /* top half */
+		} else if (c->now >= top - (top * 2) / 3) {
+			f = 845000;
+		}
+		if (f > floor) {
+			floor = f;
+		}
+	}
+	return floor;
+}
+
 /* the GPU's clocks: the governor's row, no faster than Android's controllers allow (their state is a floor) */
 static void
 gpu_apply(void)
@@ -577,6 +613,16 @@ gpu_apply(void)
 			/* (from the touch on, not only once frames are counted (anim_row): a gesture's first frames came with MIF at
 			 * row 6's 845 -- Spotlight's opening, 16-29 frames over 18 ms of GPU time each, 9 with MIF at 3172; 11-10) */
 			mif = anim_mif;
+		}
+
+		{
+			/* the CPU-load floor (dvfs_cpu_mif=1): a memory-bound thread on the MID/BIG cores wants bandwidth the GPU row
+			 * does not show -- scrolling a heavy web page, say, where the GPU is light but the CPU churns memory */
+			uint32_t cf = cpu_mif_floor();
+
+			if (cf > mif) {
+				mif = cf;
+			}
 		}
 
 		nanoseconds_to_absolutetime((uint64_t)mif_down_ms * NSEC_PER_MSEC, &hold);
@@ -1064,6 +1110,9 @@ akita_dvfs_start(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		}
 	}
 	PE_parse_boot_argn("mif_down_ms", &mif_down_ms, sizeof(mif_down_ms));
+	if (PE_parse_boot_argn("dvfs_cpu_mif", &cpu_mif, sizeof(cpu_mif)) && cpu_mif) {
+		printf("akita dvfs: dvfs_cpu_mif=1: the memory clock takes a floor from the MID/BIG clusters' load too\n");
+	}
 	PE_parse_boot_argn("dvfs_share", &share_by_power, sizeof(share_by_power));
 	if (PE_parse_boot_argn("mif_toggle_ms", &mif_toggle_ms, sizeof(mif_toggle_ms)) && mif_toggle_ms != 0) {
 		mif_fixed = true;               /* (the governor's floors left out: the test switches MIF alone) */
