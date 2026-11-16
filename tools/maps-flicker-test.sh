@@ -12,6 +12,9 @@ JOB=${JOBFILE:-$HOME/akita/local-jobs/rc.jobs.mapszoom}
 [ -f "$JOB" ] || { echo "maps-flicker-test: no job file $JOB"; exit 1; }
 # the pinches begin ~85 s after the boot (the job's waits: 50 unlock, 8, 20 for the tiles) and are over 20 s later;
 # bootrun logs for SECS seconds from the first console line and then returns
+# the gestures' end: UPS_NEEDED lines of UP_PATTERN on the console (default: six pinches' second finger lifted;
+# a job of one-finger drags: UP_PATTERN="tl: p 3 0 " and its count of taps and swipes in all)
+UP_PATTERN=${UP_PATTERN:-"tl: p 3 1 "}; UPS_NEEDED=${UPS_NEEDED:-6}
 export JOBFILE="$JOB" QUIET=1 SECS=${SECS:-60} LOGDIR="$S"
 export BOOTARGS="rec=4 touch_lat=1 torch=0 haptic=0 ${BOOTARGS:-}"
 echo "maps-flicker-test: booting the test build (job $JOB)"
@@ -30,12 +33,12 @@ timeout 200 python3 devices/akita/tools/usbmux-log.py "$S/test-console-2.log" >/
 WATCH=$!
 for i in $(seq 1 40); do
 	sleep 5
-	UPS=$(cat "$S/test-console.log" "$S/test-console-2.log" 2>/dev/null | grep -a -c "tl: p 3 1 ")
-	[ "$UPS" -ge 6 ] && break
+	UPS=$(cat "$S/test-console.log" "$S/test-console-2.log" 2>/dev/null | grep -a -c "$UP_PATTERN")
+	[ "$UPS" -ge "$UPS_NEEDED" ] && break
 done
 sleep 4; kill $WATCH 2>/dev/null
 cat "$S/test-console.log" "$S/test-console-2.log" 2>/dev/null | grep -a "tl: " > "$S/tl.log"
-echo "maps-flicker-test: $UPS pinches seen in the log"
+echo "maps-flicker-test: $UPS gesture ends seen in the log"
 # the recording, now: the ring holds the last ~560 frames that changed the screen, the pinches among them
 # (no rm -rf: last run's frames and recording are removed by name)
 [ -d "$S/frames" ] && find "$S/frames" -maxdepth 1 -name '*.ppm' -delete

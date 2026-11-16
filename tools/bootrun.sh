@@ -17,7 +17,7 @@ cd ~/akita/hackios-kernel; D=~/akita/darwin-flash; S=${LOGDIR:-$HOME/akita/logs/
 case "${JOBFILE:-rc.jobs.maldraw}" in rc.jobs.maldraw) GPU=${GPU-0};; *) GPU=${GPU-1};; esac
 if [ "$GPU" = 1 ]; then
   export METAL_PLUGIN=${METAL_PLUGIN-ca} EXTRA_SHARE=${EXTRA_SHARE-$HOME/ca-share}
-  case "$BOOTARGS" in *ca_metallib=*) ;; *) BOOTARGS="ca_metallib=/redwood/share/ca-share/QuartzCore-default.metallib display_hz=120 fbwidth=1080 fbheight=2340 fbscale=3 fbsubtype=2340 fb_zc=1 $BOOTARGS";; esac
+  case "$BOOTARGS" in *ca_metallib=*) ;; *) BOOTARGS="ca_metallib=/redwood/share/ca-share/QuartzCore-default.metallib display_hz=120 fbwidth=1080 fbheight=2340 fbscale=3 fbsubtype=2340 fb_zc=1 anim_max=1 $BOOTARGS";; esac
 fi
 env -u RC -u JOBS BIG_IN_ROOT=1 RC_JOBS=${JOBFILE:-rc.jobs.maldraw} HAKIOS_METAL_OUT=ios-mali LOCKDOWND=1 BLUETOOTH=${BLUETOOTH-1} CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh > $S/build-boot.log 2>&1 || { echo build failed; exit 1; }
 # the safety arguments first (a long command line loses its end: the loader keeps 607 characters, ~110 of them its own),
