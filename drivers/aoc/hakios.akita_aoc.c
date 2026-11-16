@@ -49,6 +49,10 @@
 #include <sys/conf.h>
 #include <sys/uio.h>
 #include <miscfs/devfs/devfs.h>
+#include <kern/kalloc.h>
+#include <sys/kauth.h>
+#include <sys/vnode.h>
+#include <sys/vnode_internal.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start, vm_offset_t end, vm_prot_t prot, unsigned int flags);
@@ -1521,18 +1525,494 @@ aoc_darwin_mic_init(void)
 	printf("akita aoc: mic for Darwin: /dev/hakios-mic is the built-in microphone (the AoC listens only while it is open)\n");
 }
 
-/* the AoC's firmware loaded by the GSA and started through Trusty (aoc=3) */
+/*
+ * THE FIRMWARE ON THE DATA VOLUME (11-15): aoc.bin is 28 MB, half the RAM disk, and the flashed boot image was 58 of
+ * its partition's 64 MB. The AoC starts 25 s in, long after /private/var is mounted, so the image may leave the file
+ * out: it is then read from the data volume (boot-arg aoc_fw=PATH, default below), where init puts the RAM disk's copy
+ * whenever an image carries one (userland/src/init.c). The RAM disk's own copy still wins when there is one.
+ */
+#define AOC_FW_DISK_PATH        "/private/var/hakios/fw/aoc.bin"
+
+static uint8_t *
+aoc_disk_file(uint64_t *size)
+{
+	char path[128] = AOC_FW_DISK_PATH;
+	vfs_context_t context = vfs_context_kernel();
+	vnode_t vnode = NULLVP;
+	struct vnode_attr attributes;
+	uint8_t *data;
+	int left = 0, error;
+
+	PE_parse_boot_argn("aoc_fw", path, sizeof(path));
+	if (rootvnode == NULLVP || vnode_lookup(path, 0, &vnode, context) != 0) {
+		printf("akita aoc: no %s on the disk either\n", path);
+		return NULL;
+	}
+	VATTR_INIT(&attributes);
+	VATTR_WANTED(&attributes, va_data_size);
+	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size < AOC_AUTH_HEADER_SIZE + 0x1000 ||
+	    attributes.va_data_size > AOC_DRAM_SIZE) {
+		vnode_put(vnode);
+		printf("akita aoc: %s: not a size an AoC image has\n", path);
+		return NULL;
+	}
+	data = kalloc_data(attributes.va_data_size, Z_WAITOK);
+	if (data == NULL) {
+		vnode_put(vnode);
+		return NULL;
+	}
+	error = vn_rdwr(UIO_READ, vnode, (caddr_t)data, (int)attributes.va_data_size, 0, UIO_SYSSPACE, 0,
+	    vfs_context_ucred(context), &left, vfs_context_proc(context));
+	vnode_put(vnode);
+	if (error != 0 || left != 0) {
+		printf("akita aoc: %s: read error %d, %d bytes left\n", path, error, left);
+		kfree_data(data, attributes.va_data_size);
+		return NULL;
+	}
+	printf("akita aoc: the firmware from the disk: %s (%llu bytes)\n", path, (uint64_t)attributes.va_data_size);
+	*size = attributes.va_data_size;
+	return data;
+}
+
+
+/*
+ * SENSORS THROUGH THE AoC (boot-arg usf=1, 11-16 night, A PROBE: it says what it finds and drives nothing). Google's
+ * sensor stack ("USF", com.google.usf) as decoded from the Android HAL's start-up traffic (~/akita/ref/usf-android,
+ * decoded/README.md): the service "com.google.usf", every message a u32 channel header and a flatbuffer; channel 2
+ * opened by a control message on channel 0 ({0, OPEN 0, 2}); requests are the HAL's own bytes with the transaction id,
+ * the destination object and the payload's fields patched: type 3 (an object by UUID, to object 1), 5 (the
+ * registry's sensors), 4 (a sensor's info: name, USF type -- accel 1, gyro 2, prox 3, ALS 9), 8 (subscribe: cookie,
+ * period in ns). Answers: kind 2 with the same transaction id; events kind 9, a raw struct (count, cookie,
+ * subscription, u16 type, u8, u8 data length, u64 ns, data).
+ */
+static void sensor_power(const char *when, bool cycle);
+static void aoc_dump_service(const char *name);
+static const uint8_t usf_t_lookup[] = { 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x14, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x10, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x08, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x6b, 0x31, 0xcb, 0xf0, 0x74, 0x4a, 0x14, 0xa1, 0xd4, 0xe8, 0xae, 0x8a, 0x3e, 0x09, 0xfc, 0x4d };
+static const uint8_t usf_t_info[] = { 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x10, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x39, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00 };
+static const uint8_t usf_t_timesync[] = { 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x14, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x10, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x14, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x00, 0x00, 0x9a, 0xbc, 0xa8, 0x82, 0xf0, 0x00, 0x00, 0x00, 0x9f, 0xf4, 0x70, 0x3c, 0xec, 0x00, 0x00, 0x00 };   /* type 11 to object 4: two u64 ns at 84, 92 */
+static const uint8_t usf_t_32[] = { 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x14, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x10, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x08, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };         /* type 32 {1} to object 8 */
+static const uint8_t usf_t_subscribe[] = { 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x14, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x10, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x35, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x20, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x07, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0e, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa0, 0x25, 0x26, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 };
+#define USF_AT_DEST     48
+#define USF_AT_TYPE     52
+#define USF_AT_TX       56
+#define USF_AT_UUID     92      /* (the lookup's last 16 bytes) */
+#define USF_AT_COOKIE   108     /* the subscribe's */
+#define USF_AT_PERIOD   116
+#define USF_AT_F0       128
+#define USF_CHANNEL     2
+
+static vm_offset_t usf_svc;
+static uint32_t usf_tx = 1, usf_events, usf_said;
+
+static inline uint32_t usf_u32(const uint8_t *b, uint32_t o) { return (uint32_t)b[o] | (uint32_t)b[o + 1] << 8 | (uint32_t)b[o + 2] << 16 | (uint32_t)b[o + 3] << 24; }
+static inline uint32_t usf_u16(const uint8_t *b, uint32_t o) { return (uint32_t)b[o] | (uint32_t)b[o + 1] << 8; }
+
+/* field IDX of the table at T in B (LEN bytes): its absolute offset, or 0 */
+static uint32_t
+usf_field(const uint8_t *b, uint32_t len, uint32_t t, unsigned idx)
+{
+	if (t + 4 > len) {
+		return 0;
+	}
+	uint32_t vt = t - (uint32_t)(int32_t)usf_u32(b, t);
+	if (vt + 4 > len || vt > t) {
+		return 0;
+	}
+	uint32_t vlen = usf_u16(b, vt);
+	if (4 + 2 * idx + 2 > vlen || vt + 4 + 2 * idx + 2 > len) {
+		return 0;
+	}
+	uint32_t fo = usf_u16(b, vt + 4 + 2 * idx);
+	return fo != 0 && t + fo + 4 <= len ? t + fo : 0;
+}
+
+/* the vector (or string) a field at AT points to: its data's offset and count; false if out of bounds */
+static bool
+usf_vector(const uint8_t *b, uint32_t len, uint32_t at, uint32_t *data, uint32_t *n)
+{
+	uint32_t v = at + usf_u32(b, at);
+	if (at == 0 || v + 4 > len) {
+		return false;
+	}
+	*n = usf_u32(b, v);
+	*data = v + 4;
+	return *data + *n <= len || *data + *n * 4 <= len;
+}
+
+static void
+usf_event(const uint8_t *e, uint32_t n)
+{
+	usf_events++;
+	if (n < 24 || usf_said >= 12) {
+		return;
+	}
+	uint32_t cookie = usf_u32(e, 4), sub = usf_u32(e, 8), type = usf_u16(e, 12), dlen = e[15];
+	uint64_t ts = (uint64_t)usf_u32(e, 16) | (uint64_t)usf_u32(e, 20) << 32;
+	char vals[96] = "";
+	unsigned at = 0;
+
+	for (uint32_t k = 0; k + 4 <= dlen && 24 + k + 4 <= n && k < 16; k += 4) {
+		uint32_t w = usf_u32(e, 24 + k);
+		float f;
+		memcpy(&f, &w, 4);
+		int milli = (int)(f * 1000.0f);
+		at += (unsigned)snprintf(vals + at, sizeof(vals) - at, " %s%d.%03d", milli < 0 ? "-" : "", (milli < 0 ? -milli : milli) / 1000,
+		    (milli < 0 ? -milli : milli) % 1000);
+	}
+	printf("akita aoc: usf: event: cookie 0x%x subscription %u type %u, %u bytes, at %llu ns:%s\n", cookie, sub, type, dlen, ts, vals);
+	usf_said++;
+}
+
+/* REQ (a template, LEN bytes, patched by the caller) sent; the answer with its transaction id into ANS (its inner
+ * message: offset and length in BUF), events met meanwhile counted. true if answered in MS ms */
+static bool
+usf_request(uint8_t *req, uint32_t len, uint8_t *buf, uint32_t cap, uint32_t *inner, uint32_t *ilen, int ms)
+{
+	uint8_t out[160];
+	uint32_t tx = usf_tx++;
+
+	req[USF_AT_TX] = (uint8_t)tx; req[USF_AT_TX + 1] = (uint8_t)(tx >> 8); req[USF_AT_TX + 2] = 0; req[USF_AT_TX + 3] = 0;
+	if (len + 4 > sizeof(out)) {
+		return false;
+	}
+	out[0] = USF_CHANNEL; out[1] = out[2] = out[3] = 0;
+	memcpy(out + 4, req, len);
+	if (!aoc_write(usf_svc, out, len + 4)) {
+		printf("akita aoc: usf: the queue to the AoC is full\n");
+		return false;
+	}
+	for (int waited = 0; waited < ms;) {
+		int n = aoc_read(usf_svc, buf, cap, 10);
+		if (n < 0) {
+			waited += 10;
+			continue;
+		}
+		if (n < 16 || (uint32_t)n > cap) {
+			continue;
+		}
+		const uint8_t *m = buf + 4;     /* (after the channel's header) */
+		uint32_t ml = (uint32_t)n - 4, root = usf_u32(m, 0), kind_at = usf_field(m, ml, root, 0), vec_at = usf_field(m, ml, root, 1);
+		uint32_t kind = kind_at ? usf_u32(m, kind_at) : 0, d = 0, dn = 0;
+
+		if (!usf_vector(m, ml, vec_at, &d, &dn) || d + dn > ml) {
+			continue;
+		}
+		if (kind == 9) {
+			usf_event(m + d, dn);
+			continue;
+		}
+		if (kind != 2) {
+			continue;
+		}
+		uint32_t iroot = usf_u32(m + d, 0), txa = usf_field(m + d, dn, iroot, 1);
+		if (txa != 0 && usf_u32(m + d, txa) == tx) {
+			*inner = 4 + d;
+			*ilen = dn;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* the answer's payload (inner field 3, itself a flatbuffer): its root table's offset in P and P's length; false if none */
+static bool
+usf_payload(const uint8_t *in, uint32_t n, const uint8_t **p, uint32_t *plen, uint32_t *status)
+{
+	uint32_t root = usf_u32(in, 0), st = usf_field(in, n, root, 2), pa = usf_field(in, n, root, 3), d, dn;
+
+	*status = st ? usf_u32(in, st) : 0;
+	if (!usf_vector(in, n, pa, &d, &dn) || d + dn > n || dn < 8) {
+		return false;
+	}
+	*p = in + d;
+	*plen = dn;
+	return true;
+}
+
+static void
+usf_probe(void)
+{
+	static uint8_t buf[1100];
+	uint8_t req[sizeof(usf_t_subscribe)];
+	uint32_t in, il, st, plen, reg = 0;
+	const uint8_t *p;
+	static const uint8_t reg_uuid[16] = { 0x6b, 0x31, 0xcb, 0xf0, 0x74, 0x4a, 0x14, 0xa1, 0xd4, 0xe8, 0xae, 0x8a, 0x3e, 0x09, 0xfc, 0x4d };
+	uint32_t ids[64], nids = 0, accel = 0, light = 0, prox = 0;
+
+	sensor_power("as the probe begins", false);
+	{
+		/* every service the AoC offers, with how much each one's two queues hold (what the AP may be expected to serve) */
+		uint32_t count = rd(ipc_base, 24), each = rd(ipc_base, 28), at = rd(ipc_base, 32);
+		for (uint32_t k = 0; k < count && each >= 92 && k < 96; k++) {
+			vm_offset_t h = ipc_base + at + k * each;
+			char nm[33];
+			for (int c = 0; c < 32; c++) {
+				nm[c] = (char)*(volatile uint8_t *)(h + c);
+			}
+			nm[32] = 0;
+			vm_offset_t up = region(h, AOC_UP), down = region(h, AOC_DOWN);
+			printf("akita aoc: service %u: \"%s\" up tx %u rx %u, down tx %u rx %u\n", k, nm, rd(up, 12), rd(up, 16), rd(down, 12), rd(down, 16));
+		}
+	}
+	if ((usf_svc = aoc_service("com.google.usf")) == 0) {
+		printf("akita aoc: usf: no service com.google.usf\n");
+		return;
+	}
+	{
+		const uint32_t open[3] = { 0, 0, USF_CHANNEL };         /* channel 0: OPEN_CHANNEL 2 */
+		printf("akita aoc: usf: the service found; channel %u opened (%s)\n", USF_CHANNEL,
+		    aoc_write(usf_svc, open, sizeof(open)) ? "sent" : "NOT sent");
+		for (int k = 0; k < 5; k++) {
+			int n = aoc_read(usf_svc, buf, sizeof(buf), 50);
+			if (n < 0) {
+				break;
+			}
+			aoc_say_bytes("usf after the open", buf, n);
+		}
+	}
+	memcpy(req, usf_t_lookup, sizeof(usf_t_lookup));
+	memcpy(req + USF_AT_UUID, reg_uuid, 16);
+	if (!usf_request(req, sizeof(usf_t_lookup), buf, sizeof(buf), &in, &il, 1000)) {
+		printf("akita aoc: usf: the registry's lookup NOT answered\n");
+		return;
+	}
+	if (usf_payload(buf + in, il, &p, &plen, &st)) {
+		uint32_t f = usf_field(p, plen, usf_u32(p, 0), 0);
+		reg = f ? usf_u32(p, f) : 0;
+	}
+	printf("akita aoc: usf: the sensor registry is object %u (status %u)\n", reg, st);
+	if (reg == 0) {
+		return;
+	}
+	/* the HAL's steps before its list (Android: objects 4 and 8 by UUID, a time sync to 4, type 32 {1} to 8) */
+	{
+		static const uint8_t uuid4[16] = { 0x8b, 0xb8, 0x1b, 0x18, 0x25, 0x4c, 0x29, 0x9f, 0x0a, 0x45, 0xde, 0xb4, 0xd8, 0xcb, 0xc5, 0x41 };
+		static const uint8_t uuid8[16] = { 0xae, 0x75, 0x6f, 0x06, 0x4c, 0x4f, 0x5a, 0x3b, 0xbc, 0xc3, 0x9f, 0x8d, 0xa1, 0x06, 0xef, 0xc3 };
+		uint32_t o4 = 0, o8 = 0;
+
+		memcpy(req, usf_t_lookup, sizeof(usf_t_lookup));
+		memcpy(req + USF_AT_UUID, uuid4, 16);
+		if (usf_request(req, sizeof(usf_t_lookup), buf, sizeof(buf), &in, &il, 1000) && usf_payload(buf + in, il, &p, &plen, &st)) {
+			uint32_t f = usf_field(p, plen, usf_u32(p, 0), 0);
+			o4 = f ? usf_u32(p, f) : 0;
+		}
+		memcpy(req, usf_t_lookup, sizeof(usf_t_lookup));
+		memcpy(req + USF_AT_UUID, uuid8, 16);
+		if (usf_request(req, sizeof(usf_t_lookup), buf, sizeof(buf), &in, &il, 1000) && usf_payload(buf + in, il, &p, &plen, &st)) {
+			uint32_t f = usf_field(p, plen, usf_u32(p, 0), 0);
+			o8 = f ? usf_u32(p, f) : 0;
+		}
+		printf("akita aoc: usf: objects %u and %u (Android's 4 and 8)\n", o4, o8);
+		if (o4 != 0) {
+			uint64_t ns;
+			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+			memcpy(req, usf_t_timesync, sizeof(usf_t_timesync));
+			memcpy(req + USF_AT_DEST, &o4, 4);
+			memcpy(req + 84, &ns, 8);
+			memcpy(req + 92, &ns, 8);
+			printf("akita aoc: usf: the time sync %s\n", usf_request(req, sizeof(usf_t_timesync), buf, sizeof(buf), &in, &il, 1000) ? "answered" : "NOT answered");
+		}
+		if (o8 != 0) {
+			memcpy(req, usf_t_32, sizeof(usf_t_32));
+			memcpy(req + USF_AT_DEST, &o8, 4);
+			printf("akita aoc: usf: type 32 {1} %s\n", usf_request(req, sizeof(usf_t_32), buf, sizeof(buf), &in, &il, 1000) ? "answered" : "NOT answered");
+		}
+	}
+	/* type 5: the registry's sensors (the info template's shape: no payload); asked again for 30 s while empty */
+	for (int again = 0; again < 60 && nids == 0; again++) {
+		if (again != 0) {
+			delay(2000000);
+		}
+	memcpy(req, usf_t_info, sizeof(usf_t_info));
+	req[USF_AT_TYPE] = 5;
+	memcpy(req + USF_AT_DEST, &reg, 4);
+	if (!usf_request(req, sizeof(usf_t_info), buf, sizeof(buf), &in, &il, 1000) || !usf_payload(buf + in, il, &p, &plen, &st)) {
+		printf("akita aoc: usf: the sensor list NOT answered\n");
+		continue;
+	}
+	{
+		uint32_t f = usf_field(p, plen, usf_u32(p, 0), 0), d, n;
+		if (usf_vector(p, plen, f, &d, &n)) {
+			for (uint32_t k = 0; k < n && k < 64 && d + 4 * k + 4 <= plen; k++) {
+				ids[nids++] = usf_u32(p, d + 4 * k);
+			}
+		}
+		if (nids == 0 && again < 2) {
+			aoc_say_bytes("usf: the list's answer", buf + in, (int)il);
+		}
+	}
+	}
+	printf("akita aoc: usf: %u sensors\n", nids);
+	if (nids == 0) {
+		/* what the sensor core says of itself: its trace and the debug queue */
+		aoc_dump_service("debug");
+		aoc_dump_service("trace_a32");
+		aoc_dump_service("com.google.umfw_stat");
+	}
+	for (uint32_t k = 0; k < nids; k++) {
+		memcpy(req, usf_t_info, sizeof(usf_t_info));
+		memcpy(req + USF_AT_DEST, &ids[k], 4);
+		if (!usf_request(req, sizeof(usf_t_info), buf, sizeof(buf), &in, &il, 500) || !usf_payload(buf + in, il, &p, &plen, &st)) {
+			printf("akita aoc: usf: sensor %u: no info\n", ids[k]);
+			continue;
+		}
+		uint32_t t = usf_u32(p, 0), nf = usf_field(p, plen, t, 0), tf = usf_field(p, plen, t, 1), pf = usf_field(p, plen, t, 3);
+		uint32_t type = tf ? usf_u32(p, tf) : 0, d = 0, n = 0;
+		char name[48] = "?";
+		if (usf_vector(p, plen, nf, &d, &n) && n < sizeof(name) && d + n <= plen) {
+			memcpy(name, p + d, n);
+			name[n] = 0;
+		}
+		uint64_t period = pf ? ((uint64_t)usf_u32(p, pf) | (uint64_t)usf_u32(p, pf + 4) << 32) : 0;
+		printf("akita aoc: usf: sensor %u: \"%s\", type %u, fastest %llu us\n", ids[k], name, type, period / 1000);
+		if (type == 1 && accel == 0) {
+			accel = ids[k];
+		} else if (type == 9 && light == 0) {
+			light = ids[k];
+		} else if (type == 3 && prox == 0) {
+			prox = ids[k];
+		}
+	}
+	/* subscribe: the accelerometer at 50 a second, then light and proximity (f0 2 as the brightness sensor's; 3 if
+	   refused) */
+	const struct { uint32_t id; uint64_t period_ns; const char *what; } subs[3] = {
+		{ accel, 20000000ull, "the accelerometer" }, { light, 200000000ull, "the ambient light" }, { prox, 100000000ull, "proximity" } };
+	for (int k = 0; k < 3; k++) {
+		if (subs[k].id == 0) {
+			printf("akita aoc: usf: %s: not in the list\n", subs[k].what);
+			continue;
+		}
+		for (uint32_t f0 = 2; f0 <= 3; f0++) {
+			uint32_t cookie = 0x00020000u | subs[k].id, sub = 0;
+			memcpy(req, usf_t_subscribe, sizeof(usf_t_subscribe));
+			memcpy(req + USF_AT_DEST, &subs[k].id, 4);
+			memcpy(req + USF_AT_COOKIE, &cookie, 4);
+			memcpy(req + USF_AT_PERIOD, &subs[k].period_ns, 8);
+			memcpy(req + USF_AT_F0, &f0, 4);
+			bool answered = usf_request(req, sizeof(usf_t_subscribe), buf, sizeof(buf), &in, &il, 1000);
+			st = 0;
+			if (answered && usf_payload(buf + in, il, &p, &plen, &st)) {
+				uint32_t f = usf_field(p, plen, usf_u32(p, 0), 0);
+				sub = f ? usf_u32(p, f) : 0;
+			} else if (answered) {
+				uint32_t root = usf_u32(buf + in, 0), sa = usf_field(buf + in, il, root, 2);
+				st = sa ? usf_u32(buf + in, sa) : 0;
+			}
+			printf("akita aoc: usf: %s (sensor %u) subscribed with f0 %u: %s, subscription %u, status %u\n", subs[k].what, subs[k].id, f0,
+			    answered ? "answered" : "NOT answered", sub, st);
+			if (sub != 0) {
+				break;
+			}
+		}
+	}
+	/* the events, for 20 s: the first dozen said, all counted */
+	uint32_t before = usf_events;
+	for (int t = 0; t < 2000; t++) {
+		int n = aoc_read(usf_svc, buf, sizeof(buf), 10);
+		if (n < 16 || n > (int)sizeof(buf)) {
+			continue;
+		}
+		const uint8_t *m = buf + 4;
+		uint32_t ml = (uint32_t)n - 4, root = usf_u32(m, 0), ka = usf_field(m, ml, root, 0), va = usf_field(m, ml, root, 1), d, dn;
+		if (ka && usf_u32(m, ka) == 9 && usf_vector(m, ml, va, &d, &dn) && d + dn <= ml) {
+			usf_event(m + d, dn);
+		}
+	}
+	printf("akita aoc: usf: %u events in 20 s (%u before)\n", usf_events - before, before);
+}
+
+static void
+aoc_usf_thread(__unused void *arg, __unused wait_result_t wr_)
+{
+	usf_probe();
+}
+
+
+/*
+ * THE SENSORS' SUPPLIES (11-16): the device tree's aoc node names them -- sensor_1v8-supply = the S2MPG15's LDO7S
+ * ("L7S_SENSORS", 1.8 V), sensor_3v3-supply = LDO5S ("L5S_PROX") -- and Google's aoc driver turns them on at its probe
+ * and power-cycles them (off, 150 ms, on) before every start of the AoC (reset_sensor_power). Their control registers
+ * (s2mpg15-register.h: L5S_CTRL 0x33, L7S_CTRL 0x35, enable bits 7:6) through ACPM's PMIC protocol, as the camera
+ * driver reads its L12S (bus 1, type 1 the PM block). usf=1 only reads them; usf=2 also power-cycles them before the
+ * firmware is loaded.
+ */
+extern int akita_acpm_xfer(unsigned channel, uint32_t cmd[4]);
+#define SENSOR_L5S_CTRL 0x33
+#define SENSOR_L7S_CTRL 0x35
+
+static bool
+sensor_pmic(bool write, unsigned reg, uint8_t *value)
+{
+	uint32_t cmd[4] = { 1u << 12 | 1u << 8 | (reg & 0xff), (write ? 1u : 0u) | (uint32_t)*value << 8 | 0xffu << 16, 0, 0 };
+
+	if (akita_acpm_xfer(2, cmd) != 0 || (cmd[1] >> 24) != 0) {
+		return false;
+	}
+	if (!write) {
+		*value = (uint8_t)(cmd[1] >> 8);
+	}
+	return true;
+}
+
+static void
+sensor_power(const char *when, bool cycle)
+{
+	uint8_t l5 = 0, l7 = 0;
+	bool ok = sensor_pmic(false, SENSOR_L5S_CTRL, &l5) && sensor_pmic(false, SENSOR_L7S_CTRL, &l7);
+
+	printf("akita aoc: sensors' supplies %s: %s L5S_CTRL %#x (enable %u), L7S_CTRL %#x (enable %u)\n", when,
+	    ok ? "read:" : "NOT READ:", l5, l5 >> 6, l7, l7 >> 6);
+	if (!ok || !cycle) {
+		return;
+	}
+	uint8_t off5 = l5 & 0x3f, off7 = l7 & 0x3f, on5 = (l5 >> 6) ? l5 : (uint8_t)(l5 | 0xc0), on7 = (l7 >> 6) ? l7 : (uint8_t)(l7 | 0xc0);
+
+	ok = sensor_pmic(true, SENSOR_L7S_CTRL, &off7) && sensor_pmic(true, SENSOR_L5S_CTRL, &off5);
+	delay(150000);
+	ok = sensor_pmic(true, SENSOR_L5S_CTRL, &on5) && sensor_pmic(true, SENSOR_L7S_CTRL, &on7) && ok;
+	delay(10000);
+	l5 = l7 = 0;
+	sensor_pmic(false, SENSOR_L5S_CTRL, &l5);
+	sensor_pmic(false, SENSOR_L7S_CTRL, &l7);
+	printf("akita aoc: sensors' supplies power-cycled (%s): now L5S_CTRL %#x, L7S_CTRL %#x\n", ok ? "written" : "SOME WRITES FAILED",
+	    l5, l7);
+}
+
+static void aoc_boot_image(const uint8_t *f, uint64_t size);
+
+/* the AoC's firmware loaded by the GSA and started through Trusty (aoc=3): the RAM disk's, else the data volume's */
 static void
 aoc_boot(void)
 {
 	uint64_t size = 0;
 	const uint8_t *f = hakios_image_file("fw", "aoc.bin", &size, NULL);
-	uint32_t state = 0xff;
+	uint8_t *disk = NULL;
 
 	if (f == NULL || size < AOC_AUTH_HEADER_SIZE + 0x1000) {
-		printf("akita aoc: no fw/aoc.bin in the image (the build's ../fw-aoc)\n");
-		return;
+		printf("akita aoc: no fw/aoc.bin in the image; looking on the disk\n");
+		if ((disk = aoc_disk_file(&size)) == NULL) {
+			return;
+		}
+		f = disk;
 	}
+	{
+		uint32_t usf = 0;
+
+		if (PE_parse_boot_argn("usf", &usf, sizeof(usf)) && usf != 0) {
+			sensor_power("before the AoC's start", usf >= 2);
+		}
+	}
+	aoc_boot_image(f, size);
+	if (disk != NULL) {
+		kfree_data(disk, size);         /* (the GSA works from the carveout and the header page: the file is done with) */
+	}
+}
+
+static void
+aoc_boot_image(const uint8_t *f, uint64_t size)
+{
+	uint32_t state = 0xff;
+
 	uint32_t auth_magic = *(const uint32_t *)(f + 1024), generation = *(const uint32_t *)(f + 1028);
 	const uint8_t *cfg = f + 1024 + (generation == 2 ? 384 : 352);         /* header_v2: a 64-byte hash */
 	uint32_t fw_start = *(const uint32_t *)(cfg + 4), fw_size = *(const uint32_t *)(cfg + 8);
@@ -1787,6 +2267,17 @@ aoc_boot(void)
 				 * 11 characters of a command line that has few to spare) */
 				if (PE_parse_boot_argn("speaker", &speaker, sizeof(speaker)) && speaker != 0) {
 					aocsound = 1;
+				}
+			}
+			{
+				uint32_t usf = 0;
+
+				if (PE_parse_boot_argn("usf", &usf, sizeof(usf)) && usf != 0) {
+					thread_t ut;
+
+					if (kernel_thread_start_priority(aoc_usf_thread, NULL, 80, &ut) == KERN_SUCCESS) {
+						thread_deallocate(ut);
+					}
 				}
 			}
 			if (aocsound != 0) {
