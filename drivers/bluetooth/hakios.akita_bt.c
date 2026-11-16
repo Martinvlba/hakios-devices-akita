@@ -334,6 +334,7 @@ struct hakios_bt_platform {                     /* (hakios.bthost.c's, field for
 	bool    wakes;
 };
 extern void hakios_bthost_start(const struct hakios_bt_platform *platform);
+extern void hakios_bthost_publish(const struct hakios_bt_platform *platform);
 extern void hakios_bthost_wake(void);
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 
@@ -601,6 +602,24 @@ akita_bt_thread(__unused void *arg, __unused wait_result_t wr_)
 	}
 }
 
+/* the registry's "bluetooth" service and its address at once, long before the controller is switched on (30 s): bluetoothd,
+   started for SpringBoard within seconds of it, needs them or exits (hakios_bthost_publish) */
+static void
+akita_bt_publish_thread(__unused void *arg, __unused wait_result_t wr_)
+{
+	hakios_bthost_publish(&akita_bt_platform);
+}
+
+static void
+akita_bt_publish(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(akita_bt_publish_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 static void
 akita_bt_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
@@ -635,5 +654,15 @@ akita_bt_init(void)
 	start = thread_call_allocate(akita_bt_start, NULL);
 	clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(start, deadline);
+	uint32_t early = 1;
+
+	PE_parse_boot_argn("bt_early", &early, sizeof(early));      /* (bt_early=0: the node only when the bridge starts, as before 11-16) */
+	if (mode >= 2 && early != 0) {
+		static thread_call_t publish;
+
+		publish = thread_call_allocate(akita_bt_publish, NULL);
+		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+		thread_call_enter_delayed(publish, deadline);
+	}
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, akita_bt_init);
