@@ -143,6 +143,29 @@ static const uint32_t l2_hash_values[3] = { 0x36db6d, 0x5b6db6, 0x0 };
 #define PTE_SH_OS               (2ULL << 8)
 #define PTE_ADDR                0x000000fffffff000ULL
 
+/*
+ * System Level Cache (SLC / LLC) for the GPU, off unless gpu_slc=1. zuma's last-level cache can hold a partition of the
+ * GPU's working set; a page whose descriptor carries that partition's PBHA (Page-Based Hardware Attributes) in bits
+ * [62:59] has its transactions caught by the SLC and served there -- less DRAM traffic, lower latency, less power. This
+ * mirrors Google's mali_pixel (pixel_slc.c + the memory_group_manager's MGM_SLC_GROUP_ID): only cached application
+ * memory is tagged, never the firmware, page tables or uncached kernel regions (tiler heaps). The partition itself is
+ * enabled through ACPM's FVP_PT protocol (slc_acpm.c), the same channel-and-reply IPC the DVFS and PMIC use here. The
+ * partition's parameters are akita's device tree (slc-acpm/gpu_write_alloc: VPTID 0x28, every size allowed, PBHA 5).
+ * The whole path is gated and the PBHA is only set once ACPM has confirmed the partition enabled, so a build without
+ * gpu_slc=1 maps pages exactly as before.
+ */
+#define PTE_PBHA_POS            59              /* Odin/Turse (zuma) PBHA field in the page descriptor: bits [62:59] */
+#define PTE_PBHA_MASK           0xfULL
+#define SLC_ACPM_CHANNEL        10              /* slc-acpm acpm-ipc-channel in the device tree */
+#define SLC_PT_ENABLE           0xd001          /* slc_acpm.c: allocate/enable a partition */
+#define SLC_PT_MUTATE           0xd004          /* change a partition's size (grow from the zero-size alloc) */
+#define SLC_PT_VERSION          0xd005          /* FVP_PT firmware version; major must match SLC_PT_VERSION_KNOWN */
+#define SLC_PT_VERSION_KNOWN    0x1
+#define SLC_GPU_VPTID           0x28            /* gpu_write_alloc id_size_priority[0] */
+#define SLC_GPU_SIZE_BITS       0xffffffffu     /* gpu_write_alloc id_size_priority[1]: all sizes allowed */
+#define SLC_GPU_PRIORITY        0x0             /* gpu_write_alloc id_size_priority[2] */
+#define SLC_GPU_PBHA            0x5             /* gpu_write_alloc id_size_priority[3], the PBHA to carry in the PTE */
+
 /* the firmware file (Google's loader: magic, header version 0.3, entries of a type, a size, and words) */
 #define FW_MAGIC                0xc3f13a6eu
 #define ENTRY_INTERFACE         0
@@ -1442,6 +1465,70 @@ static struct {
 static uint32_t mcu_next = MCU_ZONE_BASE;
 static bool kept;
 
+/* the GPU's SLC partition's PBHA, already shifted into the page descriptor's [62:59]; 0 unless gpu_slc=1 enabled it */
+static uint64_t slc_pbha;
+
+extern int akita_acpm_xfer(unsigned channel, uint32_t cmd[4]);
+
+/*
+ * Enable the GPU's SLC partition over ACPM (gpu_slc=1) and, on success, publish its PBHA so cached application pages are
+ * tagged for the last-level cache. Any failure leaves slc_pbha 0: the GPU runs exactly as without the boot-arg. The
+ * sequence follows slc_acpm.c: check the firmware version, allocate the partition at zero size, then grow it to its full
+ * allowed size. The partition is left enabled (no lazy disable) for the life of the GPU.
+ */
+static void
+mali_slc_enable(void)
+{
+	uint32_t slc = 0;
+	uint32_t cmd[4];
+	int ret, ptid;
+
+	if (!PE_parse_boot_argn("gpu_slc", &slc, sizeof(slc)) || slc == 0) {
+		return;
+	}
+
+	/* FVP_PT firmware version: major must match, or the protocol below would mean something else */
+	cmd[0] = 0;
+	cmd[1] = 0;
+	cmd[2] = SLC_PT_VERSION;
+	cmd[3] = 0;
+	if (akita_acpm_xfer(SLC_ACPM_CHANNEL, cmd) != 0) {
+		printf("mali: slc: ACPM did not answer on channel %u; SLC left off\n", SLC_ACPM_CHANNEL);
+		return;
+	}
+	if ((cmd[1] >> 16) != SLC_PT_VERSION_KNOWN) {
+		printf("mali: slc: ACPM FVP_PT version %u.%u is not the expected major %u; SLC left off\n", cmd[1] >> 16,
+		    cmd[1] & 0xffff, SLC_PT_VERSION_KNOWN);
+		return;
+	}
+
+	/* allocate/enable the partition at zero size (arg1 = 1): arg = priority | vptid << 8 | (pbha & 0xff) << 16 */
+	cmd[0] = 0;
+	cmd[1] = SLC_GPU_PRIORITY | (SLC_GPU_VPTID << 8) | ((SLC_GPU_PBHA & 0xff) << 16);
+	cmd[2] = SLC_PT_ENABLE;
+	cmd[3] = 1;
+	if (akita_acpm_xfer(SLC_ACPM_CHANNEL, cmd) != 0 || (int)cmd[1] < 0) {
+		printf("mali: slc: PT_ENABLE refused (0x%x); SLC left off\n", cmd[1]);
+		return;
+	}
+	ret = (int)cmd[1];
+	ptid = ret >> 22;               /* slc_acpm.c pt_ptid_data_decode: ptid in the high bits */
+
+	/* grow the partition to its full allowed size: arg = ptid << 8 | vptid << 16, arg1 = size_bits */
+	cmd[0] = 0;
+	cmd[1] = ((uint32_t)ptid << 8) | (SLC_GPU_VPTID << 16);
+	cmd[2] = SLC_PT_MUTATE;
+	cmd[3] = SLC_GPU_SIZE_BITS;
+	if (akita_acpm_xfer(SLC_ACPM_CHANNEL, cmd) != 0 || (int)cmd[1] < 0) {
+		printf("mali: slc: PT_MUTATE (grow) refused (0x%x); SLC left off\n", cmd[1]);
+		return;
+	}
+
+	slc_pbha = (SLC_GPU_PBHA & PTE_PBHA_MASK) << PTE_PBHA_POS;
+	printf("mali: slc: GPU partition enabled (ptid %d, PBHA %u); cached application pages go to the last-level cache\n",
+	    ptid, SLC_GPU_PBHA);
+}
+
 /*
  * How busy the GPU is, for the clocks' governor (hakios.akita_dvfs.c): the time any queue had work submitted and not
  * yet seen done -- from the submission that found every queue idle to the completion check that found them all caught
@@ -1717,7 +1804,13 @@ akita_mali_vm_map(int vm, uint64_t va, uint64_t phys, uint32_t flags)
 	if (flags & 2) {
 		attributes |= PTE_NX;
 	}
-	attributes |= (uint64_t)((flags & 4) ? ATTR_NON_CACHEABLE : ATTR_CACHED) << 2;
+	if (flags & 4) {
+		attributes |= (uint64_t)ATTR_NON_CACHEABLE << 2;
+	} else {
+		/* cached application memory: route it through the SLC partition when gpu_slc=1 enabled one (else 0) */
+		attributes |= (uint64_t)ATTR_CACHED << 2;
+		attributes |= slc_pbha;
+	}
 	return map_page_in(vms[vm].root, va, phys, attributes);
 }
 
@@ -3086,6 +3179,7 @@ mali_run(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 
 		PE_parse_boot_argn("mali_keep", &keep, sizeof(keep));
 		if (keep) {
+			mali_slc_enable();
 			kept = true;
 			printf("mali: the GPU kept on: HakiosGPU (panthor's interface) for programs\n");
 			akita_gpu_start();
