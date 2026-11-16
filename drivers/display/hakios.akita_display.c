@@ -214,6 +214,9 @@ static uint32_t measure_hz(void);
 static volatile uint32_t vblank_caught_hz;        /* frame dones the vblank thread caught in the last second */
 static volatile uint64_t vblank_at;
 static uint32_t dark_ms = 100, dark_beats;     /* (the beat while the panel is dark: see the vblank thread) */
+static uint32_t sleep_mode;                    /* display_sleep=1: the panel's sleep in while dark (panel_commands) */
+static bool panel_asleep;
+static uint32_t sleeps, wakes;
 static bool panel_dark(void);
 static void panel_commands(void);
 static volatile uint32_t vblank_hz;
@@ -246,6 +249,7 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	PE_parse_boot_argn("display_max_nits", &max_nits, sizeof(max_nits));
 	PE_parse_boot_argn("display_dimming", &dimming, sizeof(dimming));
 	PE_parse_boot_argn("display_dark_ms", &dark_ms, sizeof(dark_ms));
+	PE_parse_boot_argn("display_sleep", &sleep_mode, sizeof(sleep_mode));
 	max_nits = max_nits < 100 ? 100 : max_nits > 1400 ? 1400 : max_nits;
 	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);     /* (the panel's commands: panel_commands) */
 	if (health_on) {
@@ -1012,6 +1016,15 @@ static bool panel_dark(void) { return want_on == 0 && sent_on == 0; }
 int akita_display_dark(void);
 int akita_display_dark(void) { return panel_dark(); }
 
+/*
+ * SLEEP WHILE DARK (boot-arg display_sleep=1, 11-15 night, an experiment): after display off, the panel's sleep in
+ * (DCS 0x10, then 120 ms as Google's ak3b_off_cmds), and on the way back sleep out (0x11) and 120 ms (Google's longest,
+ * the EVT0 panels'; EVT1 and later want 10) before display on. Google's own wake runs the whole init again after a
+ * reset because its off also cuts the panel's supplies; here they stay on and the panel keeps its registers (the
+ * refresh rate, the dimming, the brightness). The panel's TE stops while it sleeps: the vblank thread's dark beat
+ * runs by the clock anyway (dark_ms).
+ */
+
 static void
 panel_commands(void)
 {
@@ -1027,6 +1040,29 @@ panel_commands(void)
 		sent_on = 0;
 		panel_fails += !ok;
 		printf("akita_display: the panel dark (display off %s)\n", ok ? "sent" : "NOT sent");
+		if (sleep_mode == 1 && ok) {
+			const uint8_t sleep_in = 0x10;
+
+			delay(17000);                   /* (a frame after the display off) */
+			ok = dsim_dcs(&sleep_in, 1);
+			panel_fails += !ok;
+			if (ok) {
+				panel_asleep = true;
+				sleeps++;
+				delay(120000);
+			}
+			printf("akita_display: the panel asleep (sleep in %s, %u times)\n", ok ? "sent" : "NOT sent", sleeps);
+		}
+	}
+	if (on && panel_asleep) {
+		const uint8_t sleep_out = 0x11;
+
+		ok = dsim_dcs(&sleep_out, 1);
+		panel_fails += !ok;
+		delay(120000);
+		panel_asleep = false;
+		wakes++;
+		printf("akita_display: the panel awake (sleep out %s, %u times)\n", ok ? "sent" : "NOT sent", wakes);
 	}
 	/*
 	 * THE PANEL'S OWN DIMMING (11-11, the tester: the brightness slider "jumps"): DCS 0x53, WRCTRLD, BCTRL (0x20) and
