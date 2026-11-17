@@ -27,6 +27,13 @@
  *   camera=4   ... and the front camera's sensor (IMX712) set to the mode Android's camera uses for it (imx712_init[]:
  *              its writes as LWIS made them, traced on the phone's Android 11-17 -- i2c events, devices/akita notes) and
  *              streamed for 2 s: its frame counter (0x0005) read every 100 ms says whether frames come out
+ *   camera=5   ... and the ISP front end (isp-fe): its power domain (pd-ispfe) -- on already when the kernel starts
+ *              (configuration/status 0x1), and then left as it is; if it is off, turned on as Google's cal-if does it
+ *              (ISPFE_CONFIGURATION 0x15462480 bit 0 written through the PRIV_REG SMC -- PMU_ALIVE takes no plain
+ *              stores: one reset the phone --, ISPFE_STATUS bit 0 waited for, then the TZPC restore SMC) and off again
+ *              after -- and its CMU, the MIPI link block (CSIS link 0) and the front end read, each step said and given
+ *              300 ms first. The front end only from 0x20000 up, where Android's accesses are: a read at offset 0 reset
+ *              the phone (run-cam12)
  *   camera=3   ... and the front camera powered as LWIS does it (sensor-leshen's power-up-seqs: LDO12, ldo2 2.8 V, ldo7
  *              1.2 V, 1 ms, reset gpp4-2 high, the clock CIS_CLK1 on gpp5-0) and its sensor's id read (0x1a: registers
  *              0x0000-0x0003 and 0x0016-0x0017); then powered down again in the reverse order
@@ -486,6 +493,87 @@ static const struct sensor {
  */
 static unsigned camera_mode;
 
+/* ---- the ISP front end (isp-fe: the MIPI receivers, the front end and its DMA) ----------------------------------- */
+
+#define PMU_ISPFE_CONF          0x15462480ULL   /* (+4 STATUS) */
+#define CMU_ISPFE_PHYS          0x1c000000ULL
+#define ISPFE_CSIS_PHYS         0x1c040000ULL   /* csis-link-phy: 12 links of 64 KB */
+#define ISPFE_FE_PHYS           0x1c300000ULL
+#define CMU_TOP_ISPFE_MUX       0x10bc
+#define CMU_TOP_ISPFE_DIV       0x18b4
+#define CMU_TOP_ISPFE_GATE      0x20e4
+#define SMC_PREPARE_PD_ONOFF    0x82000410ULL
+#define PD_GET_IN_DOWN          0
+#define PD_WAKEUP_DOWN          1
+#define PD_TZPC_GROUP           2
+#define ISPFE_SMC_ID            0x1c010204ULL
+#define SMC_PRIV_REG            0x82000504ULL   /* (address, 1 = write, value): PMU_ALIVE is written only through EL3 */
+#define PRIV_REG_WRITE          1
+
+static uint64_t
+cam_smc(uint64_t f, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	register uint64_t x0 __asm__("x0") = f, x1 __asm__("x1") = a1, x2 __asm__("x2") = a2, x3 __asm__("x3") = a3;
+
+	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : : "x4", "x5", "x6", "x7", "x8", "x9", "x10",
+	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+	return x0;
+}
+
+static void
+ispfe_test(void)
+{
+	vm_offset_t pmu = ml_io_map(PMU_ISPFE_CONF & ~0xfffULL, 0x1000) + (PMU_ISPFE_CONF & 0xfff), cmu, csis, fe;
+	uint32_t st = 0;
+	uint64_t r;
+	bool was_on, up;
+
+#define ISTEP(what) do { printf("akita camera: isp-fe: step: %s\n", what); delay_for_interval(300, NSEC_PER_MSEC); } while (0)
+	printf("akita camera: isp-fe: CMU_TOP ISPFE_NOC mux %#x div %#x gate %#x; pd-ispfe configuration %#x status %#x\n",
+	    rd(cmu_top + CMU_TOP_ISPFE_MUX), rd(cmu_top + CMU_TOP_ISPFE_DIV), rd(cmu_top + CMU_TOP_ISPFE_GATE), rd(pmu), rd(pmu + 4));
+	was_on = up = (rd(pmu + 4) & 1u) != 0;
+	if (!was_on) {
+		/* (PMU_ALIVE, 0x15460000-, takes writes only through the secure monitor, as cal-if's pmucal_write_reg() does: a
+		 * plain store reset the phone, 11-17 run-cam10) */
+		ISTEP("power domain on (PRIV_REG SMC)");
+		cam_smc(SMC_PRIV_REG, PMU_ISPFE_CONF, PRIV_REG_WRITE, rd(pmu) | 1u);
+		for (int i = 0; i < 100 && !up; i++) {
+			delay(100);
+			st = rd(pmu + 4);
+			up = (st & 1u) != 0;
+		}
+		if (!up) {
+			printf("akita camera: isp-fe: the power domain did not come up (status %#x after 10 ms)\n", st);
+			cam_smc(SMC_PRIV_REG, PMU_ISPFE_CONF, PRIV_REG_WRITE, rd(pmu) & ~1u);
+			return;
+		}
+		ISTEP("TZPC restore SMC");
+		r = cam_smc(SMC_PREPARE_PD_ONOFF, PD_WAKEUP_DOWN, ISPFE_SMC_ID, PD_TZPC_GROUP);
+		printf("akita camera: isp-fe: power domain on (status %#x); TZPC restore SMC: %#llx\n", rd(pmu + 4), r);
+	} else {
+		printf("akita camera: isp-fe: the power domain is on already (left so: no SMCs, not turned off)\n");
+	}
+	cmu = ml_io_map(CMU_ISPFE_PHYS, 0x4000);
+	csis = ml_io_map(ISPFE_CSIS_PHYS, 0x1000);
+	fe = ml_io_map(ISPFE_FE_PHYS + 0x20000, 0x1000);       /* (offset 0 reset the phone, run-cam12: Android's
+	                                                        * accesses start at 0x20000; its reads were at 0x2003c) */
+	ISTEP("read CMU_ISPFE");
+	printf("akita camera: isp-fe: CMU_ISPFE noc user mux %#x, div dcphy %#x nocp %#x, cmu gate %#x\n", rd(cmu + 0x600),
+	    rd(cmu + 0x1800), rd(cmu + 0x1804), rd(cmu + 0x200c));
+	ISTEP("read the CSIS link block");
+	printf("akita camera: isp-fe: CSIS link 0: %#x %#x %#x %#x\n", rd(csis), rd(csis + 4), rd(csis + 8), rd(csis + 0xc));
+	ISTEP("read the front end");
+	printf("akita camera: isp-fe: front end +0x20000: %#x +0x20008: %#x +0x20010: %#x +0x2003c: %#x\n", rd(fe), rd(fe + 8),
+	    rd(fe + 0x10), rd(fe + 0x3c));
+	if (!was_on) {
+		ISTEP("power domain off");
+		r = cam_smc(SMC_PREPARE_PD_ONOFF, PD_GET_IN_DOWN, ISPFE_SMC_ID, PD_TZPC_GROUP);
+		cam_smc(SMC_PRIV_REG, PMU_ISPFE_CONF, PRIV_REG_WRITE, rd(pmu) & ~1u);
+		printf("akita camera: isp-fe: off again (TZPC save SMC %#llx; status %#x)\n", r, rd(pmu + 4));
+	}
+#undef ISTEP
+}
+
 static const uint8_t imx712_init[] = {
 	1, 0x01, 0x36, 0x18,
 	1, 0x01, 0x37, 0x93,
@@ -794,6 +882,9 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 			sensor_probe(&sensors[i]);
 		}
 		slg_look("after the three cameras");
+	}
+	if (camera_mode >= 5) {
+		ispfe_test();
 	}
 }
 
