@@ -30,6 +30,7 @@
  * that fails, and the light goes off for the rest of the run. Off at the run's end and on a panic's way out.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
@@ -210,10 +211,45 @@ transfer(uint8_t addr, bool read, uint8_t *buf, unsigned len, bool stop)
 	return true;
 }
 
+/*
+ * The bus is shared (11-17): the camera PMIC (SLG51002, 0x75) is on it too, and hakios.akita_camera.c reaches it through
+ * akita_i2c14_xfer() below. A register access is two transfers (the address, then the data) and must not be split by
+ * the other driver's: each takes the lock for its whole access.
+ */
+static LCK_GRP_DECLARE(bus_lck_grp, "akita-hsi2c14");
+static LCK_MTX_DECLARE(bus_lock, &bus_lck_grp);
+
 static bool
 get(uint8_t reg, uint8_t *value)
 {
-	return transfer(LM3644, false, &reg, 1, false) && transfer(LM3644, true, value, 1, true);
+	bool ok;
+
+	lck_mtx_lock(&bus_lock);
+	ok = transfer(LM3644, false, &reg, 1, false) && transfer(LM3644, true, value, 1, true);
+	lck_mtx_unlock(&bus_lock);
+	return ok;
+}
+
+/* another device on HSI2C14: W bytes written (no stop if a read follows), then R read; false if the bus is not up */
+int akita_i2c14_xfer(uint8_t addr, const uint8_t *w, unsigned wl, uint8_t *r, unsigned rl);
+
+int
+akita_i2c14_xfer(uint8_t addr, const uint8_t *w, unsigned wl, uint8_t *r, unsigned rl)
+{
+	bool ok = true;
+
+	if (!up) {
+		return -1;
+	}
+	lck_mtx_lock(&bus_lock);
+	if (wl != 0) {
+		ok = transfer(addr, false, (uint8_t *)(uintptr_t)w, wl, rl == 0);
+	}
+	if (ok && rl != 0) {
+		ok = transfer(addr, true, r, rl, true);
+	}
+	lck_mtx_unlock(&bus_lock);
+	return ok ? 0 : -1;
 }
 
 /* every write read back; a surprise ends writing for the run (but for the way to dark: force) */
@@ -225,7 +261,12 @@ put(uint8_t reg, uint8_t value, bool force)
 	if (broken && !force) {
 		return false;
 	}
-	if (!transfer(LM3644, false, b, 2, true) || !get(reg, &back) || back != value) {
+	bool sent;
+
+	lck_mtx_lock(&bus_lock);
+	sent = transfer(LM3644, false, b, 2, true);
+	lck_mtx_unlock(&bus_lock);
+	if (!sent || !get(reg, &back) || back != value) {
 		printf("akita torch: register %#x written %#x, reads %#x: given up\n", reg, value, back);
 		broken = true;
 		return false;
