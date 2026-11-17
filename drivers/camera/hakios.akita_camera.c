@@ -1139,6 +1139,29 @@ static const struct { uint32_t off, val; } ispfe_front_37[] = {
 #define FRONT_BUF               0x1080000u      /* the frame, rounded up */
 #define FRONT_SIDE              0x100000u       /* the second buffer (+0x110: its size not known: 1 MiB) */
 
+/* CMU_ISPFE's registers (Google's cal-if zuma cmucal-sfr.c; the block has holes that reset the phone: only these are
+ * read), said while the front camera streams, to be set beside Android's (~/akita/ref/camera-android/live-regs-front.txt) */
+static const uint16_t cmu_ispfe_regs[] = {
+	0x0600, 0x0604, 0x0800, 0x1800, 0x1804, 0x2000, 0x2004, 0x2008, 0x200c, 0x2010,
+	0x2014, 0x2018, 0x201c, 0x2020, 0x2024, 0x2028, 0x202c, 0x2030, 0x2034, 0x2038,
+	0x203c, 0x2040, 0x2044, 0x2048, 0x204c, 0x2050, 0x2054, 0x2058, 0x205c, 0x2060,
+	0x2064, 0x2068, 0x206c, 0x2070, 0x2074, 0x2078, 0x207c, 0x2080, 0x2084, 0x2088,
+	0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x20a4, 0x20a8, 0x20ac, 0x20b0,
+	0x20b4, 0x20b8, 0x20bc, 0x20c0, 0x20c4, 0x20c8, 0x20cc, 0x20d0, 0x20d4, 0x20d8,
+	0x20dc, 0x20e0, 0x20e4, 0x20e8, 0x20ec, 0x20f0, 0x20f4, 0x20f8, 0x20fc, 0x2100,
+	0x2104, 0x2108, 0x210c, 0x2110, 0x2114, 0x2118, 0x211c, 0x2120, 0x2124, 0x2128,
+	0x212c, 0x2130, 0x2134, 0x2138, 0x213c, 0x2140, 0x2144, 0x2148, 0x214c, 0x2150,
+	0x2154, 0x301c, 0x3020, 0x3024, 0x3028, 0x302c, 0x3030, 0x3034, 0x3038, 0x303c,
+	0x3040, 0x3044, 0x3048, 0x304c, 0x3050, 0x3054, 0x3058, 0x305c, 0x3060, 0x3064,
+	0x3068, 0x306c, 0x3070, 0x3074, 0x3078, 0x307c, 0x3080, 0x3084, 0x3088, 0x308c,
+	0x3090, 0x3094, 0x3098, 0x309c, 0x30a0, 0x30a4, 0x30a8, 0x30ac, 0x30b0, 0x30b4,
+	0x30b8, 0x30bc, 0x30c0, 0x30c4, 0x30cc, 0x30d0,
+};
+#define ISPFE_SYSREG_PHYS       0x1c020000ULL   /* SYSREG_ISPFE: +0x500 the D-PHYs' resets (bit n = D-PHY n, 1 = running);
+                                                * a sweep of the page from Android reset it within its first 16 words: read only +0x500 */
+#define FRONT_DPHY_RESET_BITS   0x60u
+#define PMU_CSI_PHY_ISO         0x15463ebcULL   /* the CSIS D-PHYs' isolation (device tree "isolation" <0x3ebc>): bit0 1 = bypass */
+
 extern uint64_t kvtophys(vm_offset_t va);
 extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
 
@@ -1146,7 +1169,7 @@ static void
 front_capture(void)
 {
 	const struct sensor *c = &sensors[1];
-	vm_offset_t fe = 0, csis = 0, frame = 0, side = 0, pmu = ml_io_map(0x15462000ULL, 0x1000);
+	vm_offset_t fe = 0, csis = 0, frame = 0, side = 0, sysreg = 0, pmu = ml_io_map(0x15462000ULL, 0x2000);
 	uint64_t frame_pa, side_pa;
 	uint8_t one = 1, zero = 0, fc = 0;
 	unsigned changed = 0, first = ~0u;
@@ -1187,6 +1210,19 @@ front_capture(void)
 	if (!imx712_mode(c)) {
 		goto down;
 	}
+	/* the D-PHYs out of isolation, as Linux's phy-exynos-mipi power_on does (exynos_pmu_update: here the PRIV_REG SMC);
+	 * Android 11-17: 1 while a camera streams, 0 when closed -- camera=7 before this left it 0 and no bytes came */
+	{
+		uint64_t r = cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) | 1u);
+
+		printf("akita camera: capture: CSI PHY isolation bypass: %#x (SMC %#llx)\n", rd(pmu + 0x1ebc), r);
+	}
+	/* ... and D-PHYs 5 and 6 (0x1c103100: the clock lane and 4 data lanes; 0x1c103600) out of reset: SYSREG_ISPFE +0x500
+	 * (device tree system-controller@1C020500 "samsung,exynos-csis", each dcphy node's "reset" = its bit). Android 11-17:
+	 * 0x60 while the front camera streams, 0x2 for the main one (D-PHY 1) */
+	sysreg = ml_io_map(ISPFE_SYSREG_PHYS, 0x1000);
+	wr(sysreg + 0x500, rd(sysreg + 0x500) | FRONT_DPHY_RESET_BITS);
+	printf("akita camera: capture: D-PHY reset release: %#x\n", rd(sysreg + 0x500));
 	/* Android's setup of the PHY, CSIS link 6 and the front end */
 	for (unsigned i = 0; i < sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0]); i++) {
 		const struct ispfe_write *w = &ispfe_front_setup[i];
@@ -1221,7 +1257,8 @@ front_capture(void)
 	{
 		static const struct { const char *name; uint32_t pa, len; } dumps[] = {
 			{ "CSIS link 6", 0x1c0a0000, 0x100 }, { "CSIS link 6 +0x600", 0x1c0a0600, 0x100 },
-			{ "fe +0x20000", 0x1c320000, 0x100 }, { "fe +0x20400", 0x1c320400, 0x100 }, { "fe ch0", 0x1c320500, 0x100 },
+			{ "D-PHY 5 clock", 0x1c103100, 0x60 }, { "D-PHY 5 lane 0", 0x1c103200, 0x60 },
+			{ "D-PHY 5 lane 3", 0x1c103500, 0x60 }, { "fe +0x20000", 0x1c320000, 0x100 }, { "fe +0x20400", 0x1c320400, 0x100 }, { "fe ch0", 0x1c320500, 0x100 },
 		};
 
 		for (unsigned d = 0; d < sizeof(dumps) / sizeof(dumps[0]); d++) {
@@ -1238,6 +1275,19 @@ front_capture(void)
 			}
 			line[n] = '\0';
 			printf("akita camera: capture: streaming: %s:%s\n", dumps[d].name, line);
+		}
+	}
+	{
+		vm_offset_t cmu = ml_io_map(CMU_ISPFE_PHYS, 0x4000);
+		char line[256];
+		int n = 0;
+
+		for (unsigned i = 0; i < sizeof(cmu_ispfe_regs) / sizeof(cmu_ispfe_regs[0]); i++) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %x:%x", cmu_ispfe_regs[i], rd(cmu + cmu_ispfe_regs[i]));
+			if (n > 200 || i + 1 == sizeof(cmu_ispfe_regs) / sizeof(cmu_ispfe_regs[0])) {
+				printf("akita camera: capture: CMU_ISPFE:%s\n", line);
+				n = 0;
+			}
 		}
 	}
 	delay_for_interval(150, NSEC_PER_MSEC);
@@ -1270,6 +1320,10 @@ front_capture(void)
 		printf("akita camera: capture: S2MPU S0 FAULT_STATUS %#x\n", rd(s2 + 0x2000));
 	}
 down:
+	if (sysreg) {
+		wr(sysreg + 0x500, rd(sysreg + 0x500) & ~FRONT_DPHY_RESET_BITS);
+	}
+	cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) & ~1u);
 	mclk(c->clk, c->clk_bank, c->clk_pin, false);
 	pin_out(c->reset_bank, c->reset_pin, false);
 	while (on-- > 0) {
