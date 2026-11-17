@@ -34,6 +34,10 @@
  *              after -- and its CMU, the MIPI link block (CSIS link 0) and the front end read, each step said and given
  *              300 ms first. The front end only from 0x20000 up, where Android's accesses are: a read at offset 0 reset
  *              the phone (run-cam12)
+ *   camera=6   ... and the three paths of the front end's DMA looked at: each SysMMU (v9 at 0x1c110000, 0x1c150000,
+ *              0x1c190000: CTRL, STATUS, VERSION, CTRL_VM -- what Google's samsung-iommu-v9.c reads) and each S2MPU behind
+ *              it (0x1c140000, 0x1c180000, 0x1c1c0000: only VERSION and FAULT_STATUS -- other reads of an S2MPU were an
+ *              SError on the GPU's, hakios.akita_mali.c); each read said first
  *   camera=3   ... and the front camera powered as LWIS does it (sensor-leshen's power-up-seqs: LDO12, ldo2 2.8 V, ldo7
  *              1.2 V, 1 ms, reset gpp4-2 high, the clock CIS_CLK1 on gpp5-0) and its sensor's id read (0x1a: registers
  *              0x0000-0x0003 and 0x0016-0x0017); then powered down again in the reverse order
@@ -521,6 +525,25 @@ cam_smc(uint64_t f, uint64_t a1, uint64_t a2, uint64_t a3)
 }
 
 static void
+ispfe_dma_look(void)
+{
+	static const uint64_t sysmmu[3] = { 0x1c110000ULL, 0x1c150000ULL, 0x1c190000ULL };
+	static const uint64_t s2mpu[3] = { 0x1c140000ULL, 0x1c180000ULL, 0x1c1c0000ULL };
+
+	for (int i = 0; i < 3; i++) {
+		vm_offset_t m = ml_io_map(sysmmu[i], 0x10000), p = ml_io_map(s2mpu[i], 0x3000);
+
+		printf("akita camera: isp-fe S%d: reading its SysMMU (%#llx)\n", i, sysmmu[i]);
+		delay_for_interval(300, NSEC_PER_MSEC);
+		printf("akita camera: isp-fe S%d: SysMMU CTRL %#x STATUS %#x VERSION %#x CTRL_VM %#x FLPT_BASE_VM %#x\n", i, rd(m),
+		    rd(m + 0x8), rd(m + 0x34), rd(m + 0x8000), rd(m + 0x8404));
+		printf("akita camera: isp-fe S%d: reading its S2MPU (%#llx): VERSION, FAULT_STATUS\n", i, s2mpu[i]);
+		delay_for_interval(300, NSEC_PER_MSEC);
+		printf("akita camera: isp-fe S%d: S2MPU VERSION %#x FAULT_STATUS %#x\n", i, rd(p + 0x60), rd(p + 0x2000));
+	}
+}
+
+static void
 ispfe_test(void)
 {
 	vm_offset_t pmu = ml_io_map(PMU_ISPFE_CONF & ~0xfffULL, 0x1000) + (PMU_ISPFE_CONF & 0xfff), cmu, csis, fe;
@@ -885,6 +908,9 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 	}
 	if (camera_mode >= 5) {
 		ispfe_test();
+	}
+	if (camera_mode >= 6) {
+		ispfe_dma_look();
 	}
 }
 
