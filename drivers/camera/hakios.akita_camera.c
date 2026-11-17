@@ -2024,6 +2024,13 @@ mmu_map_android(uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 	t[PDMA_IOVA >> 20] = (uint32_t)(kvtophys(pdma_mem) >> 4) | 2u;
 	flush_dcache(mmu_flpt, 0x40000, FALSE);
 	__asm__ volatile ("dsb sy" ::: "memory");
+	/* (the SysMMUs were switched on before these entries: their TLBs invalidated again) */
+	for (unsigned m = 0; m < 3; m++) {
+		static const uint64_t mmus[3] = { 0x1c110000ULL, 0x1c150000ULL, 0x1c190000ULL };
+
+		wr(ml_io_map(mmus[m], 0x10000) + 0x8010, 1);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
 static bool
@@ -2095,7 +2102,7 @@ front_capture(void)
 	uint64_t frame_pa, side_pa;
 	uint8_t one = 1, zero = 0, fc = 0;
 	unsigned changed = 0, first = ~0u;
-	unsigned on = 0, use_pdma = 1, ch0_on = 1;
+	unsigned on = 0, use_pdma = 1, ch0_on = 1, arm37 = 0;
 	uint32_t old_fe_mux = 0, old_fe_div = 0;
 	bool fe_clk_set = false;
 	bool mmu_used = false;
@@ -2120,6 +2127,48 @@ front_capture(void)
 	fe = ml_io_map(ISPFE_FE_PHYS, 0x100000);
 	csis = ml_io_map(ISPFE_CSIS_PHYS, 0xd0000);
 
+	/* pd-ispfe off and on again, for the block to start from its reset as on Android (which powers it down whenever no
+	 * camera is open; here it is on from the boot): CMU_ISPFE's registers kept and put back as pmucal's ispfe_save does,
+	 * TZPC saved and restored by the SMCs exynos-pd uses. camera_pdcycle=0: not done */
+	{
+		unsigned cyc = 1;
+
+		PE_parse_boot_argn("camera_pdcycle", &cyc, sizeof(cyc));
+		if (cyc) {
+			vm_offset_t cmu = ml_io_map(CMU_ISPFE_PHYS, 0x4000);
+			static uint32_t keep[sizeof(cmu_ispfe_regs) / sizeof(cmu_ispfe_regs[0])];
+			uint32_t st = 1;
+
+			for (unsigned i = 0; i < sizeof(cmu_ispfe_regs) / sizeof(cmu_ispfe_regs[0]); i++) {
+				keep[i] = rd(cmu + cmu_ispfe_regs[i]);
+			}
+			cam_smc(SMC_PREPARE_PD_ONOFF, PD_GET_IN_DOWN, ISPFE_SMC_ID, PD_TZPC_GROUP);
+			cam_smc(SMC_PRIV_REG, 0x15462480ULL, PRIV_REG_WRITE, rd(pmu + 0x480) & ~1u);
+			for (int i = 0; i < 1000 && (st & 1u); i++) {
+				delay(10);
+				st = rd(pmu + 0x484);
+			}
+			printf("akita camera: capture: pd-ispfe off (status %#x)\n", st);
+			delay(1000);
+			cam_smc(SMC_PRIV_REG, 0x15462480ULL, PRIV_REG_WRITE, rd(pmu + 0x480) | 1u);
+			for (int i = 0; i < 1000 && !(st & 1u); i++) {
+				delay(10);
+				st = rd(pmu + 0x484);
+			}
+			cam_smc(SMC_PREPARE_PD_ONOFF, PD_WAKEUP_DOWN, ISPFE_SMC_ID, PD_TZPC_GROUP);
+			printf("akita camera: capture: pd-ispfe on again (status %#x); CMU_ISPFE 0x600 %#x 0x1800 %#x after the reset\n", st,
+			    rd(cmu + 0x600), rd(cmu + 0x1800));
+			for (unsigned i = 0; i < sizeof(cmu_ispfe_regs) / sizeof(cmu_ispfe_regs[0]); i++) {
+				if (rd(cmu + cmu_ispfe_regs[i]) != keep[i]) {
+					wr(cmu + cmu_ispfe_regs[i], keep[i]);
+				}
+			}
+			if (!(st & 1u)) {
+				printf("akita camera: capture: pd-ispfe did not come back: not trying\n");
+				return;
+			}
+		}
+	}
 	/* the front camera powered and set to its mode (not streaming) */
 	if (!i2c_bus_up(c->bus)) {
 		return;
@@ -2135,6 +2184,18 @@ front_capture(void)
 	delay(10000);
 	if (!imx712_mode(c)) {
 		goto down;
+	}
+	/* ISPFE's TZPC restored, as Linux's exynos-pd does after each power-on of pd-ispfe (exynos-pd_el3: SMC 0x82000410
+	 * (PD_WAKEUP_DOWN, ISPFE, TZPC group)): pd-ispfe is on from the boot here and nobody made that call. camera_tzpc=0: no */
+	{
+		unsigned tzpc = 1;
+
+		PE_parse_boot_argn("camera_tzpc", &tzpc, sizeof(tzpc));
+		if (tzpc) {
+			uint64_t r = cam_smc(SMC_PREPARE_PD_ONOFF, PD_WAKEUP_DOWN, ISPFE_SMC_ID, PD_TZPC_GROUP);
+
+			printf("akita camera: capture: ISPFE TZPC restore SMC: %#llx\n", r);
+		}
 	}
 	/* the D-PHYs out of isolation, as Linux's phy-exynos-mipi power_on does (exynos_pmu_update: here the PRIV_REG SMC);
 	 * Android 11-17: 1 while a camera streams, 0 when closed -- camera=7 before this left it 0 and no bytes came */
@@ -2192,6 +2253,7 @@ front_capture(void)
 			printf("akita camera: capture: SYSREG_ISPFE now DRCG_EN %#x MEMCLK %#x\n", rd(sysreg + 0x104), rd(sysreg + 0x108));
 		}
 	}
+	PE_parse_boot_argn("camera_arm37", &arm37, sizeof(arm37));
 	/* Android's setup of the PHY, CSIS link 6 and the front end */
 	for (unsigned i = 0; i < sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0]); i++) {
 		const struct ispfe_write *w = &ispfe_front_setup[i];
@@ -2199,6 +2261,10 @@ front_capture(void)
 
 		if (w->delay_us) {
 			delay(w->delay_us);
+		}
+		if (w->pa == 0x1c337300 && !arm37) {
+			continue;       /* camera_arm37=0 (default): the 0x37 block not armed before the first frame (Android 11-18:
+			                 * +0x37300 0 at the first frame start; armed with 4 only after each frame's end) */
 		}
 		wr(va, w->val);
 	}
@@ -2223,6 +2289,7 @@ front_capture(void)
 	printf("akita camera: capture: the PHY, CSIS link 6 and the front end set up (%u writes)\n",
 	    (unsigned)(sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0])));
 	PE_parse_boot_argn("camera_ch0", &ch0_on, sizeof(ch0_on));
+
 	/* the frame's channel and the 0x37 block, as the PDMA's list would, with our buffers */
 	wr(fe + 0x20554, FRONT_STRIDE);
 	wr(fe + 0x20550, 4);
@@ -2286,8 +2353,20 @@ front_capture(void)
 		wr(fe + 0x20510, (uint32_t)sa);
 		wr(fe + 0x20514, (uint32_t)(sa >> 32));
 	}
-	for (unsigned i = 0; i < sizeof(ispfe_front_37) / sizeof(ispfe_front_37[0]); i++) {
-		wr(fe + ispfe_front_37[i].off, ispfe_front_37[i].val);
+	{
+		unsigned b37 = 1;       /* camera_37=0: the 0x37 block's per-frame words not written (Android's first frame runs
+		                         * with +0x37028 0 and +0x37500 0: the block off) */
+
+		PE_parse_boot_argn("camera_37", &b37, sizeof(b37));
+		if (b37) {
+			for (unsigned i = 0; i < sizeof(ispfe_front_37) / sizeof(ispfe_front_37[0]); i++) {
+				wr(fe + ispfe_front_37[i].off, ispfe_front_37[i].val);
+			}
+		} else {
+			wr(fe + 0x37028, 0);
+			wr(fe + 0x37500, 0);
+			printf("akita camera: capture: the 0x37 block left off (+0x37028 %#x)\n", rd(fe + 0x37028));
+		}
 	}
 	{
 		unsigned proc = 1;
@@ -2296,6 +2375,15 @@ front_capture(void)
 		if (proc) {
 			for (unsigned i = 0; i < sizeof(ispfe_front_proc) / sizeof(ispfe_front_proc[0]); i++) {
 				wr(fe + ispfe_front_proc[i].off, ispfe_front_proc[i].val);
+			}
+			if (use_pdma) {         /* Android's IOVAs are mapped (onto scratch): its 9 buffer addresses written too */
+				static const uint32_t a9[][2] = { { 0x54a84, 0xef660000 }, { 0x54ecc, 0xe8c00000 }, { 0x55178, 0xfd880000 },
+					{ 0x55198, 0xe5ef4000 }, { 0x551b0, 0xef660000 }, { 0x551c0, 0xeb930000 }, { 0x551c8, 0xeb900000 },
+					{ 0x551e0, 0xf6c00000 }, { 0x55200, 0xe8c00000 } };
+
+				for (unsigned i = 0; i < 9; i++) {
+					wr(fe + a9[i][0], a9[i][1]);
+				}
 			}
 			printf("akita camera: capture: the processing blocks' %u words written\n",
 			    (unsigned)(sizeof(ispfe_front_proc) / sizeof(ispfe_front_proc[0])));
@@ -2324,17 +2412,39 @@ front_capture(void)
 		unsigned arm = 1;
 
 		PE_parse_boot_argn("camera_arm", &arm, sizeof(arm));
-		if (arm && ch0_on) {      /* Android's re-arm of the front's block after each frame: 0x500e8 3, then 0x37300 4 */
+		if (arm && ch0_on && arm37) {      /* Android's re-arm of the front's block after each frame: 0x500e8 3, then 0x37300 4 */
 			wr(fe + 0x500e8, 3);
 			wr(fe + 0x37300, 4);
+		}
+	}
+	{
+		unsigned sz = 0;        /* camera_size=0xHHHHWWWW: block 0's and the 0x37 block's frame size overridden (a test) */
+
+		if (PE_parse_boot_argn("camera_size", &sz, sizeof(sz)) && sz) {
+			wr(fe + 0x20474, sz);
+			wr(fe + 0x37904, sz);
+			printf("akita camera: capture: frame size set to %#x (block 0 %#x, 0x37 block %#x)\n", sz, rd(fe + 0x20474),
+			    rd(fe + 0x37904));
 		}
 	}
 	if (use_pdma) {
 		wr(fe + 0x90010, 0x10);
 	}
 	printf("akita camera: capture: channel 0 -> %#llx; stream on\n", frame_pa);
-	i2c_write16(c->bus, 0x1a, 0x0100, &one, 1);
-	wr(fe + 0x200a0, 1);                    /* (Android, 34 us after stream on: the front end's start) */
+	{
+		unsigned first = 50;    /* camera_startfirst=N: the front end started N ms BEFORE the stream (Android's front flip
+		                         * 11-18: start, then 68 ms to the first frame); 0: 34 us after it, as the 11-17 trace */
+
+		PE_parse_boot_argn("camera_startfirst", &first, sizeof(first));
+		if (first) {
+			wr(fe + 0x200a0, 1);
+			delay_for_interval(first, NSEC_PER_MSEC);
+			i2c_write16(c->bus, 0x1a, 0x0100, &one, 1);
+		} else {
+			i2c_write16(c->bus, 0x1a, 0x0100, &one, 1);
+			wr(fe + 0x200a0, 1);
+		}
+	}
 	/* 300 ms of the front end's status, every 1 ms, each change said; Android's interrupt handler mirrored (11-17 trace:
 	 * it reads 0x20110/0x20114/0x2043c/0x2044c/0x20450, then writes 0x2008c 1, 0x20404 0, 0x20424 1 or 0x1a, 0x20438 0,
 	 * 0x2044c 0, 0x20110 0; after the 0x1a kind the next frame armed: 0x5xxxx, 0x3x300 0, 0x37300 4). camera_irq=0: only
@@ -2344,9 +2454,10 @@ front_capture(void)
 			0x2044c, 0x20450, 0x204ac, 0x204a0, 0x204bc, 0x204c0, 0x500e8, 0x500ec, 0x50118, 0x5011c, 0x501ac, 0x37300,
 			0x37304, 0x50000, 0x5000c, 0x50014, 0x5001c, 0x20540, 0x20508, 0x90010, 0x90014, 0x90028, 0x20708 };
 		uint32_t last[sizeof(st) / sizeof(st[0])] = { 0 };
-		unsigned handle = 1, said = 0, handled = 0;
+		unsigned handle = 1, said = 0, handled = 0, w1c_err = 1;
 
 		PE_parse_boot_argn("camera_irq", &handle, sizeof(handle));
+		PE_parse_boot_argn("camera_w1c", &w1c_err, sizeof(w1c_err));
 		for (unsigned ms = 0; ms < 300; ms++) {
 			uint32_t v[sizeof(st) / sizeof(st[0])];
 			bool ch = false;
@@ -2373,7 +2484,10 @@ front_capture(void)
 				wr(fe + 0x2008c, 1);
 				wr(fe + 0x20404, 0);
 				wr(fe + 0x20424, v[5] | (v[6] ? 0x1au : 0));
-				wr(fe + 0x20438, 0);
+				wr(fe + 0x20438, w1c_err ? v[7] : 0);      /* camera_w1c=1: the error word written back (W1C?) */
+				if (w1c_err) {
+					wr(fe + 0x204ac, v[11]);
+				}
 				wr(fe + 0x2044c, 0);
 				wr(fe + 0x20110, 0);
 				if ((v[5] & 0x1a) || v[6]) {
