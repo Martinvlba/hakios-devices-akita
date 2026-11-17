@@ -439,8 +439,18 @@ mclk(unsigned n, unsigned bank, unsigned pin, bool on)
 	vm_offset_t p = gpio0 + GPP(bank);
 
 	if (on) {
-		wr(cmu_top + CMU_TOP_CIS_MUX(n), 0);
-		wr(cmu_top + CMU_TOP_CIS_DIV(n), 0);
+		{
+			unsigned m = 0; /* camera_mclkmux=N: CIS_CLKn's source (0 OSCCLK, 1 PLL_SHARED0_D3 711 MHz, ...): a test */
+
+			PE_parse_boot_argn("camera_mclkmux", &m, sizeof(m));
+			wr(cmu_top + CMU_TOP_CIS_MUX(n), m & 7);
+		}
+		{
+			unsigned d = 0; /* camera_mclkdiv=N: CIS_CLKn's divider (a test: does the sensor's frame period follow it?) */
+
+			PE_parse_boot_argn("camera_mclkdiv", &d, sizeof(d));
+			wr(cmu_top + CMU_TOP_CIS_DIV(n), d & 0x1f);
+		}
 		wr(cmu_top + CMU_TOP_CIS_GATE(n), CMU_GATE_ON);
 		wr(p, (rd(p) & ~(0xfu << (4 * pin))) | (2u << (4 * pin)));
 		wr(p + 0xc, (rd(p + 0xc) & ~(0xfu << (4 * pin))) | (1u << (4 * pin)));        /* drive strength 1 (the tree's) */
@@ -754,7 +764,39 @@ imx712_mode(const struct sensor *c)
 			delay(20000);           /* (Android's pause after 0x500f) */
 		}
 	}
+	{
+		unsigned vt = 0, op = 0;        /* camera_pllvt / camera_pllop: the sensor's PLL multipliers (0x0307, 0x030f)
+		                                 * overridden -- a test of whether our sensor runs faster than Android's */
+
+		PE_parse_boot_argn("camera_pllvt", &vt, sizeof(vt));
+		PE_parse_boot_argn("camera_pllop", &op, sizeof(op));
+		if (vt) {
+			uint8_t b = (uint8_t)vt;
+
+			i2c_write16(c->bus, 0x1a, 0x0307, &b, 1);
+		}
+		if (op) {
+			uint8_t b = (uint8_t)op;
+
+			i2c_write16(c->bus, 0x1a, 0x030f, &b, 1);
+		}
+	}
 	printf("akita camera: %s: the IMX712's mode written (%u registers, %u failed)\n", c->name, k, failed);
+	{
+		/* read back: EXCK 0x0136/7, PLL 0x0301..0x030f, frame/line length 0x0340..0x0343, link rate 0x0820..0x0823 */
+		static const uint16_t rb[] = { 0x0136, 0x0137, 0x0301, 0x0303, 0x0305, 0x0306, 0x0307, 0x030b, 0x030d, 0x030e, 0x030f,
+			0x0340, 0x0341, 0x0342, 0x0343, 0x0820, 0x0821, 0x0822, 0x0823, 0x0112, 0x0113, 0x0114, 0x0808, 0x0101 };
+		char line[300];
+		int n = 0;
+
+		for (unsigned i = 0; i < sizeof(rb) / sizeof(rb[0]); i++) {
+			uint8_t v = 0xee;
+
+			i2c_read16(c->bus, 0x1a, rb[i], &v, 1);
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %04x:%02x", rb[i], v);
+		}
+		printf("akita camera: %s: read back:%s\n", c->name, line);
+	}
 	return failed == 0;
 }
 
@@ -2102,7 +2144,7 @@ front_capture(void)
 	uint64_t frame_pa, side_pa;
 	uint8_t one = 1, zero = 0, fc = 0;
 	unsigned changed = 0, first = ~0u;
-	unsigned on = 0, use_pdma = 1, ch0_on = 1, arm37 = 0;
+	unsigned on = 0, use_pdma = 1, ch0_on = 1, arm37 = 0, phy_late = 1;
 	uint32_t old_fe_mux = 0, old_fe_div = 0;
 	bool fe_clk_set = false;
 	bool mmu_used = false;
@@ -2208,8 +2250,11 @@ front_capture(void)
 	 * (device tree system-controller@1C020500 "samsung,exynos-csis", each dcphy node's "reset" = its bit). Android 11-17:
 	 * 0x60 while the front camera streams, 0x2 for the main one (D-PHY 1) */
 	sysreg = ml_io_map(ISPFE_SYSREG_PHYS, 0x1000);
-	wr(sysreg + 0x500, rd(sysreg + 0x500) | FRONT_DPHY_RESET_BITS);
-	printf("akita camera: capture: D-PHY reset release: %#x\n", rd(sysreg + 0x500));
+	PE_parse_boot_argn("camera_phyorder", &phy_late, sizeof(phy_late));
+	if (!phy_late) {
+		wr(sysreg + 0x500, rd(sysreg + 0x500) | FRONT_DPHY_RESET_BITS);
+		printf("akita camera: capture: D-PHY reset release: %#x\n", rd(sysreg + 0x500));
+	}
 	/* SYSREG_ISPFE 0x104 BUS_COMPONENT_DRCG_EN, 0x108 MEMCLK: what pmucal saves and restores across pd-ispfe's power
 	 * cycles (flexpmu_cal_local_zuma.h ispfe_save); Android while a camera streams: 0x3ffffff, 0 */
 	/* the front end's clock (CMU_TOP MUX/DIV_CLKCMU_ISPFE_NOC): Android, a camera streaming, mux 4 (PLL_SHARED1_D4) div 1;
@@ -2285,6 +2330,12 @@ front_capture(void)
 			wr(csis + 0x60700, c700);
 			printf("akita camera: capture: CSIS link 6 +0x700 = %#x (read %#x)\n", c700, rd(csis + 0x60700));
 		}
+	}
+	if (phy_late) {
+		/* (Android 11-17 ultra-wide trace: the lanes configured and enabled, CSIS set up, and only then the D-PHYs'
+		 * resets released -- the other way round the lanes never calibrated: +0xc0.. 0xffff, no deskew results) */
+		wr(sysreg + 0x500, rd(sysreg + 0x500) | FRONT_DPHY_RESET_BITS);
+		printf("akita camera: capture: D-PHY reset release after the PHY's setup: %#x\n", rd(sysreg + 0x500));
 	}
 	printf("akita camera: capture: the PHY, CSIS link 6 and the front end set up (%u writes)\n",
 	    (unsigned)(sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0])));
@@ -2432,7 +2483,24 @@ front_capture(void)
 	}
 	printf("akita camera: capture: channel 0 -> %#llx; stream on\n", frame_pa);
 	{
-		unsigned first = 50;    /* camera_startfirst=N: the front end started N ms BEFORE the stream (Android's front flip
+		unsigned pre = 100;     /* camera_prestream=N ms between the receiver's setup and the stream (Android: 141 ms) */
+
+		PE_parse_boot_argn("camera_prestream", &pre, sizeof(pre));
+		if (pre) {
+			delay_for_interval(pre, NSEC_PER_MSEC);
+		}
+		/* the D-PHYs' state words before the stream (Android, a working stream: clock lane +0x1e0.. 1 1 0xe 0x11, an idle
+		 * PHY 1 1 0xe 0x40; ours while streaming: 0x20 2 0xd 0x1f) */
+		printf("akita camera: capture: before the stream: CIS_CLK1 mux %#x div %#x gate %#x DFTMUX(0x3008) %#x (Android 0 0 0x200000 2); "
+		    "0x3004 %#x 0x300c %#x\n", rd(cmu_top + 0x1014), rd(cmu_top + 0x1814), rd(cmu_top + 0x203c), rd(cmu_top + 0x3008),
+		    rd(cmu_top + 0x3004), rd(cmu_top + 0x300c));
+		printf("akita camera: capture: before the stream: D-PHY 5 clock +1e0: %x %x %x %x; lane 0 +c0: %x %x +e0: %x %x %x %x; "
+		    "D-PHY 6 +6e0: %x %x %x %x\n", rd(csis + 0xc31e0), rd(csis + 0xc31e4), rd(csis + 0xc31e8), rd(csis + 0xc31ec),
+		    rd(csis + 0xc32c0), rd(csis + 0xc32c4), rd(csis + 0xc32e0), rd(csis + 0xc32e4), rd(csis + 0xc32e8),
+		    rd(csis + 0xc32ec), rd(csis + 0xc36e0), rd(csis + 0xc36e4), rd(csis + 0xc36e8), rd(csis + 0xc36ec));
+	}
+	{
+		unsigned first = 0;    /* camera_startfirst=N: the front end started N ms BEFORE the stream (Android's front flip
 		                         * 11-18: start, then 68 ms to the first frame); 0: 34 us after it, as the 11-17 trace */
 
 		PE_parse_boot_argn("camera_startfirst", &first, sizeof(first));
@@ -2514,6 +2582,28 @@ front_capture(void)
 			char line[240];
 			int n = 0;
 
+			/* the PHY block (0x1c100000.., 0x1c101000.., D-PHYs 5/6 0x1c103000..0x1c103fff; Android 11-18 more-front.txt) */
+			{
+				static const uint32_t r[][2] = { { 0x1c100000, 0x200 }, { 0x1c101000, 0x200 }, { 0x1c103000, 0x1000 } };
+
+				for (unsigned k = 0; k < 3; k++) {
+					for (uint32_t o = 0; o < r[k][1]; o += 4) {
+						uint32_t v = rd(csis + (r[k][0] - ISPFE_CSIS_PHYS) + o);
+
+						if (v && v != 0xdeadcafe && v != 0xfa11fa11) {
+							n += snprintf(line + n, sizeof(line) - (size_t)n, " %x:%x", r[k][0] + o, v);
+						}
+						if (n > 200) {
+							printf("akita camera: capture: PHY:%s\n", line);
+							n = 0;
+						}
+					}
+				}
+				if (n) {
+					printf("akita camera: capture: PHY:%s\n", line);
+					n = 0;
+				}
+			}
 			/* CSIS link 6 +0x100..0xfff (Android, front streaming: +0x240.. the channels' active config, +0x500/0x504
 			 * frame counters 0x1d2, +0x700 0xf1); the words that are neither 0 nor 0xdeadcafe */
 			for (uint32_t o = 0x100; o < 0x1000; o += 4) {
@@ -2634,6 +2724,163 @@ down:
 		slg_ldo_off(c->ldo[on]);
 	}
 	printf("akita camera: capture: front camera powered down\n");
+}
+
+/*
+ * camera=8: the ultra-wide IMX712 streamed into its own receiver, no front end -- to see whether D-PHY 0 calibrates on
+ * the sensor's signal here (the front camera's D-PHY 5 does not: its lanes' state words go wrong once the stream starts,
+ * though they read as Android's before it). Android's 11-17 ultra-wide setup of D-PHY 0 and CSIS link 0 (76 writes,
+ * uw-writes.txt), the D-PHYs 0/1 reset released after it (SYSREG_ISPFE +0x500 bits 0-1, Android: 3), 100 ms, stream on.
+ */
+static const struct ispfe_write uw_setup[] = {
+	{ 0x1c101200, 0x00000000, 0 },
+	{ 0x1c101300, 0x00000000, 0 },
+	{ 0x1c101400, 0x00000000, 0 },
+	{ 0x1c101500, 0x00000000, 0 },
+	{ 0x1c101600, 0x00000000, 0 },
+	{ 0x1c101000, 0x00000010, 0 },
+	{ 0x1c101004, 0x00000110, 0 },
+	{ 0x1c101008, 0x00003223, 0 },
+	{ 0x1c10100c, 0x00000000, 0 },
+	{ 0x1c101010, 0x00000200, 0 },
+	{ 0x1c101014, 0x00000000, 0 },
+	{ 0x1c101204, 0x00001334, 0 },
+	{ 0x1c101208, 0x00000005, 0 },
+	{ 0x1c10120c, 0x0000f0ae, 0 },
+	{ 0x1c101210, 0x00000002, 0 },
+	{ 0x1c101214, 0x00008600, 0 },
+	{ 0x1c101218, 0x00004000, 0 },
+	{ 0x1c101230, 0x00000103, 0 },
+	{ 0x1c101240, 0x00000001, 0 },
+	{ 0x1c101200, 0x00000003, 0 },
+	{ 0x1c101304, 0x00001334, 0 },
+	{ 0x1c101308, 0x0000000d, 0 },
+	{ 0x1c10130c, 0x000020ae, 0 },
+	{ 0x1c101310, 0x00000302, 0 },
+	{ 0x1c101314, 0x00008600, 0 },
+	{ 0x1c101318, 0x00004000, 0 },
+	{ 0x1c101330, 0x00000137, 0 },
+	{ 0x1c101334, 0x00000003, 0 },
+	{ 0x1c101340, 0x00000001, 0 },
+	{ 0x1c101350, 0x0000081a, 0 },
+	{ 0x1c101300, 0x00000001, 0 },
+	{ 0x1c101404, 0x00001334, 0 },
+	{ 0x1c101408, 0x0000000d, 0 },
+	{ 0x1c10140c, 0x000020ae, 0 },
+	{ 0x1c101410, 0x00000302, 0 },
+	{ 0x1c101414, 0x00008600, 0 },
+	{ 0x1c101418, 0x00004000, 0 },
+	{ 0x1c101430, 0x00000137, 0 },
+	{ 0x1c101434, 0x00000003, 0 },
+	{ 0x1c101440, 0x00000001, 0 },
+	{ 0x1c101450, 0x0000081a, 0 },
+	{ 0x1c101400, 0x00000001, 0 },
+	{ 0x1c101504, 0x00001334, 0 },
+	{ 0x1c101508, 0x0000000d, 0 },
+	{ 0x1c10150c, 0x000020ae, 0 },
+	{ 0x1c101510, 0x00000302, 0 },
+	{ 0x1c101514, 0x00008600, 0 },
+	{ 0x1c101518, 0x00004000, 0 },
+	{ 0x1c101530, 0x00000137, 0 },
+	{ 0x1c101534, 0x00000003, 0 },
+	{ 0x1c101540, 0x00000001, 0 },
+	{ 0x1c101550, 0x0000081a, 0 },
+	{ 0x1c101500, 0x00000001, 0 },
+	{ 0x1c101604, 0x00001334, 0 },
+	{ 0x1c101608, 0x0000000d, 0 },
+	{ 0x1c10160c, 0x000020ae, 0 },
+	{ 0x1c101610, 0x00000302, 0 },
+	{ 0x1c101614, 0x00008600, 0 },
+	{ 0x1c101618, 0x00004000, 0 },
+	{ 0x1c101630, 0x00000137, 0 },
+	{ 0x1c101634, 0x00000003, 0 },
+	{ 0x1c101640, 0x00000001, 0 },
+	{ 0x1c101650, 0x0000081a, 0 },
+	{ 0x1c101600, 0x00000001, 0 },
+	{ 0x1c040690, 0x00000000, 0 },
+	{ 0x1c040040, 0x000030ac, 0 },
+	{ 0x1c040044, 0x0c301070, 0 },
+	{ 0x1c040050, 0x0000b048, 0 },
+	{ 0x1c040054, 0x00011070, 0 },
+	{ 0x1c040600, 0x7fff7fff, 0 },
+	{ 0x1c04000c, 0x0000000f, 0 },
+	{ 0x1c040004, 0x00005f01, 0 },
+	{ 0x1c040020, 0x00000000, 0 },
+	{ 0x1c040028, 0x00000000, 0 },
+	{ 0x1c040010, 0x01fff1ff, 0 },
+	{ 0x1c040018, 0x0000007e, 0 },
+};
+
+static void
+uw_receiver_test(void)
+{
+	const struct sensor *c = &sensors[2];
+	vm_offset_t csis = ml_io_map(ISPFE_CSIS_PHYS, 0xd0000), sysreg = ml_io_map(ISPFE_SYSREG_PHYS, 0x1000);
+	vm_offset_t pmu = ml_io_map(0x15462000ULL, 0x2000);
+	uint8_t one = 1, zero = 0, fc = 0;
+	unsigned on = 0;
+
+	if (!(rd(pmu + 0x484) & 1u)) {
+		printf("akita camera: uw: pd-ispfe is off: not trying\n");
+		return;
+	}
+	if (!i2c_bus_up(c->bus)) {
+		return;
+	}
+	for (on = 0; on < 4 && c->ldo[on] != 0; on++) {
+		if (!slg_ldo_on(c->ldo[on], c->mv[on])) {
+			goto down;
+		}
+	}
+	delay(1000);
+	pin_out(c->reset_bank, c->reset_pin, true);
+	mclk(c->clk, c->clk_bank, c->clk_pin, true);
+	delay(10000);
+	if (!imx712_mode(c)) {
+		goto down;
+	}
+	cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) | 1u);
+	for (unsigned i = 0; i < sizeof(uw_setup) / sizeof(uw_setup[0]); i++) {
+		wr(csis + (uw_setup[i].pa - ISPFE_CSIS_PHYS), uw_setup[i].val);
+	}
+	wr(sysreg + 0x500, rd(sysreg + 0x500) | 3u);
+	delay_for_interval(100, NSEC_PER_MSEC);
+	printf("akita camera: uw: before the stream: D-PHY 0 clock +1e0: %x %x %x %x; lane 0 +c0: %x %x +e0: %x %x %x %x\n",
+	    rd(csis + 0xc13e0 - 0x100), rd(csis + 0xc13e4 - 0x100), rd(csis + 0xc13e8 - 0x100), rd(csis + 0xc13ec - 0x100),
+	    rd(csis + 0xc13c0), rd(csis + 0xc13c4), rd(csis + 0xc13e0), rd(csis + 0xc13e4), rd(csis + 0xc13e8), rd(csis + 0xc13ec));
+	i2c_write16(c->bus, 0x1a, 0x0100, &one, 1);
+	delay_for_interval(300, NSEC_PER_MSEC);
+	i2c_read16(c->bus, 0x1a, 0x0005, &fc, 1);
+	{
+		char line[400];
+		int n = 0;
+
+		for (uint32_t a = 0x1c101200; a < 0x1c101700; a += 4) {
+			uint32_t v = rd(csis + (a - ISPFE_CSIS_PHYS));
+
+			if ((a & 0xff) >= 0xb0 && v && v != 0xfa11fa11 && v != 0xdeadcafe) {
+				n += snprintf(line + n, sizeof(line) - (size_t)n, " %x:%x", a, v);
+			}
+			if (n > 300) {
+				printf("akita camera: uw: streaming: D-PHY 0:%s\n", line);
+				n = 0;
+			}
+		}
+		if (n) {
+			printf("akita camera: uw: streaming: D-PHY 0:%s\n", line);
+		}
+	}
+	printf("akita camera: uw: streaming (sensor frame counter %u): CSIS link 0 +04 %#x +500 %#x +504 %#x +14 %#x +1c %#x\n", fc,
+	    rd(csis + 4), rd(csis + 0x500), rd(csis + 0x504), rd(csis + 0x14), rd(csis + 0x1c));
+	i2c_write16(c->bus, 0x1a, 0x0100, &zero, 1);
+	wr(sysreg + 0x500, rd(sysreg + 0x500) & ~3u);
+down:
+	mclk(c->clk, c->clk_bank, c->clk_pin, false);
+	pin_out(c->reset_bank, c->reset_pin, false);
+	while (on-- > 0) {
+		slg_ldo_off(c->ldo[on]);
+	}
+	printf("akita camera: uw: powered down\n");
 }
 
 static void
@@ -2769,6 +3016,10 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 	front_eeprom();
 	if (camera_mode == 7) {
 		front_capture();
+		return;
+	}
+	if (camera_mode == 8) {
+		uw_receiver_test();
 		return;
 	}
 	if (camera_mode >= 3) {
