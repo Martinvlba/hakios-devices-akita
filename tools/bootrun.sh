@@ -39,6 +39,11 @@ HW=""; case "$BOOTARGS" in *torch=*) ;; *) HW="torch=3";; esac
 # ... and restart_fastboot=1: a restart of the test boot by itself (its time limit, the USB host gone) ends in the
 # bootloader, which is silent, not in the installed image, which is not
 [ -n "$QUIET" ] && HW="$HW speaker=0 restart_fastboot=1"
+# hakios_arm64e=1 (11-17): the d16ap / 16.6.1 userland is arm64e and the kernel execs arm64e only with it
+# (bsd/dev/arm/kern_machdep.c). Without it launchd cannot start, the kernel resets before USB is up and the
+# bootloader boots the ACTIVE SLOT instead -- every test boot looked like "the installed image is running".
+# Harmless for an arm64 userland. hakios_arm64e=0 in BOOTARGS turns it off.
+case "$BOOTARGS" in *hakios_arm64e=*) ;; *) HW="$HW hakios_arm64e=1";; esac
 LC_ALL=C grep -aq "touchscreen=1 buttons=1" hakios-kernel || { echo "bootrun: hakios-kernel has no built-in arguments (CONFIG_DEFAULTS, 11-12): make kernel"; exit 1; }
 CMDLINE="debug=0x8 $SAFE cpus=9 $USBSER ${THERMAL:+$THERMAL }ufs=2 ufs_write=1 $HW $BOOTARGS"
 [ ${#CMDLINE} -gt 490 ] && { echo "bootrun: the command line is ${#CMDLINE} characters: more than the kernel gets whole (490: at 491 its last character was lost, 11-10); shorten BOOTARGS"; exit 1; }
