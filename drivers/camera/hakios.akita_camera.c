@@ -38,6 +38,8 @@
  *              0x1c190000: CTRL, STATUS, VERSION, CTRL_VM -- what Google's samsung-iommu-v9.c reads) and each S2MPU behind
  *              it (0x1c140000, 0x1c180000, 0x1c1c0000: only VERSION and FAULT_STATUS -- other reads of an S2MPU were an
  *              SError on the GPU's, hakios.akita_mali.c); each read said first
+ *   camera=7   (alone) one capture from the front camera into a buffer of ours: Android's PHY/CSIS/front-end setup and
+ *              its per-frame channel-0 writes replayed by the CPU (front_capture())
  *   camera=3   ... and the front camera powered as LWIS does it (sensor-leshen's power-up-seqs: LDO12, ldo2 2.8 V, ldo7
  *              1.2 V, 1 ms, reset gpp4-2 high, the clock CIS_CLK1 on gpp5-0) and its sensor's id read (0x1a: registers
  *              0x0000-0x0003 and 0x0016-0x0017); then powered down again in the reverse order
@@ -54,6 +56,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern int akita_acpm_xfer(unsigned channel, uint32_t cmd[4]);
@@ -733,11 +736,11 @@ i2c_write16(int bus, uint8_t addr, uint16_t reg, const uint8_t *vals, unsigned n
 }
 
 /* the sensor (powered, out of reset, clocked) set to Android's mode, streamed 2 s with its frame counter read, stopped */
-static void
-imx712_stream_test(const struct sensor *c)
+/* the IMX712's mode written (not streaming yet); false if any write failed */
+static bool
+imx712_mode(const struct sensor *c)
 {
 	unsigned k = 0, i = 0, failed = 0;
-	uint8_t one = 1, zero = 0, fc = 0, last = 0;
 
 	while (imx712_init[i] != 0) {
 		unsigned n = imx712_init[i];
@@ -752,6 +755,15 @@ imx712_stream_test(const struct sensor *c)
 		}
 	}
 	printf("akita camera: %s: the IMX712's mode written (%u registers, %u failed)\n", c->name, k, failed);
+	return failed == 0;
+}
+
+static void
+imx712_stream_test(const struct sensor *c)
+{
+	uint8_t one = 1, zero = 0, fc = 0, last = 0;
+
+	imx712_mode(c);
 	delay(7000);
 	if (!i2c_write16(c->bus, 0x1a, 0x0100, &one, 1)) {
 		printf("akita camera: %s: stream on failed\n", c->name);
@@ -767,6 +779,503 @@ imx712_stream_test(const struct sensor *c)
 	}
 	i2c_write16(c->bus, 0x1a, 0x0100, &zero, 1);
 	printf("akita camera: %s: stream off\n", c->name);
+}
+
+/*
+ * camera=7: one capture from the front camera into memory, the way Android's camera does it (traced 11-17 on the
+ * phone's Android, devices/akita notes): the MIPI PHY and CSIS link 6 and the front end set up as Android did before
+ * stream-on (ispfe_front_setup[], its writes in order with its pauses), then what Android's PDMA writes each frame for
+ * the front camera -- WDMA channel 0 (fe+0x20500: +0x140 enable, +0x150 format 4 = RAW10, +0x154 stride 0x14c0 = 4208
+ * px, +0x1c0 the frame's address, +0x110 a small second buffer) and the 0x37 block (size 0x0c001070 = 3072 x 4208, crop,
+ * the start) -- written here by the CPU, with OUR buffers' physical addresses (the SysMMUs are off: no translation).
+ * Android's processing blocks (fe 0x54xxx/0x55xxx, 1279 writes) are left out: some of them hold Android's buffer
+ * addresses, which here would be raw physical addresses. Then the sensor streams 300 ms, and the buffer is examined.
+ */
+struct ispfe_write { uint32_t pa, val, delay_us; };
+static const struct ispfe_write ispfe_front_setup[] = {
+	{ 0x1c040004, 0x00005002, 0 },
+	{ 0x1c050004, 0x00005002, 0 },
+	{ 0x1c060004, 0x00005002, 0 },
+	{ 0x1c070004, 0x00005002, 0 },
+	{ 0x1c080004, 0x00005002, 0 },
+	{ 0x1c090004, 0x00005002, 0 },
+	{ 0x1c0a0004, 0x00005002, 0 },
+	{ 0x1c0b0004, 0x00005002, 0 },
+	{ 0x1c0c0004, 0x00005002, 0 },
+	{ 0x1c0d0004, 0x00005002, 0 },
+	{ 0x1c0e0004, 0x00005002, 0 },
+	{ 0x1c0f0004, 0x00005002, 0 },
+	{ 0x1c320008, 0x0000000f, 0 },
+	{ 0x1c320010, 0x00000001, 0 },
+	{ 0x1c35000c, 0x00000000, 1694 },
+	{ 0x1c350000, 0x00000000, 0 },
+	{ 0x1c350004, 0x00000000, 0 },
+	{ 0x1c350008, 0x00000000, 0 },
+	{ 0x1c35000c, 0x00000c10, 0 },
+	{ 0x1c350010, 0x00dddead, 0 },
+	{ 0x1c350014, 0x00000000, 0 },
+	{ 0x1c350018, 0x00000000, 0 },
+	{ 0x1c35001c, 0x00000000, 0 },
+	{ 0x1c350020, 0x00020002, 0 },
+	{ 0x1c350024, 0x00000000, 0 },
+	{ 0x1c350028, 0x00000000, 0 },
+	{ 0x1c35002c, 0x00000000, 0 },
+	{ 0x1c350030, 0x00000000, 0 },
+	{ 0x1c350034, 0x00000000, 0 },
+	{ 0x1c350038, 0x00000000, 0 },
+	{ 0x1c35003c, 0x00000000, 0 },
+	{ 0x1c350040, 0x00000000, 0 },
+	{ 0x1c350044, 0x00000000, 0 },
+	{ 0x1c350048, 0x00000000, 0 },
+	{ 0x1c35004c, 0x00000000, 0 },
+	{ 0x1c350050, 0x00000000, 0 },
+	{ 0x1c350054, 0x00000000, 0 },
+	{ 0x1c350294, 0x00000006, 0 },
+	{ 0x1c350298, 0x00000064, 0 },
+	{ 0x1c35029c, 0x000001f4, 0 },
+	{ 0x1c3502a0, 0x00001388, 0 },
+	{ 0x1c3502a4, 0x00000000, 0 },
+	{ 0x1c3502a8, 0x0000005a, 0 },
+	{ 0x1c3502ac, 0x00000190, 0 },
+	{ 0x1c35000c, 0x00000c11, 0 },
+	{ 0x1c350058, 0x00000000, 0 },
+	{ 0x1c35005c, 0x00000000, 0 },
+	{ 0x1c350060, 0x00000000, 0 },
+	{ 0x1c350064, 0x3fffffff, 0 },
+	{ 0x1c350068, 0x00000000, 0 },
+	{ 0x1c350088, 0x00000000, 0 },
+	{ 0x1c35008c, 0x00000000, 0 },
+	{ 0x1c350090, 0x00000000, 0 },
+	{ 0x1c350094, 0x3fffffff, 0 },
+	{ 0x1c350098, 0x00000000, 0 },
+	{ 0x1c3500b8, 0x00000000, 0 },
+	{ 0x1c3500bc, 0x00000000, 0 },
+	{ 0x1c3500c0, 0x00000000, 0 },
+	{ 0x1c3500c4, 0x3fffffff, 0 },
+	{ 0x1c3500c8, 0x00000000, 0 },
+	{ 0x1c3500e8, 0x00000000, 0 },
+	{ 0x1c3500ec, 0x00000000, 0 },
+	{ 0x1c3500f0, 0x00000000, 0 },
+	{ 0x1c3500f4, 0x3fffffff, 0 },
+	{ 0x1c3500f8, 0x00000000, 0 },
+	{ 0x1c350118, 0x00000000, 0 },
+	{ 0x1c35011c, 0x00000000, 0 },
+	{ 0x1c350120, 0x00000000, 0 },
+	{ 0x1c350124, 0x3fffffff, 0 },
+	{ 0x1c350128, 0x00000000, 0 },
+	{ 0x1c350148, 0x00000000, 0 },
+	{ 0x1c35014c, 0x00000000, 0 },
+	{ 0x1c350150, 0x00000000, 0 },
+	{ 0x1c350154, 0x000003ff, 0 },
+	{ 0x1c350158, 0x00000000, 0 },
+	{ 0x1c350160, 0x00000000, 0 },
+	{ 0x1c350164, 0x00000000, 0 },
+	{ 0x1c350168, 0x00000000, 0 },
+	{ 0x1c35016c, 0x000003ff, 0 },
+	{ 0x1c350170, 0x00000000, 0 },
+	{ 0x1c350178, 0x00000000, 0 },
+	{ 0x1c35017c, 0x00000000, 0 },
+	{ 0x1c350180, 0x00000000, 0 },
+	{ 0x1c350184, 0x000003ff, 0 },
+	{ 0x1c350188, 0x00000000, 0 },
+	{ 0x1c350190, 0x00000000, 0 },
+	{ 0x1c350194, 0x00000000, 0 },
+	{ 0x1c350198, 0x00000000, 0 },
+	{ 0x1c35019c, 0x000003ff, 0 },
+	{ 0x1c3501a0, 0x00000000, 0 },
+	{ 0x1c330f00, 0x00000001, 0 },
+	{ 0x1c330c00, 0x00000001, 0 },
+	{ 0x1c330c04, 0x00000001, 0 },
+	{ 0x1c330c0c, 0x00000000, 0 },
+	{ 0x1c330d00, 0x00000001, 0 },
+	{ 0x1c330d04, 0x00000001, 0 },
+	{ 0x1c330d0c, 0x00000000, 0 },
+	{ 0x1c330100, 0x00000053, 0 },
+	{ 0x1c320094, 0x3fffffff, 1145 },
+	{ 0x1c32011c, 0x00000001, 0 },
+	{ 0x1c040004, 0x00005002, 0 },
+	{ 0x1c050004, 0x00005002, 0 },
+	{ 0x1c060004, 0x00005002, 0 },
+	{ 0x1c070004, 0x00005002, 0 },
+	{ 0x1c080004, 0x00005002, 0 },
+	{ 0x1c090004, 0x00005002, 0 },
+	{ 0x1c0a0004, 0x00005002, 0 },
+	{ 0x1c0b0004, 0x00005002, 0 },
+	{ 0x1c0c0004, 0x00005002, 0 },
+	{ 0x1c0d0004, 0x00005002, 0 },
+	{ 0x1c0e0004, 0x00005002, 0 },
+	{ 0x1c0f0004, 0x00005002, 0 },
+	{ 0x1c10131c, 0x00000200, 0 },
+	{ 0x1c10141c, 0x00000200, 0 },
+	{ 0x1c10151c, 0x00000200, 0 },
+	{ 0x1c10181c, 0x00000200, 0 },
+	{ 0x1c10191c, 0x00000200, 0 },
+	{ 0x1c101a1c, 0x00000200, 0 },
+	{ 0x1c10231c, 0x00000200, 0 },
+	{ 0x1c10241c, 0x00000200, 0 },
+	{ 0x1c10251c, 0x00000200, 0 },
+	{ 0x1c10281c, 0x00000200, 0 },
+	{ 0x1c10291c, 0x00000200, 0 },
+	{ 0x1c102a1c, 0x00000200, 0 },
+	{ 0x1c10321c, 0x00000200, 0 },
+	{ 0x1c10331c, 0x00000200, 0 },
+	{ 0x1c10341c, 0x00000200, 0 },
+	{ 0x1c10381c, 0x00000200, 0 },
+	{ 0x1c10391c, 0x00000200, 0 },
+	{ 0x1c103a1c, 0x00000200, 0 },
+	{ 0x1c337308, 0x000007fc, 22984 },
+	{ 0x1c33730c, 0x000007f8, 0 },
+	{ 0x1c330c38, 0x00000040, 0 },
+	{ 0x1c330c3c, 0x00000020, 0 },
+	{ 0x1c330d38, 0x00000040, 0 },
+	{ 0x1c330d3c, 0x00000020, 0 },
+	{ 0x1c330c08, 0x0000001a, 0 },
+	{ 0x1c330d08, 0x00000002, 0 },
+	{ 0x1c3500f0, 0x103ffffe, 0 },
+	{ 0x1c320410, 0x00000007, 764 },
+	{ 0x1c320430, 0x00000012, 0 },
+	{ 0x1c320444, 0x00003fff, 0 },
+	{ 0x1c320458, 0x00000003, 0 },
+	{ 0x1c3200b0, 0x00000001, 0 },
+	{ 0x1c320478, 0x0007ca00, 0 },
+	{ 0x1c32047c, 0x000015f0, 0 },
+	{ 0x1c320460, 0x00000001, 0 },
+	{ 0x1c320464, 0x00000001, 0 },
+	{ 0x1c32046c, 0x00000001, 0 },
+	{ 0x1c320470, 0x00000001, 0 },
+	{ 0x1c32048c, 0x06000200, 0 },
+	{ 0x1c320488, 0x00000000, 0 },
+	{ 0x1c320474, 0x0c001070, 0 },
+	{ 0x1c32042c, 0x0000001b, 0 },
+	{ 0x1c328804, 0x00000000, 0 },
+	{ 0x1c328800, 0x00000001, 0 },
+	{ 0x1c320418, 0x00000001, 0 },
+	{ 0x1c103100, 0x00000000, 0 },
+	{ 0x1c103600, 0x00000000, 0 },
+	{ 0x1c103200, 0x00000000, 0 },
+	{ 0x1c103300, 0x00000000, 0 },
+	{ 0x1c103400, 0x00000000, 0 },
+	{ 0x1c103500, 0x00000000, 0 },
+	{ 0x1c101000, 0x00000010, 0 },
+	{ 0x1c101004, 0x00000110, 0 },
+	{ 0x1c101008, 0x00003223, 0 },
+	{ 0x1c10100c, 0x00000000, 0 },
+	{ 0x1c101010, 0x00000200, 0 },
+	{ 0x1c101014, 0x00000000, 0 },
+	{ 0x1c103104, 0x00001334, 0 },
+	{ 0x1c103108, 0x00000005, 0 },
+	{ 0x1c10310c, 0x0000f0ae, 0 },
+	{ 0x1c103110, 0x00000002, 0 },
+	{ 0x1c103114, 0x00008600, 0 },
+	{ 0x1c103118, 0x00004000, 0 },
+	{ 0x1c103130, 0x00000103, 0 },
+	{ 0x1c103140, 0x00000001, 0 },
+	{ 0x1c103100, 0x00000003, 0 },
+	{ 0x1c103600, 0x00000003, 0 },
+	{ 0x1c103204, 0x00001334, 0 },
+	{ 0x1c103208, 0x0000000d, 0 },
+	{ 0x1c10320c, 0x000020ae, 0 },
+	{ 0x1c103210, 0x00000302, 0 },
+	{ 0x1c103214, 0x00008600, 0 },
+	{ 0x1c103218, 0x00004000, 0 },
+	{ 0x1c103230, 0x00000137, 0 },
+	{ 0x1c103234, 0x00000003, 0 },
+	{ 0x1c103240, 0x00000001, 0 },
+	{ 0x1c103250, 0x0000081a, 0 },
+	{ 0x1c103200, 0x00000001, 0 },
+	{ 0x1c103304, 0x00001334, 0 },
+	{ 0x1c103308, 0x0000000d, 0 },
+	{ 0x1c10330c, 0x000020ae, 0 },
+	{ 0x1c103310, 0x00000302, 0 },
+	{ 0x1c103314, 0x00008600, 0 },
+	{ 0x1c103318, 0x00004000, 0 },
+	{ 0x1c103330, 0x00000137, 0 },
+	{ 0x1c103334, 0x00000003, 0 },
+	{ 0x1c103340, 0x00000001, 0 },
+	{ 0x1c103350, 0x0000081a, 0 },
+	{ 0x1c103300, 0x00000001, 0 },
+	{ 0x1c103404, 0x00001334, 0 },
+	{ 0x1c103408, 0x0000000d, 0 },
+	{ 0x1c10340c, 0x000020ae, 0 },
+	{ 0x1c103410, 0x00000302, 0 },
+	{ 0x1c103414, 0x00008600, 0 },
+	{ 0x1c103418, 0x00004000, 0 },
+	{ 0x1c103430, 0x00000137, 0 },
+	{ 0x1c103434, 0x00000003, 0 },
+	{ 0x1c103440, 0x00000001, 0 },
+	{ 0x1c103450, 0x0000081a, 0 },
+	{ 0x1c103400, 0x00000001, 0 },
+	{ 0x1c103504, 0x00001334, 0 },
+	{ 0x1c103508, 0x0000000d, 0 },
+	{ 0x1c10350c, 0x000020ae, 0 },
+	{ 0x1c103510, 0x00000302, 0 },
+	{ 0x1c103514, 0x00008600, 0 },
+	{ 0x1c103518, 0x00004000, 0 },
+	{ 0x1c103530, 0x00000137, 0 },
+	{ 0x1c103534, 0x00000003, 0 },
+	{ 0x1c103540, 0x00000001, 0 },
+	{ 0x1c103550, 0x0000081a, 0 },
+	{ 0x1c103500, 0x00000001, 0 },
+	{ 0x1c0a0690, 0x00000000, 0 },
+	{ 0x1c0a0040, 0x000030ac, 0 },
+	{ 0x1c0a0044, 0x0c001070, 0 },
+	{ 0x1c0a0050, 0x0000b048, 0 },
+	{ 0x1c0a0054, 0x00011070, 0 },
+	{ 0x1c0a0600, 0x7fff7fff, 0 },
+	{ 0x1c0a000c, 0x0000000f, 0 },
+	{ 0x1c0a0004, 0x00005f01, 0 },
+	{ 0x1c0a0020, 0x00000000, 0 },
+	{ 0x1c0a0028, 0x00000000, 0 },
+	{ 0x1c0a0010, 0x01fff1ff, 0 },
+	{ 0x1c0a0018, 0x0000007e, 0 },
+	{ 0x1c33730c, 0x000007fc, 0 },
+	{ 0x1c3500f0, 0x103fffff, 0 },
+	{ 0x1c320430, 0x0000001a, 0 },
+	{ 0x1c320430, 0x0000001b, 0 },
+	{ 0x1c32008c, 0x00000001, 3784 },
+	{ 0x1c320404, 0x00000000, 0 },
+	{ 0x1c320424, 0x00000008, 0 },
+	{ 0x1c320438, 0x00000000, 0 },
+	{ 0x1c32044c, 0x00000000, 0 },
+	{ 0x1c320110, 0x00000000, 0 },
+	{ 0x1c350058, 0x00000000, 0 },
+	{ 0x1c350088, 0x00000000, 0 },
+	{ 0x1c3500b8, 0x00000000, 0 },
+	{ 0x1c3500e8, 0x00000001, 0 },
+	{ 0x1c350118, 0x00000000, 0 },
+	{ 0x1c3501ac, 0x00000000, 0 },
+	{ 0x1c331300, 0x00000000, 0 },
+	{ 0x1c333300, 0x00000000, 0 },
+	{ 0x1c335300, 0x00000000, 0 },
+	{ 0x1c337300, 0x00000004, 0 },
+	{ 0x1c339300, 0x00000000, 0 },
+};
+static const struct { uint32_t off, val; } ispfe_front_37[] = {
+	{ 0x37050, 0x00000000 },
+	{ 0x37400, 0x00000014 },
+	{ 0x37404, 0x00000030 },
+	{ 0x37500, 0x00000002 },
+	{ 0x37504, 0x00000000 },
+	{ 0x37508, 0x04000400 },
+	{ 0x3750c, 0x04000400 },
+	{ 0x37510, 0x04000400 },
+	{ 0x37514, 0x04000400 },
+	{ 0x37518, 0x04000400 },
+	{ 0x3751c, 0x04000400 },
+	{ 0x37520, 0x04000400 },
+	{ 0x37524, 0x04000400 },
+	{ 0x37528, 0x04000400 },
+	{ 0x3752c, 0x04000400 },
+	{ 0x37530, 0x04000400 },
+	{ 0x37534, 0x04000400 },
+	{ 0x37538, 0x04000400 },
+	{ 0x3753c, 0x04000400 },
+	{ 0x37540, 0x04000400 },
+	{ 0x37544, 0x04000400 },
+	{ 0x37548, 0x04000400 },
+	{ 0x3754c, 0x04000400 },
+	{ 0x37550, 0x04000400 },
+	{ 0x37554, 0x04000400 },
+	{ 0x37558, 0x00000100 },
+	{ 0x3755c, 0x00000100 },
+	{ 0x37560, 0x00000100 },
+	{ 0x37564, 0x00000100 },
+	{ 0x37568, 0x00000f00 },
+	{ 0x3756c, 0x0000000d },
+	{ 0x37570, 0x00000000 },
+	{ 0x37574, 0x00b40078 },
+	{ 0x37578, 0x06080300 },
+	{ 0x3757c, 0x00001000 },
+	{ 0x37580, 0x00001000 },
+	{ 0x37584, 0x00001000 },
+	{ 0x37588, 0x00001000 },
+	{ 0x3758c, 0x0000000c },
+	{ 0x37590, 0x00100008 },
+	{ 0x37594, 0x005000b4 },
+	{ 0x37598, 0x1d380dff },
+	{ 0x3759c, 0x01480100 },
+	{ 0x375a0, 0x00000000 },
+	{ 0x375a4, 0x00180006 },
+	{ 0x375a8, 0x00230023 },
+	{ 0x375ac, 0x008c0065 },
+	{ 0x375b0, 0x04000040 },
+	{ 0x375b4, 0x10000080 },
+	{ 0x375b8, 0x08080403 },
+	{ 0x375bc, 0x00100008 },
+	{ 0x375c0, 0x0028000a },
+	{ 0x375c4, 0x0eff062e },
+	{ 0x375c8, 0x0cd30eff },
+	{ 0x375cc, 0x1dff0bf0 },
+	{ 0x375d0, 0x19a71dff },
+	{ 0x375d4, 0x00000050 },
+	{ 0x375d8, 0x0493002d },
+	{ 0x375dc, 0x00000000 },
+	{ 0x375e0, 0x00c00700 },
+	{ 0x375e4, 0x005500aa },
+	{ 0x375e8, 0x00000000 },
+	{ 0x375ec, 0x00000000 },
+	{ 0x375f0, 0x00000000 },
+	{ 0x375f4, 0x00000000 },
+	{ 0x375f8, 0x00000000 },
+	{ 0x375fc, 0x00000000 },
+	{ 0x37600, 0x00000000 },
+	{ 0x37604, 0x00000000 },
+	{ 0x37608, 0x00000000 },
+	{ 0x3760c, 0x10700c00 },
+	{ 0x37700, 0x00000000 },
+	{ 0x37900, 0x00000000 },
+	{ 0x37904, 0x0c001070 },
+	{ 0x37b00, 0x00000000 },
+	{ 0x37008, 0x00000000 },
+	{ 0x3700c, 0x00000071 },
+	{ 0x37a00, 0x00000000 },
+	{ 0x37b04, 0x00000003 },
+	{ 0x37028, 0x00000001 },
+};
+
+#define FRONT_STRIDE            0x14c0u
+#define FRONT_HEIGHT            3072u
+#define FRONT_FRAME             (FRONT_STRIDE * FRONT_HEIGHT)
+#define FRONT_BUF               0x1080000u      /* the frame, rounded up */
+#define FRONT_SIDE              0x100000u       /* the second buffer (+0x110: its size not known: 1 MiB) */
+
+extern uint64_t kvtophys(vm_offset_t va);
+extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
+
+static void
+front_capture(void)
+{
+	const struct sensor *c = &sensors[1];
+	vm_offset_t fe = 0, csis = 0, frame = 0, side = 0, pmu = ml_io_map(0x15462000ULL, 0x1000);
+	uint64_t frame_pa, side_pa;
+	uint8_t one = 1, zero = 0, fc = 0;
+	unsigned changed = 0, first = ~0u;
+	unsigned on = 0;
+
+	if (!(rd(pmu + 0x484) & 1u)) {
+		printf("akita camera: capture: pd-ispfe is off: not trying\n");
+		return;
+	}
+	if (kmem_alloc_contig(kernel_map, &frame, FRONT_BUF, 0, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+	    kmem_alloc_contig(kernel_map, &side, FRONT_SIDE, 0, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("akita camera: capture: no contiguous memory for the frame\n");
+		return;
+	}
+	frame_pa = kvtophys(frame);
+	side_pa = kvtophys(side);
+	memset((void *)frame, 0xa5, FRONT_BUF);
+	memset((void *)side, 0xa5, FRONT_SIDE);
+	flush_dcache(frame, FRONT_BUF, FALSE);
+	flush_dcache(side, FRONT_SIDE, FALSE);
+	printf("akita camera: capture: frame buffer %#llx (%u bytes), second buffer %#llx\n", frame_pa, FRONT_BUF, side_pa);
+	fe = ml_io_map(ISPFE_FE_PHYS, 0x100000);
+	csis = ml_io_map(ISPFE_CSIS_PHYS, 0xd0000);
+
+	/* the front camera powered and set to its mode (not streaming) */
+	if (!i2c_bus_up(c->bus)) {
+		return;
+	}
+	for (on = 0; on < 4 && c->ldo[on] != 0; on++) {
+		if (!slg_ldo_on(c->ldo[on], c->mv[on])) {
+			goto down;
+		}
+	}
+	delay(1000);
+	pin_out(c->reset_bank, c->reset_pin, true);
+	mclk(c->clk, c->clk_bank, c->clk_pin, true);
+	delay(10000);
+	if (!imx712_mode(c)) {
+		goto down;
+	}
+	/* Android's setup of the PHY, CSIS link 6 and the front end */
+	for (unsigned i = 0; i < sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0]); i++) {
+		const struct ispfe_write *w = &ispfe_front_setup[i];
+		vm_offset_t va = w->pa >= ISPFE_FE_PHYS ? fe + (w->pa - ISPFE_FE_PHYS) : csis + (w->pa - ISPFE_CSIS_PHYS);
+
+		if (w->delay_us) {
+			delay(w->delay_us);
+		}
+		wr(va, w->val);
+	}
+	printf("akita camera: capture: the PHY, CSIS link 6 and the front end set up (%u writes)\n",
+	    (unsigned)(sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0])));
+	/* the frame's channel and the 0x37 block, as the PDMA's list would, with our buffers */
+	wr(fe + 0x20554, FRONT_STRIDE);
+	wr(fe + 0x20550, 4);
+	wr(fe + 0x20544, 0);
+	wr(fe + 0x20540, 1);
+	wr(fe + 0x205c0, (uint32_t)frame_pa);
+	wr(fe + 0x205c4, (uint32_t)(frame_pa >> 32));
+	wr(fe + 0x20508, 0x71);
+	wr(fe + 0x2050c, 0);
+	wr(fe + 0x20510, (uint32_t)side_pa);
+	wr(fe + 0x20514, (uint32_t)(side_pa >> 32));
+	for (unsigned i = 0; i < sizeof(ispfe_front_37) / sizeof(ispfe_front_37[0]); i++) {
+		wr(fe + ispfe_front_37[i].off, ispfe_front_37[i].val);
+	}
+	printf("akita camera: capture: channel 0 -> %#llx; stream on\n", frame_pa);
+	i2c_write16(c->bus, 0x1a, 0x0100, &one, 1);
+	wr(fe + 0x200a0, 1);                    /* (Android, 34 us after stream on: the front end's start) */
+	delay_for_interval(150, NSEC_PER_MSEC);
+	/* while streaming: CSIS link 6, the front end's top page, channel 0 (the words that are not 0) */
+	{
+		static const struct { const char *name; uint32_t pa, len; } dumps[] = {
+			{ "CSIS link 6", 0x1c0a0000, 0x100 }, { "CSIS link 6 +0x600", 0x1c0a0600, 0x100 },
+			{ "fe +0x20000", 0x1c320000, 0x100 }, { "fe +0x20400", 0x1c320400, 0x100 }, { "fe ch0", 0x1c320500, 0x100 },
+		};
+
+		for (unsigned d = 0; d < sizeof(dumps) / sizeof(dumps[0]); d++) {
+			vm_offset_t base = dumps[d].pa >= ISPFE_FE_PHYS ? fe + (dumps[d].pa - ISPFE_FE_PHYS) : csis + (dumps[d].pa - ISPFE_CSIS_PHYS);
+			char line[512];
+			int n = 0;
+
+			for (uint32_t o = 0; o < dumps[d].len && n < (int)sizeof(line) - 24; o += 4) {
+				uint32_t v = rd(base + o);
+
+				if (v) {
+					n += snprintf(line + n, sizeof(line) - (size_t)n, " +%02x:%x", o, v);
+				}
+			}
+			line[n] = '\0';
+			printf("akita camera: capture: streaming: %s:%s\n", dumps[d].name, line);
+		}
+	}
+	delay_for_interval(150, NSEC_PER_MSEC);
+	i2c_read16(c->bus, 0x1a, 0x0005, &fc, 1);
+	i2c_write16(c->bus, 0x1a, 0x0100, &zero, 1);
+	delay(50000);
+	printf("akita camera: capture: stream off (frame counter %u); channel 0: enable %#x addr %#x %#x, +0x37904 %#x\n", fc,
+	    rd(fe + 0x20540), rd(fe + 0x205c0), rd(fe + 0x205c4), rd(fe + 0x37904));
+	wr(fe + 0x20540, 0);
+	/* what came: the frame's bytes no longer 0xa5 */
+	flush_dcache(frame, FRONT_BUF, FALSE);
+	flush_dcache(side, FRONT_SIDE, FALSE);
+	for (unsigned i = 0; i < FRONT_BUF; i++) {
+		if (((uint8_t *)frame)[i] != 0xa5) {
+			changed++;
+			first = first == ~0u ? i : first;
+		}
+	}
+	printf("akita camera: capture: %u of %u bytes written (first at %#x); second buffer: %s\n", changed, FRONT_FRAME,
+	    first, ((uint8_t *)side)[0] != 0xa5 || ((uint8_t *)side)[4] != 0xa5 ? "written" : "untouched");
+	for (unsigned row = 0; row < FRONT_HEIGHT && changed; row += 1024) {
+		const uint8_t *b = (const uint8_t *)frame + row * FRONT_STRIDE + 2000;
+
+		printf("akita camera: capture: row %u: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", row, b[0], b[1], b[2], b[3],
+		    b[4], b[5], b[6], b[7], b[8], b[9]);
+	}
+	{
+		vm_offset_t s2 = ml_io_map(0x1c140000ULL, 0x3000);
+
+		printf("akita camera: capture: S2MPU S0 FAULT_STATUS %#x\n", rd(s2 + 0x2000));
+	}
+down:
+	mclk(c->clk, c->clk_bank, c->clk_pin, false);
+	pin_out(c->reset_bank, c->reset_pin, false);
+	while (on-- > 0) {
+		slg_ldo_off(c->ldo[on]);
+	}
+	printf("akita camera: capture: front camera powered down\n");
 }
 
 static void
@@ -900,6 +1409,10 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 		return;
 	}
 	front_eeprom();
+	if (camera_mode == 7) {
+		front_capture();
+		return;
+	}
 	if (camera_mode >= 3) {
 		for (int i = 0; i < 3; i++) {
 			sensor_probe(&sensors[i]);
