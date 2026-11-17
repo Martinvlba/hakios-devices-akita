@@ -13,7 +13,11 @@
 #   akita-usb.sh mux               -- clean usbmuxd restart, wait for lockdownd pairing
 #   akita-usb.sh recover [BUSID]   -- attach + mux (the usual "get me talking to the phone")
 #   akita-usb.sh klog [DIR]        -- pull the newest klogsave kernel log via afcclient (DIR default ~/akita/logs)
+#   akita-usb.sh android           -- stop usbmuxd so adb/fastboot can own the device (no more usbmux-vs-adb fight)
+#   akita-usb.sh ios               -- bring usbmux back when the phone is in iOS again
 # Needs: usbipd.exe (Windows), sudo for usbmuxd (no password is stored here), afcclient/idevicepair.
+# usbmuxd here is the HakiOS fork (~/akita/usbmuxd-hakios): bounded disconnect (no hangs), Apple
+# mode-switch disabled, built --without-preflight. Reverts to stock via the systemd drop-in.
 set -uo pipefail
 
 usbipd() { usbipd.exe "$@" 2>&1; }
@@ -86,11 +90,34 @@ cmd_klog() {
 	timeout 40 afcclient get "hakios-klog/$f" "$out" >/dev/null 2>&1 && echo "akita-usb: $out ($(wc -l <"$out") lines)" || echo "akita-usb: pull failed"
 }
 
+# Hand the device to adb/fastboot: fully stop usbmuxd so it cannot claim the Pixel while it is in
+# Android/fastboot mode (the old "usbmux breaks adb" conflict). Safe to run any time.
+cmd_android() {
+	echo "akita-usb: stopping usbmuxd so adb/fastboot can own the device"
+	sudo systemctl stop usbmuxd.socket usbmuxd.service 2>/dev/null
+	sudo pkill -x usbmuxd 2>/dev/null
+	sleep 1
+	echo "akita-usb: usbmuxd stopped ($(pgrep -xc usbmuxd) running); mode now: $(device_mode)"
+	echo "akita-usb: run 'akita-usb.sh ios' to bring usbmux back when the phone returns to iOS"
+}
+
+# Bring usbmux back (HakiOS fork) once the phone is in iOS again.
+cmd_ios() {
+	case "$(device_mode)" in
+		iOS|none-in-wsl) ;;
+		*) echo "akita-usb: device is in $(device_mode) mode, not iOS -- refusing to start usbmux (SE safety)"; return 1;;
+	esac
+	sudo systemctl start usbmuxd.socket 2>/dev/null
+	cmd_mux
+}
+
 case "${1:-status}" in
 	status) cmd_status ;;
 	attach) cmd_attach "${2:-}" ;;
 	mux) cmd_mux ;;
 	recover) cmd_attach "${2:-}" && cmd_mux ;;
 	klog) cmd_klog "${2:-}" ;;
+	android|adb|fastboot) cmd_android ;;
+	ios) cmd_ios ;;
 	*) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
