@@ -1,6 +1,7 @@
 # Pixel 8a (akita): status
 
-HakiOS (iOS 16.7.16 userland on XNU) on the Google Pixel 8a (Tensor G3, Mali-G715). Last update: 2026-11-15.
+HakiOS (iOS 16.6.1 userland of the iPhone 13 mini, arm64e, on XNU; 16.7.16 of the iPhone X before 2026-11-16) on the
+Google Pixel 8a (Tensor G3, Mali-G715). Last update: 2026-11-17.
 
 The phone starts iOS from its own storage (slot b) in about 45 seconds; Android stays on slot a. Everything below is
 what was seen on the one phone this port is developed on.
@@ -14,10 +15,10 @@ what was seen on the one phone this port is developed on.
 | Screen | 1080 x 2400 at 120 Hz, drawn by the GPU, applications' own Metal layers at the full 120 frames a second; brightness slider; screen off and on with the side button |
 | Touch and buttons | touch, power, volume |
 | GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it (a 600-draw WebGL aquarium demo at the page's full 60 frames a second); Maps draws its map (land, water, roads, labels) |
-| Bluetooth | on: Settings' switch, discoverable as "iPhone", finds nearby devices; earbuds pair and play (YouTube in Safari heard through Nothing Ear (3)); calls' audio, keyboards and LE accessories not tried yet |
+| Bluetooth | on (on 16.6.1 too, since 2026-11-17): Settings' switch, discoverable as "iPhone", finds nearby devices; earbuds pair and play (YouTube in Safari heard through Nothing Ear (3)); calls' audio, keyboards and LE accessories not tried yet |
 | Wi-Fi | joins WPA2 networks, DHCP, HTTPS; joined by the time the home screen is up; each phone has its own address |
-| Sound | both speakers |
-| Vibration | yes |
+| Sound | both speakers, with the iPhone 13 mini's own speaker processing (its speaker protection runs without live amplifier feedback for now) |
+| Vibration | yes: the system's taps and vibrations, Core Haptics patterns |
 | Flashlight | the LED works (Control Center's button not confirmed yet) |
 | Battery | charge level and charging shown |
 | Heat and speed | all 9 cores, speed scaled with load and temperature, cores idle when there is nothing to do |
@@ -49,7 +50,7 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | Battery life | poor: the phone never sleeps (no suspend yet); about 0.47 A with the screen off. Idle cores are powered down and the unused power domains turned off; Wi-Fi's PCIe link (no low-power state yet) is 0.06 A of it, where the rest goes is not found yet |
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
 | Microphone | reaches the kernel; iOS does not record from it yet |
-| Camera | both sensors answer; no picture yet |
+| Camera | all three sensors are powered and identified (main Sony IMX787, front and ultra-wide Sony IMX712); the front camera streams 30 frames a second from our kernel; no picture in iOS yet |
 
 ## Not yet
 
