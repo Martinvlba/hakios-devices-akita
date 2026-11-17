@@ -10,6 +10,11 @@
 # unless the command line names it, x=0 turns one off (wifi=0 pcie=0: a run without Wi-Fi). The command line keeps what
 # the loader reads (cpus, ufs, ufs_write, torch), the GPU's display arguments, the failsafes and the run's own.
 cd ~/akita/hackios-kernel; D=~/akita/darwin-flash; S=${LOGDIR:-$HOME/akita/logs/run}; mkdir -p $S
+# DARWIN (11-17): the iOS build the user space is made for MUST be the one on the phone's system volume -- since 11-16
+# that is 16.6.1 d16ap (arm64e; rebase-13mini.md). build.sh's own default, ../sysimage, is 16.7.16 for the iPhone X
+# (arm64): a run built against it gave an arm64 HakiosMetal no process loads (no Metal, mediaserverd aborting, no
+# sound) and injected code hooking 16.7.16's addresses. DARWIN=../sysimage for a run on a 16.7.16 system.
+export DARWIN=${DARWIN:-../sysimage-d16ap}
 # GPU=1, the default unless the job file is mali_draw_test's own: CoreAnimation on the Mali (METAL_PLUGIN=ca with the
 # iPhone 11's library from ~/ca-share), the panel at 120 Hz, zero-copy scan-out. GPU=0: iOS draws in software -- what the
 # Wi-Fi/USB runs of 11-09 did by accident, 10-25 fps, the big cores at 75 C (the tester's video of 23:12 was one).
