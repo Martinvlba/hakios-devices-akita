@@ -2621,9 +2621,10 @@ front_capture(void)
 
 			/* the PHY block (0x1c100000.., 0x1c101000.., D-PHYs 5/6 0x1c103000..0x1c103fff; Android 11-18 more-front.txt) */
 			{
-				static const uint32_t r[][2] = { { 0x1c100000, 0x200 }, { 0x1c101000, 0x200 }, { 0x1c103000, 0x1000 } };
+				static const uint32_t r[][2] = { { 0x1c100000, 0x1000 }, { 0x1c101000, 0x2000 }, { 0x1c103000, 0x1000 },
+					{ 0x1c104000, 0x1000 } };
 
-				for (unsigned k = 0; k < 3; k++) {
+				for (unsigned k = 0; k < sizeof(r) / sizeof(r[0]); k++) {
 					for (uint32_t o = 0; o < r[k][1]; o += 4) {
 						uint32_t v = rd(csis + (r[k][0] - ISPFE_CSIS_PHYS) + o);
 
