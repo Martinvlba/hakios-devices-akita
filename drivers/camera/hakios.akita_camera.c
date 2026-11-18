@@ -3245,6 +3245,42 @@ front_capture(void)
 		}
 	}
 	LSTEP("queue + stream-on next");
+	/* isp-fe's four bus-QoS (BTS) windows (DT exynos-bts bts_ispfe0..3, 0x26c48180 + 0x80 each): Android's bts driver
+	 * programs their "default" set at boot (exynos-btsopsgs.c set_ipbts: QoS override + value, outstanding-transaction
+	 * limits, urgency thresholds); our kernel never did. Dumped; camera_bts=1 applies Android's defaults first */
+	{
+		static const uint32_t bts_rmo[4] = { 0x26, 0xffff, 0xffff, 0xffff }, bts_wmo[4] = { 0x40, 0x40, 0x40, 0x08 };
+		vm_offset_t bts = ml_io_map(0x26c48000ULL, 0x1000);
+		unsigned apply = 0;
+
+		PE_parse_boot_argn("camera_bts", &apply, sizeof(apply));
+		for (unsigned pass = 0; pass < (apply ? 2u : 1u); pass++) {
+			for (unsigned i = 0; i < 4; i++) {
+				vm_offset_t b = bts + 0x180 + i * 0x80;
+
+				/* (only the words Android's driver reads: other offsets in the window are an SError -- it killed a boot and
+				 * Android, 11-18) */
+				printf("akita camera: capture: BTS ispfe%u %s: CON %#x TIMEOUT_R0 %#x TIMEOUT_W0 %#x RCON %#x RBLK %#x WCON %#x WBLK %#x\n",
+				    i, pass ? "set" : "as found", rd(b), rd(b + 0x8), rd(b + 0x10), rd(b + 0x20), rd(b + 0x24), rd(b + 0x40),
+				    rd(b + 0x44));
+				if (pass == 0 && apply) {
+					uint32_t v, th = 0x20u * 0x01010101u;
+
+					wr(b + 0x20, (rd(b + 0x20) & ~((1u << 8) | (0xfu << 12))) | (1u << 8) | (0xcu << 12));
+					wr(b + 0x40, (rd(b + 0x40) & ~((1u << 8) | (0xfu << 12))) | (1u << 8) | (0xcu << 12));
+					wr(b, rd(b) | 1u);                                      /* QoS on */
+					wr(b + 0x24, (rd(b + 0x24) & ~0xffffu) | bts_rmo[i]);
+					wr(b + 0x44, (rd(b + 0x44) & ~0xffffu) | bts_wmo[i]);
+					wr(b + 0x8, th);                                        /* urgency thresholds, 4 VCs */
+					wr(b + 0x10, th);
+					v = rd(b) & ~((1u << 23) | (1u << 7));
+					wr(b, v | (1u << 23));                                  /* qurgent on, ex off */
+					wr(b + 0x20, rd(b + 0x20) & ~1u);                       /* blocking off */
+					wr(b + 0x40, rd(b + 0x40) & ~1u);
+				}
+			}
+		}
+	}
 	/* fe +0x20100..0x2012c, the top's second group: Android streaming has +0x104 = +0x108 = 0x800, +0x118 = +0x11c = 1,
 	 * +0x124 0x75000 -- ours read +0x124 0x75800 (bit 11 more). camera_t104/t108/t124=V: V written there first */
 	{
