@@ -2922,14 +2922,63 @@ static const struct ispfe_write uw_setup[] = {
 	{ 0x1c040018, 0x0000007e, 0 },
 };
 
+/* (camera_uwfe=1) Android's 11-17 front-end writes for the ultra-wide (block 1, 0x20800; uw-writes.txt 39.714..39.728):
+ * replayed after the receiver's setup; block 1 started (0x200a0 2), then the stream */
+static const struct ispfe_write uw_fe_setup[] = {
+	{ 0x1c335308, 0x000007fc, 0 },
+	{ 0x1c33530c, 0x000007f8, 0 },
+	{ 0x1c330c30, 0x00000040, 0 },
+	{ 0x1c330c34, 0x00000020, 0 },
+	{ 0x1c330d30, 0x00000040, 0 },
+	{ 0x1c330d34, 0x00000020, 0 },
+	{ 0x1c330c38, 0x00000040, 0 },
+	{ 0x1c330c3c, 0x00000020, 0 },
+	{ 0x1c330d38, 0x00000040, 0 },
+	{ 0x1c330d3c, 0x00000020, 0 },
+	{ 0x1c330c08, 0x0000004a, 0 },
+	{ 0x1c330d08, 0x00000002, 0 },
+	{ 0x1c3500c0, 0x103ffffe, 0 },
+	{ 0x1c320810, 0x00000007, 0 },
+	{ 0x1c320830, 0x00000012, 0 },
+	{ 0x1c320844, 0x00003fff, 0 },
+	{ 0x1c320858, 0x00000003, 0 },
+	{ 0x1c320818, 0x00000001, 0 },
+	{ 0x1c3200b0, 0x00000002, 0 },
+	{ 0x1c320878, 0x000c44a0, 0 },
+	{ 0x1c32087c, 0x000014f8, 0 },
+	{ 0x1c320860, 0x00000001, 0 },
+	{ 0x1c320864, 0x00000001, 0 },
+	{ 0x1c32086c, 0x00000001, 0 },
+	{ 0x1c320870, 0x00000001, 0 },
+	{ 0x1c32088c, 0x00000200, 0 },
+	{ 0x1c320888, 0x00000000, 0 },
+	{ 0x1c320874, 0x0c301070, 0 },
+	{ 0x1c32082c, 0x0000001b, 0 },
+	{ 0x1c328404, 0x00000001, 0 },
+	{ 0x1c328400, 0x00000001, 0 },
+	{ 0x1c33530c, 0x000007fc, 0 },
+	{ 0x1c3500c0, 0x103fffff, 0 },
+	{ 0x1c320830, 0x0000001a, 0 },
+	{ 0x1c320830, 0x0000001b, 0 },
+	{ 0x1c32008c, 0x00000002, 0 },
+	{ 0x1c320804, 0x00000000, 0 },
+	{ 0x1c320824, 0x00000008, 0 },
+	{ 0x1c320838, 0x00000000, 0 },
+	{ 0x1c32084c, 0x00000000, 0 },
+	{ 0x1c320110, 0x00000000, 0 },
+	{ 0x1c331300, 0x00000000, 0 },
+	{ 0x1c333300, 0x00000000, 0 },
+	{ 0x1c335300, 0x00000004, 0 },
+};
+
 static void
 uw_receiver_test(void)
 {
 	const struct sensor *c = &sensors[2];
 	vm_offset_t csis = ml_io_map(ISPFE_CSIS_PHYS, 0xd0000), sysreg = ml_io_map(ISPFE_SYSREG_PHYS, 0x1000);
-	vm_offset_t pmu = ml_io_map(0x15462000ULL, 0x2000);
+	vm_offset_t pmu = ml_io_map(0x15462000ULL, 0x2000), fe = 0;
 	uint8_t one = 1, zero = 0, fc = 0;
-	unsigned on = 0;
+	unsigned on = 0, uwfe = 0;
 
 	if (!(rd(pmu + 0x484) & 1u)) {
 		printf("akita camera: uw: pd-ispfe is off: not trying\n");
@@ -2974,12 +3023,55 @@ uw_receiver_test(void)
 		wr(csis + (uw_setup[i].pa - ISPFE_CSIS_PHYS), uw_setup[i].val);
 	}
 	wr(sysreg + 0x500, rd(sysreg + 0x500) | 3u);
+	PE_parse_boot_argn("camera_uwfe", &uwfe, sizeof(uwfe));
+	if (uwfe) {
+		fe = ml_io_map(ISPFE_FE_PHYS, 0x100000);
+		wr(fe + 0x20008, 0xf);          /* (the top, as the front's setup has it) */
+		wr(fe + 0x20010, 1);
+		wr(fe + 0x20094, 0x3fffffff);
+		wr(fe + 0x2011c, 1);
+		for (unsigned i = 0; i < sizeof(uw_fe_setup) / sizeof(uw_fe_setup[0]); i++) {
+			wr(fe + (uw_fe_setup[i].pa - ISPFE_FE_PHYS), uw_fe_setup[i].val);
+		}
+		wr(fe + 0x200a0, 2);
+		printf("akita camera: uw: block 1 set up (%u writes) and started\n", (unsigned)(sizeof(uw_fe_setup) / sizeof(uw_fe_setup[0])));
+	}
 	delay_for_interval(100, NSEC_PER_MSEC);
 	printf("akita camera: uw: before the stream: D-PHY 0 clock +1e0: %x %x %x %x; lane 0 +c0: %x %x +e0: %x %x %x %x\n",
 	    rd(csis + 0xc13e0 - 0x100), rd(csis + 0xc13e4 - 0x100), rd(csis + 0xc13e8 - 0x100), rd(csis + 0xc13ec - 0x100),
 	    rd(csis + 0xc13c0), rd(csis + 0xc13c4), rd(csis + 0xc13e0), rd(csis + 0xc13e4), rd(csis + 0xc13e8), rd(csis + 0xc13ec));
 	i2c_write16(c->bus, 0x1a, 0x0100, &one, 1);
-	delay_for_interval(300, NSEC_PER_MSEC);
+	if (fe) {
+		uint32_t lst[8] = { 0 };
+		unsigned said = 0;
+
+		for (unsigned ms = 0; ms < 300; ms++) {
+			uint32_t v[8] = { rd(fe + 0x2008c), rd(fe + 0x20820), rd(fe + 0x20824), rd(fe + 0x20828), rd(fe + 0x20838),
+				rd(fe + 0x208ac), rd(fe + 0x2089c), rd(fe + 0x20b08) };
+
+			if ((ms == 0 || memcmp(v, lst, sizeof(v))) && said < 30) {
+				printf("akita camera: uw: block 1 %3u ms: 2008c:%x 20820:%x 20824:%x 20828:%x 20838:%x 208ac:%x 2089c:%x 20b08:%x\n",
+				    ms, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+				said++;
+			}
+			memcpy(lst, v, sizeof(v));
+			if (v[2]) {
+				wr(fe + 0x2008c, 2);
+				wr(fe + 0x20824, v[2]);
+				wr(fe + 0x20838, v[4]);
+			}
+			delay(1000);
+		}
+	} else {
+		delay_for_interval(300, NSEC_PER_MSEC);
+	}
+	if (fe) {
+		/* pdma-wrap (0x1c395000): the words Android reads each frame (always 0 there) */
+		vm_offset_t pw = ml_io_map(0x1c395000ULL, 0x1000);
+
+		printf("akita camera: uw: pdma-wrap +23c %#x +33c %#x +43c %#x +53c %#x\n", rd(pw + 0x23c), rd(pw + 0x33c), rd(pw + 0x43c),
+		    rd(pw + 0x53c));
+	}
 	i2c_read16(c->bus, 0x1a, 0x0005, &fc, 1);
 	{
 		char line[400];
