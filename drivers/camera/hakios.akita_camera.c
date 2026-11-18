@@ -2303,6 +2303,18 @@ front_capture(void)
 
 		printf("akita camera: capture: CSI PHY isolation bypass: %#x (SMC %#llx)\n", rd(pmu + 0x1ebc), r);
 	}
+	{
+		unsigned febc = 0;      /* camera_febc=1: Android's nine PRIV_REG writes of 0 to PMU 0x1546febc (the +0xc000 alias of
+		                         * 0x15463ebc, one per D-PHY node's power_on, 11-18 smc-fresh-front.txt) */
+
+		PE_parse_boot_argn("camera_febc", &febc, sizeof(febc));
+		for (unsigned k = 0; febc && k < 9; k++) {
+			cam_smc(SMC_PRIV_REG, 0x1546febcULL, PRIV_REG_WRITE, 0);
+		}
+		if (febc) {
+			printf("akita camera: capture: 9x 0x1546febc <- 0; 0x15463ebc now %#x\n", rd(pmu + 0x1ebc));
+		}
+	}
 	/* ... and D-PHYs 5 and 6 (0x1c103100: the clock lane and 4 data lanes; 0x1c103600) out of reset: SYSREG_ISPFE +0x500
 	 * (device tree system-controller@1C020500 "samsung,exynos-csis", each dcphy node's "reset" = its bit). Android 11-17:
 	 * 0x60 while the front camera streams, 0x2 for the main one (D-PHY 1) */
@@ -2606,6 +2618,9 @@ front_capture(void)
 		}
 		/* the D-PHYs' state words before the stream (Android, a working stream: clock lane +0x1e0.. 1 1 0xe 0x11, an idle
 		 * PHY 1 1 0xe 0x40; ours while streaming: 0x20 2 0xd 0x1f) */
+		printf("akita camera: capture: before the stream: PLL_SHARED0..3 CON3 %#x %#x %#x %#x (Android a15b0400 a0e30300 a0820400 "
+		    "a06c0400); ISPFE_NOC mux %#x div %#x\n", rd(cmu_top + 0x14c), rd(cmu_top + 0x18c), rd(cmu_top + 0x1cc),
+		    rd(cmu_top + 0x20c), rd(cmu_top + 0x10bc), rd(cmu_top + 0x18b4));
 		printf("akita camera: capture: before the stream: CIS_CLK1 mux %#x div %#x gate %#x DFTMUX(0x3008) %#x (Android 0 0 0x200000 2); "
 		    "0x3004 %#x 0x300c %#x\n", rd(cmu_top + 0x1014), rd(cmu_top + 0x1814), rd(cmu_top + 0x203c), rd(cmu_top + 0x3008),
 		    rd(cmu_top + 0x3004), rd(cmu_top + 0x300c));
