@@ -6397,7 +6397,38 @@ fd_session(void)
 			wr(fe + 0x20110, 0);
 		}
 		if (!fd_is_open || fd_ms_since(fd_last_read) > 5000) {
-			break;
+			/*
+			 * Nobody wants frames: the SENSOR to standby and nothing else, the front end left as it is, and
+			 * this thread asleep until a read wants frames again; then the sensor streams on. A whole stop
+			 * and a second start in one boot does not work: Android's open, replayed, wants the front end at
+			 * its reset ("the commit's status bit never came" otherwise, 11-18), and the power cycle that
+			 * would give it one killed the phone after a session (private notes: fragile zones). The price:
+			 * the sensor's supplies, its clock and the front end's stay on once a camera was used.
+			 */
+			uint8_t v = 0;
+
+			i2c_write16(c->bus, 0x1a, 0x0100, &v, 1);
+			lck_mtx_lock(&fd_lock);
+			fd_streaming = false;
+			while (fd_readers != 0) {
+				(void)msleep(&fd_readers, &fd_lock, PZERO, "akita-camera-drain", NULL);
+			}
+			fd_buf[0].seq = fd_buf[1].seq = 0;
+			printf("akita camera: device: the front camera in standby (%s): %u frames, %u starts, %u errors\n",
+			    !fd_is_open ? "closed" : "nobody reads", ends, starts, errs);
+			while (!fd_wanted) {
+				(void)msleep(&fd_wanted, &fd_lock, PZERO, "akita-camera-standby", NULL);
+			}
+			fd_wanted = false;
+			fd_streaming = true;
+			lck_mtx_unlock(&fd_lock);
+			newest = -1;
+			marked[0] = marked[1] = false;
+			fd_last_read = mach_absolute_time();
+			v = 1;
+			i2c_write16(c->bus, 0x1a, 0x0100, &v, 1);
+			printf("akita camera: device: the front camera streams again\n");
+			continue;
 		}
 		delay(700);
 	}
@@ -6623,7 +6654,11 @@ fd_serve(void)
 			(void)msleep(&fd_wanted, &fd_lock, PZERO, "akita-camera-idle", NULL);
 		}
 		lck_mtx_unlock(&fd_lock);
-		if (!fd_session()) {
+		/* (a session that started does not come back: it sleeps with the sensor in standby when nobody reads) */
+		if (fd_session()) {
+			continue;
+		}
+		{
 			lck_mtx_lock(&fd_lock);
 			fd_broken = true;
 			fd_wanted = false;
