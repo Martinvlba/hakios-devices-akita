@@ -56,6 +56,8 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/fcntl.h>
+#include <sys/vnode.h>
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -2610,6 +2612,48 @@ pdma_patch_tables(void)
 	    (unsigned)(sizeof(front_pdma_tab_idx) / sizeof(front_pdma_tab_idx[0])));
 }
 
+/* a front frame (the packed RAW10 as the front end wrote it, FRONT_STRIDE x FRONT_HEIGHT bytes) into a file AFC serves:
+ * /var/mobile/Media/hakios-klog/front.raw (tools/usbmux-pull-frame.py fetches it and makes a picture). Copied through a
+ * 1 MiB kernel buffer; up to 30 s waited for the data volume */
+static void
+frame_save(vm_offset_t frame)
+{
+	static const char path[] = "/private/var/mobile/Media/hakios-klog/front.raw";
+	vfs_context_t context = vfs_context_kernel();
+	vnode_t vnode = NULLVP;
+	uint8_t *buf;
+	int error = ENOENT, left = 0;
+	size_t total = (size_t)FRONT_STRIDE * FRONT_HEIGHT, done = 0;
+
+	for (int i = 0; i < 30 && error != 0; i++) {
+		error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vnode, context);
+		if (error != 0) {
+			delay_for_interval(1000, NSEC_PER_MSEC);
+		}
+	}
+	if (error != 0) {
+		printf("akita camera: frame: %s could not be created (error %d)\n", path, error);
+		return;
+	}
+	buf = kalloc_data(0x100000, Z_WAITOK);
+	while (buf != NULL && done < total && error == 0) {
+		size_t n = total - done < 0x100000 ? total - done : 0x100000;
+
+		memcpy(buf, (const void *)(frame + done), n);
+		error = vn_rdwr(UIO_WRITE, vnode, (caddr_t)buf, (int)n, (off_t)done, UIO_SYSSPACE, 0, vfs_context_ucred(context), &left,
+		    vfs_context_proc(context));
+		if (left != 0) {
+			error = error ? error : EIO;
+		}
+		done += n;
+	}
+	if (buf != NULL) {
+		kfree_data(buf, 0x100000);
+	}
+	vnode_close(vnode, FWRITE, context);
+	printf("akita camera: frame: %zu of %zu bytes in %s (error %d)\n", done, total, path, error);
+}
+
 /* a thumbnail of a front frame in the log: every 40th pixel (one Bayer colour) of every 40th row, the top 8 of its 10 bits
  * (packed RAW10: 4 pixels' high bytes, then one byte of low bits), 105 x 77 */
 static void
@@ -3633,6 +3677,7 @@ front_capture(void)
 	    first, ((uint8_t *)side)[0] != 0xa5 || ((uint8_t *)side)[4] != 0xa5 ? "written" : "untouched");
 	if (changed) {
 		frame_thumb(frame);
+		frame_save(frame);
 	}
 	for (unsigned row = 0; row < FRONT_HEIGHT && changed; row += 1024) {
 		const uint8_t *b = (const uint8_t *)frame + row * FRONT_STRIDE + 2000;
@@ -4609,6 +4654,7 @@ front_replay_capture(void)
 	}
 	if (changed) {
 		frame_thumb(frame);
+		frame_save(frame);
 	}
 	for (unsigned row = 0; row < FRONT_HEIGHT && changed; row += 1024) {
 		const uint8_t *b = (const uint8_t *)frame + row * FRONT_STRIDE + 2000;
