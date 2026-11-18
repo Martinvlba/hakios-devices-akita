@@ -6133,6 +6133,8 @@ static const struct replay_ev main_replay[] = {
  */
 #define FD_FRAME_B_IOVA         0xea000000u     /* the second buffer's address in the lists (17 sections, clear of Android's) */
 #define FD_FRAME_B_OFF          0x2200000u      /* ... in the camera's low memory (camera_lowpa + 34 MiB) */
+#define FD_QUEUE_OFF            0x8000u         /* the PDMA's queue in its megabyte */
+#define FD_QUEUE_BYTES          1000u           /* ... a ring of 1000 bytes (fe+0x9000c), entries of 16 */
 #define FD_MARK                 0x5a5aa5a5u
 /* (the mark sits in the LAST line: the first is written before a poll sees the frame's start) */
 #define FD_MARK_OFF             ((size_t)FRONT_STRIDE * (FRONT_HEIGHT - 1))
@@ -6201,7 +6203,9 @@ fd_session(void)
 	uint32_t mux, div;
 	unsigned on = 0, starts = 0, ends = 0, errs = 0;
 	int newest = -1;
-	bool marked[2] = { false, false }, ok = false;
+	bool marked[2] = { false, false }, ok = false, stopping = false, stop_sent = false;
+	uint64_t stop_time = 0;
+	unsigned stop_after = 0, queued = 1;
 
 	if (!(rd(pmu + 0x484) & 1u)) {
 		printf("akita camera: device: pd-ispfe is off\n");
@@ -6222,7 +6226,16 @@ fd_session(void)
 	cam_fill(pdma_scratch, 0, 0x400000);
 	cam_fill(side, 0, FRONT_SIDE);
 	{
-		volatile uint32_t *q = (volatile uint32_t *)pdma_mem, *lb = (volatile uint32_t *)(pdma_mem + 0x4000);
+		/*
+		 * (11-18/19) THE QUEUE IS A RING OF 1000 BYTES (fe+0x9000c = 0x3e8), its entries 16 bytes, the write
+		 * pointer in bytes: Android's goes 0, 0x10 ... 0x3e0, 0x8, 0x18 ... 0x3d8, 0 (ispfe-front-writes.txt) --
+		 * every 63rd entry lies across the ring's end. Here 256 entries were filled and the pointer wrapped at
+		 * 0xff0, then 1000 entries and at 0x3e80: either way the front end stopped ending frames when the
+		 * pointer went back to 0 (after 256 frames, after 1000). Now as Android: each entry is written at the
+		 * pointer, across the end where it falls, just before the pointer moves on (fd_queue()). The ring has
+		 * its own place (FD_QUEUE_OFF, clear of the lists at 0x1000/0x4000 and the tables at 0x10000).
+		 */
+		volatile uint32_t *q = (volatile uint32_t *)(pdma_mem + FD_QUEUE_OFF), *lb = (volatile uint32_t *)(pdma_mem + 0x4000);
 
 		cam_copy(pdma_mem + 0x1000, front_pdma_list, sizeof(front_pdma_list));
 		pdma_patch_tables();
@@ -6232,12 +6245,13 @@ fd_session(void)
 			return false;
 		}
 		lb[12] = FD_FRAME_B_IOVA;
-		for (unsigned e = 0; e < 256; e++) {
+		for (unsigned e = 0; e < 2; e++) {      /* (the first two, where the open's own two pointer writes find them) */
 			q[e * 4] = 0xc003;
 			q[e * 4 + 1] = PDMA_IOVA + ((e & 1) ? 0x4000 : 0x1000);
 			q[e * 4 + 2] = 0;
 			q[e * 4 + 3] = sizeof(front_pdma_list);
 		}
+		queued = 1;
 		__asm__ volatile ("dsb sy" ::: "memory");
 	}
 	mux = rd(cmu_top + CMU_TOP_ISPFE_MUX);
@@ -6303,7 +6317,7 @@ fd_session(void)
 			continue;
 		}
 		if (pa == 0x1c390004) {
-			val = PDMA_IOVA;
+			val = PDMA_IOVA + FD_QUEUE_OFF;
 		}
 		if (pa == 0x1c32008c) {         /* (Android's handler acknowledges the commit here: wait for it as it does) */
 			for (int w = 0; w < 200 && !(rd(fe + 0x20424) & 8u); w++) {
@@ -6331,6 +6345,7 @@ fd_session(void)
 	fd_buf[0].seq = fd_buf[1].seq = 0;
 	lck_mtx_unlock(&fd_lock);
 	ok = true;
+	fd_last_read = mach_absolute_time();    /* (the start took its time: five seconds for the first read from here) */
 	printf("akita camera: device: the front camera streams for Darwin\n");
 	for (;;) {
 		uint32_t v424 = rd(fe + 0x20424), v438 = rd(fe + 0x20438);
@@ -6351,6 +6366,13 @@ fd_session(void)
 				ends++;
 				wr(fe + 0x500e8, 3);
 				wr(fe + 0x37300, 4);
+				if (stopping && !stop_sent && ends >= stop_after) {     /* (the gap after a frame: the stop) */
+					uint8_t v = 0;
+
+					i2c_write16(c->bus, 0x1a, 0x0100, &v, 1);
+					stop_sent = true;
+					stop_time = mach_absolute_time();
+				}
 				if (done >= 0) {
 					lck_mtx_lock(&fd_lock);
 					fd_buf[done].seq = ++fd_seq;
@@ -6386,7 +6408,20 @@ fd_session(void)
 						marked[x] = true;
 					}
 				}
-				wr(fe + 0x90010, (rd(fe + 0x90010) + 0x10) & 0xff0u);
+				{
+					/* entry number `queued` at its place in the ring, then the pointer past it */
+					uint32_t entry[4] = { 0xc003, PDMA_IOVA + ((queued & 1) ? 0x4000 : 0x1000), 0,
+						              sizeof(front_pdma_list) };
+					uint32_t at = (queued * 16u) % FD_QUEUE_BYTES;
+					volatile uint8_t *ring = (volatile uint8_t *)(pdma_mem + FD_QUEUE_OFF);
+
+					for (unsigned i = 0; i < 16; i++) {
+						ring[(at + i) % FD_QUEUE_BYTES] = ((const uint8_t *)entry)[i];
+					}
+					__asm__ volatile ("dsb sy" ::: "memory");
+					queued++;
+					wr(fe + 0x90010, (queued * 16u) % FD_QUEUE_BYTES);
+				}
 			}
 			errs += v438 != 0;
 			wr(fe + 0x2008c, 1);
@@ -6396,7 +6431,7 @@ fd_session(void)
 			wr(fe + 0x2044c, 0);
 			wr(fe + 0x20110, 0);
 		}
-		if (!fd_is_open || fd_ms_since(fd_last_read) > 5000) {
+		if (!stopping && (!fd_is_open || fd_ms_since(fd_last_read) > 5000)) {
 			/*
 			 * Nobody wants frames: the SENSOR to standby and nothing else, the front end left as it is, and
 			 * this thread asleep until a read wants frames again; then the sensor streams on. A whole stop
@@ -6404,10 +6439,34 @@ fd_session(void)
 			 * its reset ("the commit's status bit never came" otherwise, 11-18), and the power cycle that
 			 * would give it one killed the phone after a session (private notes: fragile zones). The price:
 			 * the sensor's supplies, its clock and the front end's stay on once a camera was used.
+			 *
+			 * WHEN the sensor is told matters: it stops where it is, and a frame cut short never ends for the
+			 * front end -- not in 300 ms of being served -- and after it no frame ends ever again (starts
+			 * without ends; 11-18 night, four runs). Only a stop that fell between two frames worked. So the
+			 * stop is put there: the frames made long (6315 lines: 30 ms and more of nothing after the
+			 * picture's last line), two more frame ends awaited, and the sensor told at the second one's end
+			 * (below, where a frame's end is handled).
 			 */
+			stopping = true;
+			stop_sent = false;
+			stop_time = mach_absolute_time();
+			stop_after = ends + 2;
+			if (fd_fll < 6000) {
+				fd_fll = 6315;
+				fd_exposure(c->bus, fd_lines, fd_gain64, fd_fll);
+			}
+		}
+		if (stopping && !stop_sent && fd_ms_since(stop_time) > 700) {   /* (no frame's end came: told anyway) */
 			uint8_t v = 0;
 
 			i2c_write16(c->bus, 0x1a, 0x0100, &v, 1);
+			stop_sent = true;
+			stop_time = mach_absolute_time();
+			printf("akita camera: device: no frame ended in 700 ms: the sensor to standby where it is\n");
+		}
+		if (stopping && stop_sent && fd_ms_since(stop_time) > 20) {
+			uint8_t v = 1;
+
 			lck_mtx_lock(&fd_lock);
 			fd_streaming = false;
 			while (fd_readers != 0) {
@@ -6424,8 +6483,8 @@ fd_session(void)
 			lck_mtx_unlock(&fd_lock);
 			newest = -1;
 			marked[0] = marked[1] = false;
+			stopping = false;
 			fd_last_read = mach_absolute_time();
-			v = 1;
 			i2c_write16(c->bus, 0x1a, 0x0100, &v, 1);
 			printf("akita camera: device: the front camera streams again\n");
 			continue;
