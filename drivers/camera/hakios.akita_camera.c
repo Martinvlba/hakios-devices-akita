@@ -2372,6 +2372,11 @@ front_capture(void)
 			wr(csis + 0x60040, dt);
 			printf("akita camera: capture: CSIS link 6 +0x40 = %#x\n", rd(csis + 0x60040));
 		}
+		dt = 0xffffffffu;       /* camera_csis50=V: CSIS link 6 channel 1's config (+0x50, Android 0xb048: DT 0x12 embedded data) */
+		if (PE_parse_boot_argn("camera_csis50", &dt, sizeof(dt)) && dt != 0xffffffffu) {
+			wr(csis + 0x60050, dt);
+			printf("akita camera: capture: CSIS link 6 +0x50 = %#x\n", rd(csis + 0x60050));
+		}
 	}
 	if (phy_late) {
 		/* (Android 11-17 ultra-wide trace: the lanes configured and enabled, CSIS set up, and only then the D-PHYs'
