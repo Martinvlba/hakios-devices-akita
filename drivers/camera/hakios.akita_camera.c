@@ -6221,13 +6221,15 @@ cam_capture(const struct cam_cfg *g)
 	unsigned frame_bytes = g->stride * g->height, frame_mb = (frame_bytes + 0xfffffu) >> 20, first_block = 0, evsay = 0, stopat = 0, feclk = 1, nack = 99, acks_said = 0, blind = 0, kick = 1, gates = 0, s2off = 1, bus_khz = 233000;
 	uint32_t bus_was[3] = { 0, 0, 0 };
 	uint64_t frame_pa, side_pa;
-	uint32_t mux, div;
+	uint32_t mux, div, blocks;
 
 	if (!(rd(pmu + 0x484) & 1u)) {
 		printf("akita camera: %s: pd-ispfe is off\n", g->name);
 		return;
 	}
-	while (!(g->blocks & (1u << first_block))) {
+	blocks = g->blocks;
+	PE_parse_boot_argn("camera_blocks", &blocks, sizeof(blocks));   /* (a test: only these of the camera's blocks started) */
+	while (!(blocks & (1u << first_block))) {
 		first_block++;
 	}
 	PE_parse_boot_argn("camera_lowpa", &low, sizeof(low));
@@ -6359,6 +6361,31 @@ cam_capture(const struct cam_cfg *g)
 		printf("akita camera: %s: CMU_ISPFE gates %s: 0x2000 %#x 0x2154 %#x\n", g->name, gates ? "forced on" : "left automatic",
 		    rd(cmu_fe + 0x2000), rd(cmu_fe + 0x2154));
 	}
+	/* the 0x50000 unit's one-time setup (control words, timings, every context's masks: ~70 writes). Android does it at
+	 * the first camera open after its HAL starts and not again -- it is in the front camera's trace and NOT in the main
+	 * camera's, which was opened later in the same session. Without it that unit's registers cannot be touched (reads and
+	 * writes hung the phone) and the main camera's frame stalled 2.4 ms in. Taken from front_replay[]: its writes to
+	 * fe+0x50000..0x502ff before the first interrupt-enable (0x500f0). camera_lmpinit=1: done. OFF by default: it did not
+	 * make those registers safe (the hang stayed), and with it the PDMA stopped fetching after its third entry */
+	{
+		unsigned lmpinit = 0, n = 0;
+
+		PE_parse_boot_argn("camera_lmpinit", &lmpinit, sizeof(lmpinit));
+		for (unsigned i = 0; lmpinit && g->ev != front_replay && i < sizeof(front_replay) / sizeof(front_replay[0]); i++) {
+			const struct replay_ev *e = &front_replay[i];
+
+			if (e->kind != 0 || e->addr < 0x1c350000 || e->addr >= 0x1c350300) {
+				continue;
+			}
+			if (e->addr == 0x1c3500f0) {
+				break;
+			}
+			wr(fe + (e->addr - ISPFE_FE_PHYS), e->val);
+			delay(20);
+			n++;
+		}
+		printf("akita camera: %s: the 0x50000 unit's setup: %u writes; fe +0x5000c %#x\n", g->name, n, rd(fe + 0x5000c));
+	}
 	for (unsigned i = 0; i < g->n_ev; i++) {
 		const struct replay_ev *e = &g->ev[i];
 		uint32_t pa = e->addr, val = e->val;
@@ -6385,6 +6412,9 @@ cam_capture(const struct cam_cfg *g)
 		}
 		if (pa == 0x1c390004) {
 			val = PDMA_IOVA;
+		}
+		if (pa == 0x1c3200a0 || pa == 0x1c32008c) {
+			val &= blocks;
 		}
 		if (pa == 0x1c320000 + 0x8c) {          /* (Android's handler acknowledges the commit here: wait for it as it does) */
 			int w = 0;
@@ -6426,7 +6456,7 @@ cam_capture(const struct cam_cfg *g)
 				vm_offset_t r = fe + 0x20400 + b * 0x400;
 				uint32_t st, er;
 
-				if (!(g->blocks & (1u << b))) {
+				if (!(blocks & (1u << b))) {
 					continue;
 				}
 				st = rd(r + 0x24);
@@ -6454,7 +6484,7 @@ cam_capture(const struct cam_cfg *g)
 					for (unsigned bb = 0; bb < 15; bb++) {
 						vm_offset_t q = fe + 0x20400 + bb * 0x400;
 
-						if (g->blocks & (1u << bb)) {
+						if (blocks & (1u << bb)) {
 							printf("akita camera: %s: block %u: +20 %#x +24 %#x +28 %#x +38(read before) %#x +3c %#x +a0 %#x +ac %#x +bc %#x"
 							    " +c0 %#x +c4 %#x; channel +100 %#x +108 %#x +140 %#x +1b0 %#x +1b4 %#x +1c0 %#x +308 %#x\n", g->name, bb,
 							    rd(q + 0x20), rd(q + 0x24), rd(q + 0x28), bb == b ? er : rd(q + 0x38), rd(q + 0x3c), rd(q + 0xa0),
@@ -6474,6 +6504,9 @@ cam_capture(const struct cam_cfg *g)
 			/* camera_blind=1: written. OFF by default: with them AND a PDMA entry queued per frame the main camera's second
 			 * frame is really processed -- and every CPU hangs a few ms into it (watchdog reset), cause not found yet */
 			for (unsigned i = 0; i + 1 < 8 && g->ackw[i] != 0 && blind; i += 2) {
+				if (!(blind & (1u << (i / 2)))) {       /* camera_blind is a mask of the pairs: 1 the first, 2, 4 */
+					continue;
+				}
 				wr(fe + g->ackw[i], g->ackw[i + 1]);
 			}
 		}
