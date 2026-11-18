@@ -3,3 +3,5 @@
 boot-info/*
 !boot-info/first-boot-*.txt
 __pycache__/
+# every private working note (handoff, todo lists, plans, crash catalogue): never in git
+private-untracked/
