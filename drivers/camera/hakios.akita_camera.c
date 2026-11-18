@@ -2862,6 +2862,25 @@ uw_receiver_test(void)
 		printf("akita camera: uw: pd-ispfe is off: not trying\n");
 		return;
 	}
+	{
+		/* S2MPG15 LDO2S "L2S_PLL_MIPI_UFS" (the MIPI PHYs' PLL supply; Android 850 mV: 300 mV + 12.5 mV x code -> 0x2c)
+		 * and L12S (CAMIO, 700 mV + 25 mV x code; Android 1.8 V -> 0x2c) as found; camera_l2s=CODE sets L2S's code */
+		uint8_t l2 = 0, l12 = 0;
+		unsigned set = 0;
+
+		spmic(false, S2MPG15_PM, 0x30, &l2);
+		spmic(false, S2MPG15_PM, S2MPG15_L12S_CTRL, &l12);
+		printf("akita camera: uw: L2S_CTRL %#x (%u mV if 6-bit) L12S_CTRL %#x (%u mV)\n", l2, 300 + (l2 & 0x3f) * 25 / 2,
+		    l12, 700 + (l12 & 0x3f) * 25);
+		if (PE_parse_boot_argn("camera_l2s", &set, sizeof(set)) && set) {
+			uint8_t v = (uint8_t)((l2 & 0xc0) | (set & 0x3f));
+
+			spmic(true, S2MPG15_PM, 0x30, &v);
+			delay(1000);
+			spmic(false, S2MPG15_PM, 0x30, &l2);
+			printf("akita camera: uw: L2S_CTRL now %#x\n", l2);
+		}
+	}
 	if (!i2c_bus_up(c->bus)) {
 		return;
 	}
