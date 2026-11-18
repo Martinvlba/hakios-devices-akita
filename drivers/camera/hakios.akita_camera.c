@@ -2992,6 +2992,18 @@ uw_receiver_test(void)
 
 		spmic(false, S2MPG15_PM, 0x30, &l2);
 		spmic(false, S2MPG15_PM, S2MPG15_L12S_CTRL, &l12);
+		{
+			/* VDD_CAM = S2MPG15 BUCK1S (CTRL 0x0e, OUT1 0x0f, OUT2 0xca; 200 mV + 6.25 mV x code; Android 518.75 mV = 0x33) and
+			 * BUCK11S "VDD_INT_M" (OUT1 0x24) */
+			uint8_t c1 = 0, o1 = 0, o2 = 0, b11 = 0;
+
+			spmic(false, S2MPG15_PM, 0x0e, &c1);
+			spmic(false, S2MPG15_PM, 0x0f, &o1);
+			spmic(false, S2MPG15_PM, 0xca, &o2);
+			spmic(false, S2MPG15_PM, 0x24, &b11);
+			printf("akita camera: uw: VDD_CAM B1S_CTRL %#x OUT1 %#x (%u uV) OUT2 %#x (%u uV); B11S_OUT1 %#x (%u uV)\n", c1, o1,
+			    200000 + o1 * 6250, o2, 200000 + o2 * 6250, b11, 200000 + b11 * 6250);
+		}
 		printf("akita camera: uw: L2S_CTRL %#x (%u mV if 6-bit) L12S_CTRL %#x (%u mV)\n", l2, 300 + (l2 & 0x3f) * 25 / 2,
 		    l12, 700 + (l12 & 0x3f) * 25);
 		if (PE_parse_boot_argn("camera_l2s", &set, sizeof(set)) && set) {
