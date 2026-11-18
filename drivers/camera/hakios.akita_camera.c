@@ -2310,6 +2310,28 @@ front_capture(void)
 		}
 	}
 	PE_parse_boot_argn("camera_arm37", &arm37, sizeof(arm37));
+	{
+		unsigned pre = 1;       /* camera_blkstop=0: not done. Android's flip (11-18 kpblk-flip-front.txt) stops and clears
+		                         * block 0 before setting it up: +0x18 0, +0x1c 0, 0x200a4 1 (stop), +0x10 0, +0x30 9, +0x44
+		                         * 0x10, +0x58 0, 0x37028 0, then +0x30 1, +0x30 0, +0x44 0 */
+
+		PE_parse_boot_argn("camera_blkstop", &pre, sizeof(pre));
+		if (pre) {
+			wr(fe + 0x20418, 0);
+			wr(fe + 0x2041c, 0);
+			wr(fe + 0x200a4, 1);
+			wr(fe + 0x20410, 0);
+			wr(fe + 0x20430, 9);
+			wr(fe + 0x20444, 0x10);
+			wr(fe + 0x20458, 0);
+			wr(fe + 0x37028, 0);
+			delay(600);
+			wr(fe + 0x20430, 1);
+			wr(fe + 0x20430, 0);
+			wr(fe + 0x20444, 0);
+			printf("akita camera: capture: block 0 stopped and cleared first (0x200a4 now %#x)\n", rd(fe + 0x200a4));
+		}
+	}
 	/* Android's setup of the PHY, CSIS link 6 and the front end */
 	for (unsigned i = 0; i < sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0]); i++) {
 		const struct ispfe_write *w = &ispfe_front_setup[i];
@@ -2340,6 +2362,15 @@ front_capture(void)
 		if (c700 != 0xffffffffu) {
 			wr(csis + 0x60700, c700);
 			printf("akita camera: capture: CSIS link 6 +0x700 = %#x (read %#x)\n", c700, rd(csis + 0x60700));
+		}
+	}
+	{
+		unsigned dt = 0;        /* camera_csiscfg=V: CSIS link 6 channel 0's ISP_CONFIG (+0x40, Android 0x30ac = RAW10) overridden
+		                         * (a test: 0x30a8 = RAW8 -- no line of the sensor's then matches, only frame start/end pass) */
+
+		if (PE_parse_boot_argn("camera_csiscfg", &dt, sizeof(dt)) && dt) {
+			wr(csis + 0x60040, dt);
+			printf("akita camera: capture: CSIS link 6 +0x40 = %#x\n", rd(csis + 0x60040));
 		}
 	}
 	if (phy_late) {
@@ -2489,6 +2520,28 @@ front_capture(void)
 			    rd(fe + 0x37904));
 		}
 	}
+	{
+		/* camera_z1..camera_z4=OFF: front-end words set to 0 after the setup (a test of which of block 0's output/route
+		 * words make it refuse its frames: +0x60/64/6c/70, +0xc8/cc/d0, +0xd4/d8 ...) */
+		static const char *zn[4] = { "camera_z1", "camera_z2", "camera_z3", "camera_z4" };
+
+		for (unsigned k = 0; k < 4; k++) {
+			unsigned off = 0;
+
+			if (PE_parse_boot_argn(zn[k], &off, sizeof(off)) && off >= 0x20000 && off < 0x60000) {
+				wr(fe + off, 0);
+				printf("akita camera: capture: fe +%#x = 0 (read %#x)\n", off, rd(fe + off));
+			}
+		}
+	}
+	{
+		unsigned b0 = 0xffffffffu;      /* camera_200b0=V: fe +0x200b0 (Android 1: per-frame configuration by the PDMA?) */
+
+		if (PE_parse_boot_argn("camera_200b0", &b0, sizeof(b0)) && b0 != 0xffffffffu) {
+			wr(fe + 0x200b0, b0);
+			printf("akita camera: capture: fe +0x200b0 = %#x\n", rd(fe + 0x200b0));
+		}
+	}
 	if (use_pdma) {
 		wr(fe + 0x90010, 0x10);
 	}
@@ -2533,10 +2586,11 @@ front_capture(void)
 			0x2044c, 0x20450, 0x204ac, 0x204a0, 0x204bc, 0x204c0, 0x500e8, 0x500ec, 0x50118, 0x5011c, 0x501ac, 0x37300,
 			0x37304, 0x50000, 0x5000c, 0x50014, 0x5001c, 0x20540, 0x20508, 0x90010, 0x90014, 0x90028, 0x20708 };
 		uint32_t last[sizeof(st) / sizeof(st[0])] = { 0 };
-		unsigned handle = 1, said = 0, handled = 0, w1c_err = 1;
+		unsigned handle = 1, said = 0, handled = 0, w1c_err = 1, csis_said = 0, en18 = 0;
 
 		PE_parse_boot_argn("camera_irq", &handle, sizeof(handle));
 		PE_parse_boot_argn("camera_w1c", &w1c_err, sizeof(w1c_err));
+		PE_parse_boot_argn("camera_en18", &en18, sizeof(en18));
 		for (unsigned ms = 0; ms < 300; ms++) {
 			uint32_t v[sizeof(st) / sizeof(st[0])];
 			bool ch = false;
@@ -2554,6 +2608,25 @@ front_capture(void)
 				}
 				printf("akita camera: capture: fe status %s\n", line);
 				said++;
+			}
+			if ((v[5] & 1u) && !(last[5] & 1u) && csis_said < 2) {
+				/* CSIS link 6 +0x00..+0xfc at a frame start (Android's: kpcsis-flip-front.txt) */
+				char cl[700];
+				int cn = 0;
+
+				for (uint32_t o = 0; o < 0x100; o += 4) {
+					uint32_t x = rd(csis + 0x60000 + o);
+
+					if (x && x != 0xdeadcafe && x != 0x80008000 && (x & 0xffff) != 0x00fc) {
+						cn += snprintf(cl + cn, sizeof(cl) - (size_t)cn, " %x:%x", o, x);
+					}
+				}
+				printf("akita camera: capture: at frame start %u ms: CSIS link 6:%s\n", ms, cl);
+				csis_said++;
+			}
+			if (en18 && ms == en18) {
+				wr(fe + 0x20418, 1);    /* camera_en18=N: block 0's +0x18 (its enable) set N ms after stream-on */
+				printf("akita camera: capture: block 0 +0x18 = 1 at %u ms\n", ms);
 			}
 			memcpy(last, v, sizeof(last));
 			if (use_pdma && (v[5] & 1u)) {
