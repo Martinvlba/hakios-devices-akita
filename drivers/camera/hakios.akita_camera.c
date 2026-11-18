@@ -2664,6 +2664,24 @@ front_capture(void)
 		printf("akita camera: capture: fe events handled: %u\n", handled);
 	}
 	{
+		/* fe 0x28000-0x29fff (the per-camera input units: +0x28400 UW, +0x28800 front, +0x29000 main), the words not 0 */
+		char line[300];
+		int n = 0;
+
+		for (uint32_t o = 0x28000; o < 0x2a000; o += 4) {
+			uint32_t v = rd(fe + o);
+
+			if (v && v != 0xdeadcafe) {
+				n += snprintf(line + n, sizeof(line) - (size_t)n, " %x:%x", o, v);
+			}
+			if (n > 240) {
+				printf("akita camera: capture: fe 0x28000..:%s\n", line);
+				n = 0;
+			}
+		}
+		printf("akita camera: capture: fe 0x28000..:%s\n", n ? line : " (all 0)");
+	}
+	{
 		/* the sensor's registers while it streams, as Android's (imx712-front-regs-android.txt, i2ctransfer 16-byte bursts):
 		 * the lines that are not all 0. camera_sdump=0: not said */
 		static const uint16_t rr[][2] = { { 0x0000, 0x1000 }, { 0x3000, 0x3200 }, { 0x4000, 0x4a00 }, { 0x5000, 0x5100 },
