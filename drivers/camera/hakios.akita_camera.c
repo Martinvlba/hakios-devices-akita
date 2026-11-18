@@ -770,6 +770,17 @@ imx712_mode(const struct sensor *c)
 
 		PE_parse_boot_argn("camera_pllvt", &vt, sizeof(vt));
 		PE_parse_boot_argn("camera_pllop", &op, sizeof(op));
+		{
+			unsigned reg = 0, val = 0;      /* camera_sreg=0xRRRR camera_sval=0xVV: one more sensor register (a test) */
+
+			if (PE_parse_boot_argn("camera_sreg", &reg, sizeof(reg)) && PE_parse_boot_argn("camera_sval", &val, sizeof(val))) {
+				uint8_t b = (uint8_t)val, r = 0xee;
+
+				i2c_write16(c->bus, 0x1a, (uint16_t)reg, &b, 1);
+				i2c_read16(c->bus, 0x1a, (uint16_t)reg, &r, 1);
+				printf("akita camera: %s: sensor %#x = %#x (read %#x)\n", c->name, reg, val, r);
+			}
+		}
 		if (vt) {
 			uint8_t b = (uint8_t)vt;
 
@@ -2573,6 +2584,32 @@ front_capture(void)
 			delay(1000);
 		}
 		printf("akita camera: capture: fe events handled: %u\n", handled);
+	}
+	{
+		/* the sensor's registers while it streams, as Android's (imx712-front-regs-android.txt, i2ctransfer 16-byte bursts):
+		 * the lines that are not all 0. camera_sdump=0: not said */
+		static const uint16_t rr[][2] = { { 0x0000, 0x1000 }, { 0x3000, 0x3200 }, { 0x4000, 0x4a00 }, { 0x5000, 0x5100 },
+			{ 0x6a00, 0x6b00 }, { 0x7000, 0x7100 } };
+		unsigned sd = 1;
+
+		PE_parse_boot_argn("camera_sdump", &sd, sizeof(sd));
+		for (unsigned k = 0; sd && k < sizeof(rr) / sizeof(rr[0]); k++) {
+			for (unsigned a = rr[k][0]; a < rr[k][1]; a += 16) {
+				uint8_t b[16] = { 0 };
+				bool nz = false;
+
+				if (!i2c_read16(c->bus, 0x1a, (uint16_t)a, b, 16)) {
+					continue;
+				}
+				for (int q = 0; q < 16; q++) {
+					nz |= b[q] != 0;
+				}
+				if (nz) {
+					printf("akita camera: sensor %04x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					    a, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+				}
+			}
+		}
 	}
 	{
 		unsigned dump = 1;
