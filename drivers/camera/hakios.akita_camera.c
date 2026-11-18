@@ -771,6 +771,21 @@ imx712_mode(const struct sensor *c)
 		PE_parse_boot_argn("camera_pllvt", &vt, sizeof(vt));
 		PE_parse_boot_argn("camera_pllop", &op, sizeof(op));
 		{
+			unsigned ae = 0;        /* camera_ae=1: Android's fresh-open exposure and frame length before stream-on
+			                         * (0x0202/3 = 0x18a0, 0x0340/1 = 0x18ab; ours from the 11-17 trace: 0x030e, 0x0c73) */
+
+			PE_parse_boot_argn("camera_ae", &ae, sizeof(ae));
+			if (ae) {
+				static const uint8_t w[][3] = { { 0x01, 0x04, 0x01 }, { 0x02, 0x02, 0x18 }, { 0x02, 0x03, 0xa0 },
+					{ 0x03, 0x40, 0x18 }, { 0x03, 0x41, 0xab }, { 0x01, 0x04, 0x00 } };
+
+				for (unsigned k = 0; k < 6; k++) {
+					i2c_write16(c->bus, 0x1a, (uint16_t)(w[k][0] << 8 | w[k][1]), &w[k][2], 1);
+				}
+				printf("akita camera: %s: exposure 0x18a0, frame length 0x18ab (Android's fresh open)\n", c->name);
+			}
+		}
+		{
 			unsigned reg = 0, val = 0;      /* camera_sreg=0xRRRR camera_sval=0xVV: one more sensor register (a test) */
 
 			if (PE_parse_boot_argn("camera_sreg", &reg, sizeof(reg)) && PE_parse_boot_argn("camera_sval", &val, sizeof(val))) {
@@ -1991,6 +2006,7 @@ static const uint32_t front_pdma_list[1660] = {
 	0x00000000, 0xfd4dfb76, 0xfef1fe4a, 0x003cff92,
 };
 static const uint32_t front_pdma_iovas[] = {
+	0x0c4f6000,     /* (an indirect load's source below 0x10000000: unmapped before, the PDMA stalled on it) */
 	0x10001000, 0x10700000, 0x11278000, 0x1ab70000, 0x1b0cc000, 0x1c800000,
 	0x1d100000, 0x1d280000, 0x1d300000, 0x4ccd8000, 0xe5ef4000, 0xe78cb000,
 	0xe7c00000, 0xe8c00000, 0xe8df4000, 0xe8df6000, 0xe8df9000, 0xeb900000,
@@ -2136,6 +2152,9 @@ ispfe_mmu(bool on, uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 			wr(r + MMU_CTRL_VM, rd(r + MMU_CTRL_VM) | 1u);
 			wr(r + MMU_ALL_INV_VM, 1);
 		} else {
+			/* the VM's fault registers first (samsung-iommu-fault-v9.c: STATUS 0x8060, VA 0x8070, INFO0..2 0x8074..) */
+			printf("akita camera: capture: SysMMU %#llx faults: STATUS %#x VA %#x INFO0 %#x INFO1 %#x INFO2 %#x\n", mmus[m],
+			    rd(r + 0x8060), rd(r + 0x8070), rd(r + 0x8074), rd(r + 0x8078), rd(r + 0x807c));
 			wr(r + MMU_CTRL_VM, rd(r + MMU_CTRL_VM) & ~1u);
 			wr(r + MMU_FLPT_BASE_VM, 0);
 			wr(r + MMU_ALL_INV_VM, 1);
@@ -2219,6 +2238,33 @@ front_capture(void)
 			if (!(st & 1u)) {
 				printf("akita camera: capture: pd-ispfe did not come back: not trying\n");
 				return;
+			}
+		}
+	}
+	/* camera_pdall=1: the downstream camera domains powered too (Android's camera open powers them all: GDC, GSE, MCSC,
+	 * RGBP, TNR, YUVP -- pmucal *_on = CONFIGURATION bit0 + wait STATUS; then the TZPC restore with each one's need_smc) */
+	{
+		unsigned pdall = 0;
+
+		PE_parse_boot_argn("camera_pdall", &pdall, sizeof(pdall));
+		if (pdall) {
+			static const struct { const char *n; uint32_t off, smc; } pds[] = { { "gdc", 0x1f00, 0x1d410204 },
+				{ "gse", 0x1f80, 0x1d810204 }, { "mcsc", 0x2000, 0x1d010204 }, { "rgbp", 0x2100, 0x1c410204 },
+				{ "tnr", 0x2180, 0x1cc10204 }, { "yuvp", 0x2200, 0x1c810204 } };
+			vm_offset_t pm = ml_io_map(0x15461000ULL, 0x2000);
+
+			for (unsigned k = 0; k < sizeof(pds) / sizeof(pds[0]); k++) {
+				uint32_t st = rd(pm + pds[k].off - 0x1000 + 4);
+
+				if (!(st & 1u)) {
+					cam_smc(SMC_PRIV_REG, 0x15460000ULL + pds[k].off, PRIV_REG_WRITE, rd(pm + pds[k].off - 0x1000) | 1u);
+					for (int i = 0; i < 1000 && !(st & 1u); i++) {
+						delay(10);
+						st = rd(pm + pds[k].off - 0x1000 + 4);
+					}
+					cam_smc(SMC_PREPARE_PD_ONOFF, PD_WAKEUP_DOWN, pds[k].smc, PD_TZPC_GROUP);
+				}
+				printf("akita camera: capture: pd-%s status %#x\n", pds[k].n, st);
 			}
 		}
 	}
