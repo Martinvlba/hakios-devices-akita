@@ -56,7 +56,11 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/conf.h>
+#include <sys/uio.h>
 #include <sys/fcntl.h>
+#include <miscfs/devfs/devfs.h>
+#include <sys/hakios.camera.h>
 #include <sys/vnode.h>
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
@@ -2566,7 +2570,7 @@ static uint64_t cam_low;
 #define LSTEP(what) do { if (cam_low) { printf("akita camera: capture: step: %s\n", what); delay_for_interval(300, NSEC_PER_MSEC); } } while (0)
 
 extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start, vm_offset_t end, vm_prot_t prot, unsigned int flags);
-#define LOW_SPAN                0x2800000u
+#define LOW_SPAN                0x3400000u
 /* the camera_lowpa region mapped once, write-combined, with kernel addresses of its own and pmap_map: ml_io_map's whole area
  * is 8 MB (io_map.c's IO_MAP_SIZE), and its exhaustion was what killed run-low3..8 and the memkill runs (always after ~6 MB
  * of mappings, whatever the address), as it did the AoC driver's 11-11 */
@@ -6119,6 +6123,518 @@ static const struct replay_ev main_replay[] = {
 	{ 0, 0x1c3501ac, 0x0, 4 },
 };
 
+/*
+ * camera=13: /dev/hakios-camera, the contract userland's camera_device.c speaks (sys/hakios.camera.h): the FRONT camera
+ * for Darwin. A read starts the sensor and the front end (Android's open replayed, as camera=9); frames go to two buffers
+ * in turn (two PDMA lists that differ in the frame's address, queued alternately), so the newest finished frame is whole
+ * while the next is written; exposure commands go to the sensor at a frame's end; when nobody has read for 5 s, or the
+ * device is closed, everything goes down again. The wide camera (sensor 1) is not there yet: asked for, it gets the front
+ * sensor's frames under its own number, so that the Camera application shows a picture on either side.
+ */
+#define FD_FRAME_B_IOVA         0xea000000u     /* the second buffer's address in the lists (17 sections, clear of Android's) */
+#define FD_FRAME_B_OFF          0x2200000u      /* ... in the camera's low memory (camera_lowpa + 34 MiB) */
+#define FD_MARK                 0x5a5aa5a5u
+/* (the mark sits in the LAST line: the first is written before a poll sees the frame's start) */
+#define FD_MARK_OFF             ((size_t)FRONT_STRIDE * (FRONT_HEIGHT - 1))
+#define FD_LINE_NS              10656u          /* 5192 pixel clocks a line: 3128 lines are 1/30 s */
+#define FD_GAIN_UNITY           64u
+
+static LCK_GRP_DECLARE(fd_grp, "akita-camera");
+static LCK_MTX_DECLARE(fd_lock, &fd_grp);
+static bool fd_is_open, fd_wanted, fd_streaming, fd_broken;
+static unsigned fd_readers;
+static uint64_t fd_seq, fd_given, fd_last_read;         /* (fd_last_read: mach_absolute_time) */
+static struct { vm_offset_t va; uint64_t seq, time; uint32_t lines, gain64, fll; } fd_buf[2];
+static struct { bool pending; uint32_t lines, gain64, fll; } fd_ask;
+static uint32_t fd_lines = 6304, fd_gain64 = 16 * FD_GAIN_UNITY, fd_fll = 6315;        /* (what Android's open leaves) */
+static uint32_t fd_sensor = 2;                          /* the number the frames carry (what was last asked for) */
+
+static uint64_t
+fd_ms_since(uint64_t t)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
+	return ns / NSEC_PER_MSEC;
+}
+
+/* lines, gain (x64) and frame length to the IMX712, as front_set_exposure() writes them */
+static void
+fd_exposure(int bus, uint32_t lines, uint32_t gain64, uint32_t fll)
+{
+	uint32_t reg;
+	uint8_t b[2], one = 1, zero = 0;
+
+	gain64 = gain64 < FD_GAIN_UNITY ? FD_GAIN_UNITY : gain64 > 16 * FD_GAIN_UNITY ? 16 * FD_GAIN_UNITY : gain64;
+	lines = lines < 8 ? 8 : lines > 6304 ? 6304 : lines;
+	if (fll < 3128) {
+		fll = 3128;
+	}
+	if (fll < lines + 10) {
+		fll = lines + 10;
+	}
+	if (fll > 6315) {
+		fll = 6315;
+	}
+	reg = 1024 - (1024 * FD_GAIN_UNITY) / gain64;
+	i2c_write16(bus, 0x1a, 0x0104, &one, 1);
+	b[0] = (uint8_t)(fll >> 8); b[1] = (uint8_t)fll;
+	i2c_write16(bus, 0x1a, 0x0340, b, 2);
+	b[0] = (uint8_t)(lines >> 8); b[1] = (uint8_t)lines;
+	i2c_write16(bus, 0x1a, 0x0202, b, 2);
+	b[0] = (uint8_t)(reg >> 8); b[1] = (uint8_t)reg;
+	i2c_write16(bus, 0x1a, 0x0204, b, 2);
+	i2c_write16(bus, 0x1a, 0x0104, &zero, 1);
+	fd_lines = lines;
+	fd_gain64 = gain64;
+	fd_fll = fll;
+}
+
+/* one session: the front camera up, frames until nobody wants them, everything down. False: it could not start */
+static bool
+fd_session(void)
+{
+	const struct sensor *c = &sensors[1];
+	vm_offset_t fe = cam_io(ISPFE_FE_PHYS, 0x100000), csis = cam_io(ISPFE_CSIS_PHYS, 0xd0000);
+	vm_offset_t sreg = cam_io(ISPFE_SYSREG_PHYS, 0x1000), pmu = cam_io(0x15462000ULL, 0x2000), side;
+	uint64_t frame_pa[2], side_pa;
+	uint32_t mux, div;
+	unsigned on = 0, starts = 0, ends = 0, errs = 0;
+	int newest = -1;
+	bool marked[2] = { false, false }, ok = false;
+
+	if (!(rd(pmu + 0x484) & 1u)) {
+		printf("akita camera: device: pd-ispfe is off\n");
+		return false;
+	}
+	cam_low = 0xa0000000u;
+	fd_buf[0].va = cam_lowmap(0x1000000);
+	fd_buf[1].va = cam_lowmap(FD_FRAME_B_OFF);
+	side = cam_lowmap(0x800000);
+	pdma_mem = cam_lowmap(0x200000);
+	pdma_scratch = cam_lowmap(0x400000);
+	frame_pa[0] = cam_low + 0x1000000;
+	frame_pa[1] = cam_low + FD_FRAME_B_OFF;
+	side_pa = cam_low + 0x800000;
+	pdma_mem_pa = cam_low + 0x200000;
+	pdma_scratch_pa = cam_low + 0x400000;
+	cam_fill(pdma_mem, 0, 0x100000);
+	cam_fill(pdma_scratch, 0, 0x400000);
+	cam_fill(side, 0, FRONT_SIDE);
+	{
+		volatile uint32_t *q = (volatile uint32_t *)pdma_mem, *lb = (volatile uint32_t *)(pdma_mem + 0x4000);
+
+		cam_copy(pdma_mem + 0x1000, front_pdma_list, sizeof(front_pdma_list));
+		pdma_patch_tables();
+		cam_copy(pdma_mem + 0x4000, (const void *)(pdma_mem + 0x1000), sizeof(front_pdma_list));
+		if (lb[11] != 0x205c0 || lb[12] != ANDROID_FRAME_IOVA) {
+			printf("akita camera: device: the list's frame address is not where it was (%#x %#x)\n", lb[11], lb[12]);
+			return false;
+		}
+		lb[12] = FD_FRAME_B_IOVA;
+		for (unsigned e = 0; e < 256; e++) {
+			q[e * 4] = 0xc003;
+			q[e * 4 + 1] = PDMA_IOVA + ((e & 1) ? 0x4000 : 0x1000);
+			q[e * 4 + 2] = 0;
+			q[e * 4 + 3] = sizeof(front_pdma_list);
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	mux = rd(cmu_top + CMU_TOP_ISPFE_MUX);
+	div = rd(cmu_top + CMU_TOP_ISPFE_DIV);
+	wr(cmu_top + CMU_TOP_ISPFE_DIV, (div & ~0x1fu) | 1u);
+	for (int i = 0; i < 1000 && (rd(cmu_top + CMU_TOP_ISPFE_DIV) & (1u << 16)); i++) {
+		delay(1);
+	}
+	wr(cmu_top + CMU_TOP_ISPFE_MUX, (mux & ~7u) | 4u);
+	for (int i = 0; i < 1000 && (rd(cmu_top + CMU_TOP_ISPFE_MUX) & (1u << 16)); i++) {
+		delay(1);
+	}
+	if (!ispfe_mmu(true, frame_pa[0], FRONT_BUF_MB, side_pa)) {
+		return false;
+	}
+	mmu_map_android(frame_pa[0], FRONT_BUF_MB, side_pa);
+	{
+		uint32_t *t = (uint32_t *)mmu_flpt;
+
+		for (unsigned i = 0; i < FRONT_BUF_MB; i++) {
+			t[(FD_FRAME_B_IOVA >> 20) + i] = (uint32_t)((frame_pa[1] + ((uint64_t)i << 20)) >> 4) | 2u;
+		}
+		cam_flush(mmu_flpt, 0x40000);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		for (unsigned m = 0; m < 3; m++) {
+			static const uint64_t mmus[3] = { 0x1c110000ULL, 0x1c150000ULL, 0x1c190000ULL };
+
+			wr(cam_io(mmus[m], 0x10000) + 0x8010, 1);
+		}
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		static const uint64_t s2mpu_pa[3] = { 0x1c140000ULL, 0x1c180000ULL, 0x1c1c0000ULL };
+		vm_offset_t s2 = cam_io(s2mpu_pa[i], 0x3000);
+
+		wr(s2 + 0x54, 0xff);
+		wr(s2 + 0x1000, 1);
+	}
+	if (!i2c_bus_up(c->bus)) {
+		goto mmu_off;
+	}
+	for (on = 0; on < 4 && c->ldo[on] != 0; on++) {
+		if (!slg_ldo_on(c->ldo[on], c->mv[on])) {
+			goto down;
+		}
+	}
+	delay(1000);
+	pin_out(c->reset_bank, c->reset_pin, true);
+	mclk(c->clk, c->clk_bank, c->clk_pin, true);
+	delay(10000);
+	cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) | 1u);
+	wr(sreg + 0x104, 0x3ffffff);
+	for (unsigned i = 0; i < sizeof(front_replay) / sizeof(front_replay[0]); i++) {
+		const struct replay_ev *e = &front_replay[i];
+		uint32_t pa = e->addr, val = e->val;
+
+		if (e->delay_us) {
+			delay(e->delay_us);
+		}
+		if (e->kind == 1) {
+			uint8_t v = (uint8_t)e->val;
+
+			i2c_write16(c->bus, 0x1a, (uint16_t)e->addr, &v, 1);
+			continue;
+		}
+		if (pa == 0x1c390004) {
+			val = PDMA_IOVA;
+		}
+		if (pa == 0x1c32008c) {         /* (Android's handler acknowledges the commit here: wait for it as it does) */
+			for (int w = 0; w < 200 && !(rd(fe + 0x20424) & 8u); w++) {
+				delay(1000);
+			}
+			if (!(rd(fe + 0x20424) & 8u)) {
+				printf("akita camera: device: the commit's status bit never came: no session\n");
+				goto stop;
+			}
+		}
+		if (pa >= ISPFE_FE_PHYS && pa < ISPFE_FE_PHYS + 0x100000) {
+			wr(fe + (pa - ISPFE_FE_PHYS), val);
+		} else if (pa >= ISPFE_CSIS_PHYS && pa < ISPFE_CSIS_PHYS + 0xd0000) {
+			wr(csis + (pa - ISPFE_CSIS_PHYS), val);
+		} else if (pa >= ISPFE_SYSREG_PHYS && pa < ISPFE_SYSREG_PHYS + 0x1000) {
+			wr(sreg + (pa - ISPFE_SYSREG_PHYS), val);
+		}
+	}
+	fd_lines = 6304;
+	fd_gain64 = 16 * FD_GAIN_UNITY;
+	fd_fll = 6315;
+	lck_mtx_lock(&fd_lock);
+	fd_streaming = true;
+	fd_wanted = false;
+	fd_buf[0].seq = fd_buf[1].seq = 0;
+	lck_mtx_unlock(&fd_lock);
+	ok = true;
+	printf("akita camera: device: the front camera streams for Darwin\n");
+	for (;;) {
+		uint32_t v424 = rd(fe + 0x20424), v438 = rd(fe + 0x20438);
+
+		if (v424) {
+			if ((v424 & 0x12u) == 0x12u) {  /* a frame's end: which buffer it went to (the mark at its start is gone) */
+				int done = -1;
+
+				for (int x = 0; x < 2; x++) {
+					if (marked[x] && *(const volatile uint32_t *)(fd_buf[x].va + FD_MARK_OFF) != FD_MARK) {
+						done = x;
+					}
+				}
+				if (done < 0) {
+					done = newest;          /* (the newest one was written again: still a whole frame) */
+				}
+				marked[0] = marked[1] = false;
+				ends++;
+				wr(fe + 0x500e8, 3);
+				wr(fe + 0x37300, 4);
+				if (done >= 0) {
+					lck_mtx_lock(&fd_lock);
+					fd_buf[done].seq = ++fd_seq;
+					fd_buf[done].time = mach_absolute_time();
+					fd_buf[done].lines = fd_lines;
+					fd_buf[done].gain64 = fd_gain64;
+					fd_buf[done].fll = fd_fll;
+					newest = done;
+					lck_mtx_unlock(&fd_lock);
+					wakeup(&fd_seq);
+				}
+				if (fd_ask.pending) {
+					uint32_t l, g, f;
+
+					lck_mtx_lock(&fd_lock);
+					l = fd_ask.lines;
+					g = fd_ask.gain64;
+					f = fd_ask.fll;
+					fd_ask.pending = false;
+					lck_mtx_unlock(&fd_lock);
+					fd_exposure(c->bus, l, g, f);
+				}
+				if (ends <= 3 || ends % 300 == 0) {
+					printf("akita camera: device: frame %u in buffer %d (%u starts, %u errors); %u lines, gain %u/64, frame %u\n",
+					    ends, done, starts, errs, fd_lines, fd_gain64, fd_fll);
+				}
+			}
+			if (v424 & 1u) {                /* a frame's start: the buffer(s) it may go to marked, the next list queued */
+				starts++;
+				for (int x = 0; x < 2; x++) {
+					if (x != newest) {
+						*(volatile uint32_t *)(fd_buf[x].va + FD_MARK_OFF) = FD_MARK;
+						marked[x] = true;
+					}
+				}
+				wr(fe + 0x90010, (rd(fe + 0x90010) + 0x10) & 0xff0u);
+			}
+			errs += v438 != 0;
+			wr(fe + 0x2008c, 1);
+			wr(fe + 0x20404, 0);
+			wr(fe + 0x20424, v424);
+			wr(fe + 0x20438, v438);
+			wr(fe + 0x2044c, 0);
+			wr(fe + 0x20110, 0);
+		}
+		if (!fd_is_open || fd_ms_since(fd_last_read) > 5000) {
+			break;
+		}
+		delay(700);
+	}
+stop:
+	lck_mtx_lock(&fd_lock);
+	fd_streaming = false;
+	while (fd_readers != 0) {               /* (a read is copying out of a buffer: the front end stays until it is done) */
+		(void)msleep(&fd_readers, &fd_lock, PZERO, "akita-camera-drain", NULL);
+	}
+	fd_buf[0].seq = fd_buf[1].seq = 0;
+	lck_mtx_unlock(&fd_lock);
+	{
+		uint8_t zero = 0;
+
+		i2c_write16(c->bus, 0x1a, 0x0100, &zero, 1);
+	}
+	delay(50000);
+	printf("akita camera: device: the front camera stopped (%s): %u frames, %u starts, %u errors\n",
+	    !fd_is_open ? "closed" : "nobody reads", ends, starts, errs);
+	wr(fe + 0x90000, 0);
+	wr(sreg + 0x500, rd(sreg + 0x500) & ~FRONT_DPHY_RESET_BITS);
+	cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) & ~1u);
+	mclk(c->clk, c->clk_bank, c->clk_pin, false);
+	pin_out(c->reset_bank, c->reset_pin, false);
+down:
+	while (on-- > 0) {
+		slg_ldo_off(c->ldo[on]);
+	}
+mmu_off:
+	ispfe_mmu(false, 0, 0, 0);
+	wr(cmu_top + CMU_TOP_ISPFE_MUX, (rd(cmu_top + CMU_TOP_ISPFE_MUX) & ~7u) | (mux & 7u));
+	delay(100);
+	wr(cmu_top + CMU_TOP_ISPFE_DIV, (rd(cmu_top + CMU_TOP_ISPFE_DIV) & ~0x1fu) | (div & 0x1fu));
+	return ok;
+}
+
+static int
+fd_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	if (fd_broken) {
+		return EIO;
+	}
+	fd_is_open = true;
+	fd_last_read = mach_absolute_time();
+	return 0;
+}
+
+static int
+fd_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	fd_is_open = false;
+	fd_wanted = false;
+	wakeup(&fd_wanted);
+	return 0;
+}
+
+static int
+fd_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct hakios_camera_frame f;
+	uint64_t since = mach_absolute_time();
+	vm_offset_t at;
+	int b, error = 0;
+
+	lck_mtx_lock(&fd_lock);
+	fd_last_read = mach_absolute_time();
+	for (;;) {
+		struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
+
+		if (fd_broken) {
+			lck_mtx_unlock(&fd_lock);
+			return EIO;
+		}
+		if (!fd_streaming && !fd_wanted) {
+			fd_wanted = true;
+			wakeup(&fd_wanted);
+		}
+		b = -1;
+		for (int i = 0; i < 2 && fd_streaming; i++) {
+			if (fd_buf[i].seq > fd_given && (b < 0 || fd_buf[i].seq > fd_buf[b].seq)) {
+				b = i;
+			}
+		}
+		if (b >= 0) {
+			break;
+		}
+		if (fd_ms_since(since) > (fd_streaming ? 3000u : 15000u)) {
+			lck_mtx_unlock(&fd_lock);
+			return EAGAIN;
+		}
+		error = msleep(&fd_seq, &fd_lock, PZERO | PCATCH, "akita-camera", &ts);
+		if (error != 0 && error != EWOULDBLOCK) {
+			lck_mtx_unlock(&fd_lock);
+			return error;
+		}
+		fd_last_read = mach_absolute_time();
+	}
+	fd_readers++;
+	fd_given = fd_buf[b].seq;
+	at = fd_buf[b].va;
+	bzero(&f, sizeof(f));
+	memcpy(f.magic, HAKIOS_CAMERA_MAGIC, 8);
+	f.header_bytes = sizeof(f);
+	f.width = 4208;
+	f.height = FRONT_HEIGHT;
+	f.stride = FRONT_STRIDE;
+	f.format = 1;
+	f.bayer = 3;                            /* BGGR */
+	f.black = 64;
+	f.sequence = fd_buf[b].seq;
+	f.time = fd_buf[b].time;
+	f.exposure_lines = fd_buf[b].lines;
+	f.line_ns = FD_LINE_NS;
+	f.gain = fd_buf[b].gain64;
+	f.gain_unity = FD_GAIN_UNITY;
+	f.gain_max = 16 * FD_GAIN_UNITY;
+	f.frame_lines = fd_buf[b].fll;
+	f.frame_lines_min = 3128;
+	f.frame_lines_max = 6315;
+	f.margin = 10;
+	f.sensor = fd_sensor;
+	f.focus = HAKIOS_CAMERA_NO_FOCUS;
+	lck_mtx_unlock(&fd_lock);
+	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+	if (error == 0 && uio_resid(uio) > 0) {
+		error = uiomove((caddr_t)at, (int)MIN((uint64_t)FRONT_STRIDE * FRONT_HEIGHT, (uint64_t)uio_resid(uio)), uio);
+	}
+	lck_mtx_lock(&fd_lock);
+	fd_last_read = mach_absolute_time();
+	fd_readers--;
+	lck_mtx_unlock(&fd_lock);
+	wakeup(&fd_readers);
+	return error;
+}
+
+static int
+fd_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct hakios_camera_command c;
+
+	if (uio_resid(uio) < (user_ssize_t)sizeof(c) || uiomove((caddr_t)&c, sizeof(c), uio) != 0) {
+		return EINVAL;
+	}
+	if (c.command == HAKIOS_CAMERA_EXPOSURE) {
+		lck_mtx_lock(&fd_lock);
+		fd_ask.lines = c.a;
+		fd_ask.gain64 = c.b;
+		fd_ask.fll = c.c;
+		fd_ask.pending = true;
+		lck_mtx_unlock(&fd_lock);
+		return 0;
+	}
+	if (c.command == HAKIOS_CAMERA_SENSOR) {
+		if (c.a != 1 && c.a != 2) {
+			return EINVAL;
+		}
+		if (c.a != fd_sensor) {
+			printf("akita camera: device: sensor %u asked for: the front sensor's frames under that number%s\n", c.a,
+			    c.a == 1 ? " (the wide camera is not there yet)" : "");
+		}
+		fd_sensor = c.a;
+		return 0;
+	}
+	if (c.command == HAKIOS_CAMERA_FOCUS) {
+		return 0;                       /* (no lens motor on the front camera) */
+	}
+	return c.command == HAKIOS_CAMERA_KEEP ? ENOSPC : EINVAL;
+}
+
+static const struct cdevsw fd_cdevsw = {
+	.d_open = fd_dev_open, .d_close = fd_dev_close, .d_read = fd_dev_read, .d_write = fd_dev_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* the node, made as the thread starts (mediaserverd looks for a camera when it starts) */
+static bool
+fd_make(void)
+{
+	int major = cdevsw_add(-1, &fd_cdevsw);
+
+	return major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-camera") != NULL;
+}
+
+/*
+ * The node EARLY, as soon as the root is mounted: mediaserverd's capture stack works out its cameras once, when it starts,
+ * and keeps the answer -- the rest of this driver starts 12 s into the boot (the flashlight's bus first), which was after
+ * mediaserverd: no camera vendor yet, an empty list of capture sources for good, Camera.app's preview black (11-18).
+ * Reads that come before the service is there wait for it (fd_dev_read).
+ */
+extern struct vnode *rootvnode;
+static bool fd_made;
+
+static void
+fd_early_thread(__unused void *arg, __unused wait_result_t w)
+{
+	for (int i = 0; i < 1200 && rootvnode == NULLVP; i++) {
+		delay_for_interval(50, NSEC_PER_MSEC);
+	}
+	fd_made = rootvnode != NULLVP && fd_make();
+	printf("akita camera: device: /dev/hakios-camera %s\n", fd_made ? "made (the camera itself comes up when it is first read)" :
+	    "COULD NOT BE MADE");
+}
+
+static void
+fd_early_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(fd_early_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+/* camera=13: a session whenever a read wants frames */
+static void
+fd_serve(void)
+{
+	printf("akita camera: device: /dev/hakios-camera serves the front camera\n");
+	for (;;) {
+		lck_mtx_lock(&fd_lock);
+		while (!fd_wanted) {
+			(void)msleep(&fd_wanted, &fd_lock, PZERO, "akita-camera-idle", NULL);
+		}
+		lck_mtx_unlock(&fd_lock);
+		if (!fd_session()) {
+			lck_mtx_lock(&fd_lock);
+			fd_broken = true;
+			fd_wanted = false;
+			lck_mtx_unlock(&fd_lock);
+			wakeup(&fd_seq);
+			printf("akita camera: device: a session could not start: the device answers EIO from now on\n");
+			return;
+		}
+	}
+}
+
 /* the camera's bus domains through ACPM's DVFS, as hakios.akita_dvfs.c sets the CPUs' (channel 0, {domain, kHz, set/get}):
  * zuma's INTCAM 0xa, TNR 0xb, CAM 0xc (dt-bindings/clock/zuma.h). Android: 111 MHz each with no camera, 233 MHz while the
  * main camera streams (devfreq cur_freq, 11-18); the boot leaves 111 */
@@ -6767,6 +7283,10 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 	if (camera_mode < 2) {
 		return;
 	}
+	if (camera_mode == 13 && !fd_made) {
+		printf("akita camera: device: /dev/hakios-camera was not made\n");
+		return;
+	}
 	hsi2c_battery = ml_io_map(HSI2C_BATTERY_PHYS, 0x1000);
 	if (akita_i2c14_xfer == NULL) {
 		printf("akita camera: no flashlight driver (its bus is the PMIC's): nothing more\n");
@@ -6818,6 +7338,10 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 		cam_capture(&cam_main);
 		return;
 	}
+	if (camera_mode == 13) {
+		fd_serve();
+		return;
+	}
 	if (camera_mode >= 3) {
 		for (int i = 0; i < 3; i++) {
 			sensor_probe(&sensors[i]);
@@ -6857,5 +7381,12 @@ akita_camera_init(void)
 	start = thread_call_allocate(akita_camera_start, NULL);
 	clock_interval_to_deadline(12, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(start, deadline);
+	if (mode == 13) {
+		static thread_call_t early;
+
+		early = thread_call_allocate(fd_early_start, NULL);
+		clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(early, deadline);
+	}
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, akita_camera_init);
