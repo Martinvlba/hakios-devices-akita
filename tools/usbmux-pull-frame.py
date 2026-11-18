@@ -2,8 +2,8 @@
 """Fetch the front camera's frame the kernel saved (camera=9: /var/mobile/Media/hakios-klog/front.raw, the packed RAW10
 the front end wrote: 3072 lines of 5312 bytes, 4208 pixels each) over AFC and make pictures of it.
 
-usage: usbmux-pull-frame.py OUTDIR            fetch front.raw, write front.raw, front-gray.png and front.png
-       usbmux-pull-frame.py --convert RAW OUTDIR    pictures of a fetched file only
+usage: usbmux-pull-frame.py [--camera front|main] OUTDIR            fetch NAME.raw, write it, NAME-gray.png and NAME.png
+       usbmux-pull-frame.py [--camera ...] --convert RAW OUTDIR    pictures of a fetched file only
 
 front-gray.png: every pixel as it is (the Bayer mosaic, 8 bits). front.png: half size, one colour pixel from each 2x2
 cell (the green pair averaged), white balance from the unclipped mid-tones, gamma 2.2, turned upright (--rotate DEGREES,
@@ -15,12 +15,13 @@ import os
 import struct
 import sys
 
-STRIDE, HEIGHT, WIDTH = 5312, 3072, 4208
+# camera: (file, bytes a line, lines, pixels a line, Bayer order, degrees to turn it upright)
+CAMERAS = {'front': ('front', 5312, 3072, 4208, 'BGGR', 90), 'main': ('main', 5824, 3472, 4624, 'RGGB', -90)}
 AFC_FILE_READ = 15
-REMOTE = 'hakios-klog/front.raw'
 
 
-def fetch(out):
+def fetch(out, name):
+    REMOTE = 'hakios-klog/%s.raw' % name
     here = os.path.dirname(os.path.abspath(__file__))
     spec = importlib.util.spec_from_file_location('usbmux_install', os.path.join(here, 'usbmux-install.py'))
     base = importlib.util.module_from_spec(spec)
@@ -29,7 +30,7 @@ def fetch(out):
     _, data = afc.call(base.AFC_OPEN, struct.pack('<Q', 1) + REMOTE.encode() + b'\0')     # 1: read
     handle = data[:8]
     size = 0
-    path = os.path.join(out, 'front.raw')
+    path = os.path.join(out, '%s.raw' % name)
     with open(path, 'wb') as f:
         while True:
             _, part = afc.call(AFC_FILE_READ, handle + struct.pack('<Q', 1 << 20))
@@ -43,7 +44,8 @@ def fetch(out):
     return path
 
 
-def convert(raw, out, order, rot=90, sat=1.35):
+def convert(raw, out, order, rot=90, sat=1.35, name='front', geom=(5312, 3072, 4208)):
+    STRIDE, HEIGHT, WIDTH = geom
     import numpy as np
     from PIL import Image
 
@@ -55,7 +57,7 @@ def convert(raw, out, order, rot=90, sat=1.35):
     px = np.stack([(d[:, :, i] << 2) | ((low >> (2 * i)) & 3) for i in range(4)], axis=2).reshape(HEIGHT, WIDTH)
     print('usbmux-pull-frame: pixels min %d max %d mean %.1f; rows that are all zero: %d' %
           (px.min(), px.max(), px.mean(), int((px.max(axis=1) == 0).sum())))
-    Image.fromarray((px >> 2).astype(np.uint8)).save(os.path.join(out, 'front-gray.png'))
+    Image.fromarray((px >> 2).astype(np.uint8)).save(os.path.join(out, '%s-gray.png' % name))
     cell = {c: px[y::2, x::2].astype(np.float64) for c, (y, x) in zip('abcd', ((0, 0), (0, 1), (1, 0), (1, 1)))}
     names = dict(zip('abcd', order))
     r = next(cell[k] for k in 'abcd' if names[k] == 'R')
@@ -83,16 +85,21 @@ def convert(raw, out, order, rot=90, sat=1.35):
     out_img = Image.fromarray(img, 'RGB')
     if rot:
         out_img = out_img.rotate(rot, expand=True)
-    out_img.save(os.path.join(out, 'front.png'))
+    out_img.save(os.path.join(out, '%s.png' % name))
     print('usbmux-pull-frame: white balance gains R %.2f G %.2f B %.2f, %.1f %% of the cells clipped' %
           (gains[0], gains[1], gains[2], 100.0 * clipped.mean()))
     img = np.asarray(out_img)
-    print('usbmux-pull-frame: %s (%dx%d) and front-gray.png' % (os.path.join(out, 'front.png'), img.shape[1], img.shape[0]))
+    print('usbmux-pull-frame: %s (%dx%d) and %s-gray.png' % (os.path.join(out, '%s.png' % name), img.shape[1], img.shape[0], name))
 
 
 def main():
     args = [a for a in sys.argv[1:]]
-    order, rot = 'BGGR', 90
+    cam = 'front'
+    if '--camera' in args:
+        i = args.index('--camera')
+        cam = args[i + 1]
+        del args[i:i + 2]
+    name, stride, height, width, order, rot = CAMERAS[cam]
     if '--bayer' in args:
         i = args.index('--bayer')
         order = args[i + 1].upper()
@@ -101,13 +108,14 @@ def main():
         i = args.index('--rotate')
         rot = int(args[i + 1])
         del args[i:i + 2]
+    geom = (stride, height, width)
     if args[:1] == ['--convert'] and len(args) == 3:
         os.makedirs(args[2], exist_ok=True)
-        return convert(args[1], args[2], order, rot)
+        return convert(args[1], args[2], order, rot, 1.35, name, geom)
     if len(args) != 1:
         sys.exit(__doc__)
     os.makedirs(args[0], exist_ok=True)
-    convert(fetch(args[0]), args[0], order, rot)
+    convert(fetch(args[0], name), args[0], order, rot, 1.35, name, geom)
 
 
 if __name__ == '__main__':

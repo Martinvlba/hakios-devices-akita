@@ -4936,8 +4936,8 @@ static const uint32_t main_pdma_list[1660] = {
 	0x0000400b, 0x00000000, 0x000b0002, 0x00020554, 0x000016c0, 0x00020550, 0x00000004, 0x00020544,
 	0x00000000, 0x00020540, 0x00000001, 0x000205c0, 0xa1000000, 0x000205c4, 0x00000000, 0x00020508,
 	0x000009c9, 0x0002050c, 0x00000000, 0x00020510, 0xa08cb000, 0x00020514, 0x00000000, 0x00022154,
-	0x000016a0, 0x00022150, 0x00000004, 0x00022140, 0x00000001, 0x000221c0, 0xa0400000, 0x000221c4,
-	0x00000000, 0x00022108, 0x000009c9, 0x0002210c, 0x00000000, 0x00022110, 0xa0400000, 0x00022114,
+	0x000016a0, 0x00022150, 0x00000004, 0x00022140, 0x00000001, 0x000221c0, 0xa2800000, 0x000221c4,
+	0x00000000, 0x00022108, 0x000009c9, 0x0002210c, 0x00000000, 0x00022110, 0xa2800000, 0x00022114,
 	0x00000000, 0x00037050, 0x00000000, 0x00037400, 0x00000014, 0x00037404, 0x00000030, 0x00114001,
 	0x00037500, 0x00000002, 0x00000000, 0x04000400, 0x04000400, 0x04000400, 0x04000400, 0x04000400,
 	0x04000400, 0x04000400, 0x04000400, 0x04000400, 0x04000400, 0x04000400, 0x04000400, 0x04000400,
@@ -4971,7 +4971,7 @@ static const uint32_t main_pdma_list[1660] = {
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x000009c8, 0x00000000, 0x00010009, 0xd6bfa000,
 	0x00000000, 0x00000400, 0x0006c8b8, 0x0002c001, 0x00054870, 0x00000001, 0x00080008, 0x00300040,
 	0x00480048, 0x00017fff, 0x00000000, 0x000009c8, 0x00000000, 0x00000000, 0x00000000, 0x00014001,
-	0x00054898, 0x00000001, 0x000009c8, 0xa0400000, 0x00000000, 0x00194001, 0x000548a8, 0x00000001,
+	0x00054898, 0x00000001, 0x000009c8, 0xa2800000, 0x00000000, 0x00194001, 0x000548a8, 0x00000001,
 	0x0000062c, 0x0d900be4, 0x053c06f4, 0x00d40505, 0x0001009e, 0x0000037a, 0x00000000, 0x00000000,
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000212, 0x00000000, 0x00000000,
 	0x00000000, 0x000006c8, 0x00000000, 0x00000000, 0x00000000, 0x0417170e, 0x00000400, 0x00010fff,
@@ -4986,7 +4986,7 @@ static const uint32_t main_pdma_list[1660] = {
 	0x0001d2c3, 0x0000155e, 0x0000000a, 0x0000000a, 0x00000001, 0x01010101, 0x00000000, 0x000009c8,
 	0x00000000, 0x00000000, 0x00000000, 0x00010009, 0xd6276000, 0x00000000, 0x000000a4, 0x0006bd0c,
 	0x00048001, 0x00054a50, 0x00001201, 0x00080008, 0x00600080, 0x0517170e, 0x5b636a72, 0x3d444c53,
-	0x1e262e35, 0x00080f17, 0x00000000, 0x00000000, 0x00000000, 0x0000000b, 0x0d901210, 0xa0400000,
+	0x1e262e35, 0x00080f17, 0x00000000, 0x00000000, 0x00000000, 0x0000000b, 0x0d901210, 0xa2800000,
 	0x00000000, 0x000009c8, 0x00000001, 0x0001c001, 0x00054a38, 0x00000001, 0x00002454, 0x00001000,
 	0x00001000, 0x000018b9, 0x00000001, 0x0001c001, 0x00054a94, 0x00000001, 0x00002454, 0x00001000,
 	0x00001000, 0x000018b9, 0x00000000, 0x00014001, 0x00054aac, 0x0d904840, 0x02000203, 0x00000000,
@@ -5031,7 +5031,7 @@ static const uint32_t main_pdma_list[1660] = {
 	0x0000f407, 0x0000ffda, 0x0000f3e6, 0x0000ffe2, 0x00001000, 0x00000889, 0x00001000, 0x00000889,
 	0x0000048d, 0x00000889, 0x00001000, 0x00000889, 0x00001000, 0x01000100, 0x00000100, 0x00000000,
 	0x00058001, 0x00054eb0, 0x03640484, 0x3422110d, 0x0c045408, 0x00010000, 0x00510080, 0x00010010,
-	0x00000ffe, 0xa0400000, 0x02e00000, 0xb1600001, 0xb8200010, 0xc7600014, 0x0b800015, 0x20400016,
+	0x00000ffe, 0xa2800000, 0x02e00000, 0xb1600001, 0xb8200010, 0xc7600014, 0x0b800015, 0x20400016,
 	0x20200016, 0x04a00016, 0x02600000, 0x00a00140, 0x00400060, 0x00000000, 0x00000000, 0x00010009,
 	0xe9bd6000, 0x00000000, 0x00000104, 0x0006beb0, 0x00010009, 0xe9bcf000, 0x00000000, 0x00000104,
 	0x0006bfb4, 0x00024001, 0x00054f04, 0x00000000, 0x0d901210, 0x0d901210, 0x00000000, 0x00000000,
@@ -5042,15 +5042,15 @@ static const uint32_t main_pdma_list[1660] = {
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00040001, 0x00054f88,
 	0x0d901210, 0x00000400, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00010001,
-	0x00054fc4, 0x00000001, 0xa0400000, 0x00000000, 0x00030001, 0x0005467c, 0x0d901210, 0x00000000,
+	0x00054fc4, 0x00000001, 0xa2800000, 0x00000000, 0x00030001, 0x0005467c, 0x0d901210, 0x00000000,
 	0x00000000, 0x00000014, 0xfffe96dc, 0x0000393e, 0x00000005, 0x00000001, 0x00000000, 0x10000000,
 	0x00000000, 0x0000c001, 0x00055130, 0x00000000, 0x00000000, 0x00aa4001, 0x00055140, 0x00018000,
 	0x00030000, 0x0004b000, 0x00096000, 0x0004b000, 0x00096000, 0x000e1000, 0x001c2000, 0x0001f5fa,
-	0x00000013, 0xa0400000, 0x00000000, 0x00000000, 0x00000000, 0xa0400000, 0x00000000, 0xa0400000,
-	0x00000000, 0xa0400000, 0x00000000, 0xa0400000, 0x00000000, 0xa0400000, 0x00000000, 0xa0400000,
-	0x00000000, 0xa0400000, 0x00000000, 0xa0400000, 0x00000000, 0x00000000, 0x00000000, 0xa0436400,
-	0x00000000, 0xa0400000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xa0400000,
-	0x00000000, 0xa0400000, 0x00000000, 0xa0400000, 0x00000000, 0xa0400000, 0x00000000, 0xa0400000,
+	0x00000013, 0xa2800000, 0x00000000, 0x00000000, 0x00000000, 0xa2800000, 0x00000000, 0xa2800000,
+	0x00000000, 0xa2800000, 0x00000000, 0xa2800000, 0x00000000, 0xa2800000, 0x00000000, 0xa2800000,
+	0x00000000, 0xa2800000, 0x00000000, 0xa2800000, 0x00000000, 0x00000000, 0x00000000, 0xa2836400,
+	0x00000000, 0xa2800000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xa2800000,
+	0x00000000, 0xa2800000, 0x00000000, 0xa2800000, 0x00000000, 0xa2800000, 0x00000000, 0xa2800000,
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
 	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -5137,8 +5137,8 @@ static const uint32_t main_pdma_list[1660] = {
 	0x00840011, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
 	0x00000000, 0x00000031, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x21000000, 0x00000000,
 	0x000c0001, 0x00000000, 0x00000000, 0x00010009, 0xd89f5000, 0x00000000, 0x00000240, 0x00061d48,
-	0x00010001, 0x000400cc, 0x00000001, 0xa0400000, 0x00000000, 0x0000c001, 0x00050d70, 0x00000000,
-	0x00000000, 0x00014001, 0x00051818, 0x00000001, 0x0000001a, 0xa0400000, 0x00000000, 0x00030002,
+	0x00010001, 0x000400cc, 0x00000001, 0xa2800000, 0x00000000, 0x0000c001, 0x00050d70, 0x00000000,
+	0x00000000, 0x00014001, 0x00051818, 0x00000001, 0x0000001a, 0xa2800000, 0x00000000, 0x00030002,
 	0x0002041c, 0x00000001, 0x0002201c, 0x00000001, 0x00054678, 0x00000001, 0x00037020, 0x00000001,
 	0x00040000, 0x00000001, 0x0003b020, 0x00000001,
 };
@@ -6119,6 +6119,23 @@ static const struct replay_ev main_replay[] = {
 	{ 0, 0x1c3501ac, 0x0, 4 },
 };
 
+/* the camera's bus domains through ACPM's DVFS, as hakios.akita_dvfs.c sets the CPUs' (channel 0, {domain, kHz, set/get}):
+ * zuma's INTCAM 0xa, TNR 0xb, CAM 0xc (dt-bindings/clock/zuma.h). Android: 111 MHz each with no camera, 233 MHz while the
+ * main camera streams (devfreq cur_freq, 11-18); the boot leaves 111 */
+extern int akita_acpm_xfer(unsigned channel, uint32_t cmd[4]);
+
+static uint32_t
+cam_dvfs(uint32_t domain, uint32_t khz)
+{
+	uint32_t get[4] = { domain, 0, 1, 0 }, set[4] = { domain, khz, 0, 0 }, was;
+
+	was = akita_acpm_xfer(0, get) == 0 ? get[1] : 0;
+	if (khz != 0 && akita_acpm_xfer(0, set) != 0) {
+		printf("akita camera: DVFS domain %#x: the request for %u kHz failed\n", domain, khz);
+	}
+	return was;
+}
+
 /*
  * camera=12 (the main camera) and later ones: ONE capture path from per-camera tables, the way camera=9 does the front
  * camera by hand -- Android's fresh open replayed (mkreplay.py), its PDMA list with our addresses and its indirect-load
@@ -6139,6 +6156,7 @@ struct cam_cfg {
 	unsigned stride, height, width;
 	uint32_t blocks;                        /* the front end's blocks it starts (fe +0x200a0's bits) */
 	uint32_t dphy_reset;                    /* its PHY's bits in SYSREG_ISPFE +0x500 */
+	unsigned link;                          /* its CSIS link (csis-link-phy + link * 0x10000) */
 	/* the status words of the units THIS camera runs, read and written back each poll as Android's handler does (0 ends).
 	 * Only those: reading one of a unit that is clock-gated -- another context's 0x500xx or 0x3x300 -- resets the phone
 	 * without a word (11-18: six runs lost to it) */
@@ -6159,8 +6177,10 @@ cam_map_generic(uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 
 	PE_parse_boot_argn("camera_mapmask", &mask, sizeof(mask));
 	cam_fill(mmu_flpt, 0, 0x40000);         /* (ispfe_mmu's own entries for the front camera's IOVAs: not this list's) */
-	for (unsigned i = 0; (mask & 4) && i < 4; i++) {        /* the scratch, one to one (every other buffer of the list) */
-		t[(uint32_t)(pdma_scratch_pa >> 20) + i] = (uint32_t)((pdma_scratch_pa + ((uint64_t)i << 20)) >> 4) | 2u;
+	/* every other buffer of the list is at 0xa2800000: 64 MiB from there onto the 4 MiB of scratch, over and over. With
+	 * (64 MiB of room: an output may be as large as a frame; the front camera's second output ran off 4 MiB) */
+	for (unsigned i = 0; (mask & 4) && i < 64; i++) {
+		t[0xa28 + i] = (uint32_t)((pdma_scratch_pa + ((uint64_t)(i & 3) << 20)) >> 4) | 2u;
 	}
 	for (unsigned i = 0; (mask & 1) && i < frame_mb; i++) {
 		t[(uint32_t)(frame_pa >> 20) + i] = (uint32_t)((frame_pa + ((uint64_t)i << 20)) >> 4) | 2u;
@@ -6179,6 +6199,17 @@ cam_map_generic(uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
+/* a CSIS link's own view (Samsung's is-hw-csi-v5 names): interrupt sources 0/1 (ECC, CRC, overflow, wrong config...),
+ * frame starts/ends per channel, lost frame starts/ends, line-count and width errors, frame counters */
+static void
+csis_link_say(const char *who, const char *when, vm_offset_t l)
+{
+	printf("akita camera: %s: link %s: INT_SRC0 %#x INT_SRC1 %#x FS %#x FE %#x LOST_FS %#x LOST_FE %#x VRESOL %#x HRESOL %#x"
+	    " FRM_CNT %u %u %u %u; +0x04 %#x +0x40 %#x +0x44 %#x\n", who, when, rd(l + 0x14), rd(l + 0x1c), rd(l + 0x24), rd(l + 0x2c),
+	    rd(l + 0x614), rd(l + 0x61c), rd(l + 0x624), rd(l + 0x62c), rd(l + 0x500), rd(l + 0x504), rd(l + 0x508), rd(l + 0x50c),
+	    rd(l + 0x04), rd(l + 0x40), rd(l + 0x44));
+}
+
 static void
 cam_capture(const struct cam_cfg *g)
 {
@@ -6187,7 +6218,8 @@ cam_capture(const struct cam_cfg *g)
 	vm_offset_t sysreg = cam_io(ISPFE_SYSREG_PHYS, 0x1000), pmu = cam_io(0x15462000ULL, 0x2000), frame, side;
 	vm_offset_t cmu_fe = cam_io(CMU_ISPFE_PHYS, 0x4000);
 	unsigned low = 0xa0000000u, on = 0, starts = 0, ends = 0, errs = 0, said = 0, changed = 0, polls = 1500;
-	unsigned frame_bytes = g->stride * g->height, frame_mb = (frame_bytes + 0xfffffu) >> 20, first_block = 0, evsay = 0, stopat = 0, feclk = 1, nack = 99, acks_said = 0, blind = 0, kick = 1, gates = 0, s2off = 1;
+	unsigned frame_bytes = g->stride * g->height, frame_mb = (frame_bytes + 0xfffffu) >> 20, first_block = 0, evsay = 0, stopat = 0, feclk = 1, nack = 99, acks_said = 0, blind = 0, kick = 1, gates = 0, s2off = 1, bus_khz = 233000;
+	uint32_t bus_was[3] = { 0, 0, 0 };
 	uint64_t frame_pa, side_pa;
 	uint32_t mux, div;
 
@@ -6256,6 +6288,13 @@ cam_capture(const struct cam_cfg *g)
 	}
 	printf("akita camera: %s: ISPFE_NOC clock: mux %#x div %#x (was %#x %#x)\n", g->name, rd(cmu_top + CMU_TOP_ISPFE_MUX),
 	    rd(cmu_top + CMU_TOP_ISPFE_DIV), mux, div);
+	/* camera_bus=KHZ (default 233000, Android's while a camera streams; 0: left): INTCAM, TNR and CAM raised for the run */
+	PE_parse_boot_argn("camera_bus", &bus_khz, sizeof(bus_khz));
+	for (unsigned i = 0; i < 3; i++) {
+		bus_was[i] = cam_dvfs(0xa + i, bus_khz);
+	}
+	printf("akita camera: %s: INTCAM/TNR/CAM were %u/%u/%u kHz, now %u/%u/%u\n", g->name, bus_was[0], bus_was[1], bus_was[2],
+	    cam_dvfs(0xa, 0), cam_dvfs(0xb, 0), cam_dvfs(0xc, 0));
 	if (!ispfe_mmu(true, frame_pa, frame_mb, side_pa)) {
 		return;
 	}
@@ -6407,6 +6446,23 @@ cam_capture(const struct cam_cfg *g)
 						ends++;
 					}
 				}
+				if (er != 0 && errs == 0) {     /* the first error: what the summary words and both blocks say */
+					printf("akita camera: %s: FIRST ERROR at poll %u: summary 20110 %#x 20114 %#x; 37300 %#x 37304 %#x 3b300 %#x 3b304 %#x\n",
+					    g->name, it, rd(fe + 0x20110), rd(fe + 0x20114), rd(fe + 0x37300), rd(fe + 0x37304), rd(fe + 0x3b300),
+					    rd(fe + 0x3b304));
+					csis_link_say(g->name, "at the first error", csis + g->link * 0x10000);
+					for (unsigned bb = 0; bb < 15; bb++) {
+						vm_offset_t q = fe + 0x20400 + bb * 0x400;
+
+						if (g->blocks & (1u << bb)) {
+							printf("akita camera: %s: block %u: +20 %#x +24 %#x +28 %#x +38(read before) %#x +3c %#x +a0 %#x +ac %#x +bc %#x"
+							    " +c0 %#x +c4 %#x; channel +100 %#x +108 %#x +140 %#x +1b0 %#x +1b4 %#x +1c0 %#x +308 %#x\n", g->name, bb,
+							    rd(q + 0x20), rd(q + 0x24), rd(q + 0x28), bb == b ? er : rd(q + 0x38), rd(q + 0x3c), rd(q + 0xa0),
+							    rd(q + 0xac), rd(q + 0xbc), rd(q + 0xc0), rd(q + 0xc4), rd(q + 0x100), rd(q + 0x108), rd(q + 0x140),
+							    rd(q + 0x1b0), rd(q + 0x1b4), rd(q + 0x1c0), rd(q + 0x308));
+						}
+					}
+				}
 				errs += er != 0;
 				if ((st || er) && said < 24) {
 					said++;
@@ -6443,6 +6499,7 @@ cam_capture(const struct cam_cfg *g)
 	for (unsigned i = 0; i < frame_bytes; i += 4) {
 		changed += *(const volatile uint32_t *)(frame + i) != 0xa5a5a5a5u;
 	}
+	csis_link_say(g->name, "after the run", csis + g->link * 0x10000);
 	printf("akita camera: %s: %u frame starts, %u frame ends, %u polls with an error; %u of %u words of the frame written\n",
 	    g->name, starts, ends, errs, changed, frame_bytes / 4);
 	for (unsigned m = 0; m < 3; m++) {
@@ -6470,6 +6527,11 @@ cam_capture(const struct cam_cfg *g)
 	for (unsigned o = 0x2000; gates && o <= 0x2154; o += 4) {
 		wr(cmu_fe + o, rd(cmu_fe + o) & ~0x100000u);
 	}
+	for (unsigned i = 0; i < 3 && bus_khz; i++) {
+		if (bus_was[i]) {
+			cam_dvfs(0xa + i, bus_was[i]);
+		}
+	}
 	wr(cmu_top + CMU_TOP_ISPFE_MUX, (rd(cmu_top + CMU_TOP_ISPFE_MUX) & ~7u) | (mux & 7u));
 	delay(100);
 	wr(cmu_top + CMU_TOP_ISPFE_DIV, (rd(cmu_top + CMU_TOP_ISPFE_DIV) & ~0x1fu) | (div & 0x1fu));
@@ -6491,7 +6553,7 @@ static const struct cam_cfg cam_main = {
 	main_replay, sizeof(main_replay) / sizeof(main_replay[0]),
 	main_pdma_list, sizeof(main_pdma_list),
 	main_tab_idx, sizeof(main_tab_idx) / sizeof(main_tab_idx[0]), main_tab,
-	0x16c0, 3472, 4624, 0x81, 0x2,
+	0x16c0, 3472, 4624, 0x81, 0x2, 1,
 	{ 0x37300 },
 	{ 0x500e8, 0x13, 0x50148, 0x1a, 0x3b300, 0x1 },         /* (only the bits Android's handler was seen to write) */
 };
