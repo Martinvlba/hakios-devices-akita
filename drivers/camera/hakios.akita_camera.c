@@ -57,8 +57,9 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
-
+#include <vm/pmap.h>
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
 extern int akita_acpm_xfer(unsigned channel, uint32_t cmd[4]);
 extern int akita_i2c14_xfer(uint8_t addr, const uint8_t *w, unsigned wl, uint8_t *r, unsigned rl) __attribute__((weak));
 
@@ -2095,6 +2096,7 @@ static const struct { uint32_t pa, mask, val, cond; } lpm_init_all[] = {
 };
 
 extern uint64_t kvtophys(vm_offset_t va);
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
 
 /*
@@ -2147,7 +2149,68 @@ static const struct { uint64_t pa; unsigned pmmu; uint32_t dflt; const struct mm
 #define FRONT_IOVA              0x10000000u
 #define FRONT_SIDE_IOVA         0x12000000u
 
+/* (word stores: block operations are not allowed on device mappings, which the probes map camera_lowpa memory as) */
+static void
+cam_fill(vm_offset_t va, uint32_t v, size_t len)
+{
+	for (size_t i = 0; i < len / 4; i++) {
+		((volatile uint32_t *)va)[i] = v;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void
+cam_copy(vm_offset_t dst, const void *src, size_t len)
+{
+	for (size_t i = 0; i < len / 4; i++) {
+		((volatile uint32_t *)dst)[i] = ((const uint32_t *)src)[i];
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static uint64_t cam_low;
+/* (cache maintenance only on kernel memory: the camera_lowpa buffers are non-cacheable write-combined mappings, no lines
+ * to clean; LSTEP says each stage of the capture with them first, for a boot that dies part way) */
+#define LSTEP(what) do { if (cam_low) { printf("akita camera: capture: step: %s\n", what); delay_for_interval(300, NSEC_PER_MSEC); } } while (0)
+
+extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start, vm_offset_t end, vm_prot_t prot, unsigned int flags);
+#define LOW_SPAN                0x2200000u
+/* the camera_lowpa region mapped once, write-combined, with kernel addresses of its own and pmap_map: ml_io_map's whole area
+ * is 8 MB (io_map.c's IO_MAP_SIZE), and its exhaustion was what killed run-low3..8 and the memkill runs (always after ~6 MB
+ * of mappings, whatever the address), as it did the AoC driver's 11-11 */
+static vm_offset_t
+cam_lowmap(uint64_t off)
+{
+	static vm_offset_t va;
+
+	if (va == 0) {
+		vm_offset_t v = 0;
+
+		if (kmem_alloc(kernel_map, &v, LOW_SPAN, KMA_VAONLY | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			return 0;
+		}
+		pmap_map(v, (vm_offset_t)cam_low, (vm_offset_t)(cam_low + LOW_SPAN), VM_PROT_READ | VM_PROT_WRITE, VM_WIMG_WCOMB);
+		va = v;
+	}
+	return va + off;
+}
+
+static void
+cam_flush(vm_offset_t va, unsigned len)
+{
+	if (cam_low) {
+		__asm__ volatile ("dsb sy" ::: "memory");
+	} else {
+		flush_dcache(va, len, FALSE);
+	}
+}
+
 static vm_offset_t mmu_flpt;
+static uint64_t mmu_flpt_pa, pdma_mem_pa, pdma_scratch_pa;
+/* camera_lowpa=ADDR: every buffer the front end reaches by DMA put at a physical address below 4 GB (11-18: its DMA does
+ * not reach XNU's RAM at 0x8_8xxxxxxx -- the SysMMU walker read nothing, the PDMA never got its queue; below 4 GB both
+ * work): ADDR+1M the SysMMU table, +2M the PDMA queue/list, +4M its scratch, +8M the second buffer, +16M the frame */
+#define LOW_FRAME_MAP           FRONT_BUF
 static vm_offset_t pdma_mem, pdma_scratch;     /* 1 MiB: the queue + the list; 4 MiB of zeros */
 
 /* Android's IOVAs in our table (camera_pdma): its frame and second buffer onto ours, the queue + list at PDMA_IOVA, every
@@ -2156,7 +2219,7 @@ static void
 mmu_map_android(uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 {
 	uint32_t *t = (uint32_t *)mmu_flpt;
-	uint64_t scr = kvtophys(pdma_scratch);
+	uint64_t scr = pdma_scratch_pa;
 
 	for (unsigned i = 0; i < sizeof(front_pdma_iovas) / sizeof(front_pdma_iovas[0]); i++) {
 		for (unsigned k = 0; k < 4; k++) {
@@ -2167,8 +2230,8 @@ mmu_map_android(uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 		t[(ANDROID_FRAME_IOVA >> 20) + i] = (uint32_t)((frame_pa + ((uint64_t)i << 20)) >> 4) | 2u;
 	}
 	t[ANDROID_SIDE_IOVA >> 20] = (uint32_t)(side_pa >> 4) | 2u;
-	t[PDMA_IOVA >> 20] = (uint32_t)(kvtophys(pdma_mem) >> 4) | 2u;
-	flush_dcache(mmu_flpt, 0x40000, FALSE);
+	t[PDMA_IOVA >> 20] = (uint32_t)(pdma_mem_pa >> 4) | 2u;
+	cam_flush(mmu_flpt, 0x40000);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	/* (the SysMMUs were switched on before these entries: their TLBs invalidated again) */
 	for (unsigned m = 0; m < 3; m++) {
@@ -2187,19 +2250,26 @@ ispfe_mmu(bool on, uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 	if (on) {
 		uint32_t *t;
 
+		if (!mmu_flpt && cam_low) {
+			mmu_flpt_pa = cam_low + 0x100000;
+			mmu_flpt = cam_lowmap(0x100000);
+		}
 		if (!mmu_flpt && kmem_alloc_contig(kernel_map, &mmu_flpt, 0x40000, 0x3ffff, 0, 0, KMA_KOBJECT | KMA_DATA,
 		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 			mmu_flpt = 0;
 			printf("akita camera: capture: no memory for the SysMMU table\n");
 			return false;
 		}
+		if (!mmu_flpt_pa) {
+			mmu_flpt_pa = kvtophys(mmu_flpt);
+		}
 		t = (uint32_t *)mmu_flpt;
-		memset(t, 0, 0x40000);
+		cam_fill(mmu_flpt, 0, 0x40000);
 		for (unsigned i = 0; i < frame_mb; i++) {
 			t[(FRONT_IOVA >> 20) + i] = (uint32_t)((frame_pa + ((uint64_t)i << 20)) >> 4) | 2u;
 		}
 		t[FRONT_SIDE_IOVA >> 20] = (uint32_t)(side_pa >> 4) | 2u;
-		flush_dcache(mmu_flpt, 0x40000, FALSE);
+		cam_flush(mmu_flpt, 0x40000);
 		__asm__ volatile ("dsb sy" ::: "memory");
 	}
 	for (unsigned m = 0; m < 3; m++) {
@@ -2224,7 +2294,7 @@ ispfe_mmu(bool on, uint64_t frame_pa, unsigned frame_mb, uint64_t side_pa)
 					wr(r + MMU_STREAM_CFG(st->index) + 0xc, st->mask);
 				}
 			}
-			wr(r + MMU_FLPT_BASE_VM, (uint32_t)(kvtophys(mmu_flpt) >> 12));
+			wr(r + MMU_FLPT_BASE_VM, (uint32_t)(mmu_flpt_pa >> 12));
 			wr(r + MMU_ATTRIBUTE_VM, (rd(r + MMU_ATTRIBUTE_VM) & ~0xf0000u & ~(0xfu << 7)) | 0x20000u | (1u << 11) | (0xfu << 7));
 			wr(r + MMU_CTRL_VM, rd(r + MMU_CTRL_VM) | 1u);
 			wr(r + MMU_ALL_INV_VM, 1);
@@ -2261,18 +2331,34 @@ front_capture(void)
 		return;
 	}
 	/* (1 MiB aligned, whole MiBs: the SysMMU maps them with 1 MiB sections) */
+	{
+		unsigned low = 0;
+
+		PE_parse_boot_argn("camera_lowpa", &low, sizeof(low));
+		cam_low = low;
+	}
+	if (cam_low) {
+		frame = cam_lowmap(0x1000000);
+		side = cam_lowmap(0x800000);
+		pdma_mem_pa = cam_low + 0x200000;
+		pdma_mem = cam_lowmap(0x200000);
+		pdma_scratch_pa = cam_low + 0x400000;
+		pdma_scratch = cam_lowmap(0x400000);
+		printf("akita camera: capture: the front end's buffers below 4 GB from %#llx\n", cam_low);
+	} else
 	if (kmem_alloc_contig(kernel_map, &frame, FRONT_BUF_MB << 20, 0xfffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
 	    kmem_alloc_contig(kernel_map, &side, FRONT_SIDE, 0xfffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		printf("akita camera: capture: no contiguous memory for the frame\n");
 		return;
 	}
-	frame_pa = kvtophys(frame);
-	side_pa = kvtophys(side);
-	memset((void *)frame, 0xa5, FRONT_BUF);
-	memset((void *)side, 0xa5, FRONT_SIDE);
-	flush_dcache(frame, FRONT_BUF, FALSE);
-	flush_dcache(side, FRONT_SIDE, FALSE);
+	frame_pa = cam_low ? cam_low + 0x1000000 : kvtophys(frame);
+	side_pa = cam_low ? cam_low + 0x800000 : kvtophys(side);
+	cam_fill(frame, 0xa5a5a5a5, cam_low ? LOW_FRAME_MAP : FRONT_BUF);
+	cam_fill(side, 0xa5a5a5a5, FRONT_SIDE);
+	cam_flush(frame, FRONT_BUF);
+	cam_flush(side, FRONT_SIDE);
 	printf("akita camera: capture: frame buffer %#llx (%u bytes), second buffer %#llx\n", frame_pa, FRONT_BUF, side_pa);
+	LSTEP("buffers filled");
 	fe = ml_io_map(ISPFE_FE_PHYS, 0x100000);
 	csis = ml_io_map(ISPFE_CSIS_PHYS, 0xd0000);
 
@@ -2524,6 +2610,7 @@ front_capture(void)
 			printf("akita camera: capture: block 0 stopped and cleared first (0x200a4 now %#x)\n", rd(fe + 0x200a4));
 		}
 	}
+	LSTEP("the PHY/CSIS/front-end setup next");
 	/* Android's setup of the PHY, CSIS link 6 and the front end */
 	for (unsigned i = 0; i < sizeof(ispfe_front_setup) / sizeof(ispfe_front_setup[0]); i++) {
 		const struct ispfe_write *w = &ispfe_front_setup[i];
@@ -2590,6 +2677,7 @@ front_capture(void)
 		uint64_t fa = frame_pa, sa = side_pa;
 
 		PE_parse_boot_argn("camera_mmu", &use_mmu, sizeof(use_mmu));
+		LSTEP("SysMMUs on next");
 		if (use_mmu && ispfe_mmu(true, frame_pa, FRONT_BUF_MB, side_pa)) {
 			mmu_used = true;
 			fa = FRONT_IOVA;
@@ -2605,21 +2693,27 @@ front_capture(void)
 			printf("akita camera: capture: no memory for the PDMA\n");
 			use_pdma = 0;
 		}
+		if (use_pdma && !cam_low) {
+			pdma_mem_pa = kvtophys(pdma_mem);
+			pdma_scratch_pa = kvtophys(pdma_scratch);
+		}
 		if (use_pdma) {
 			uint32_t *q = (uint32_t *)pdma_mem;
 
-			memset((void *)pdma_mem, 0, 0x100000);
-			memset((void *)pdma_scratch, 0, 0x400000);
+			cam_fill(pdma_mem, 0, 0x100000);
+			cam_fill(pdma_scratch, 0, 0x400000);
 			for (unsigned e = 0; e < 256; e++) {
-				q[e * 4] = 0xc003;
-				q[e * 4 + 1] = PDMA_IOVA + 0x1000;
-				q[e * 4 + 2] = 0;
-				q[e * 4 + 3] = sizeof(front_pdma_list);
+				((volatile uint32_t *)q)[e * 4] = 0xc003;
+				((volatile uint32_t *)q)[e * 4 + 1] = PDMA_IOVA + 0x1000;
+				((volatile uint32_t *)q)[e * 4 + 2] = 0;
+				((volatile uint32_t *)q)[e * 4 + 3] = sizeof(front_pdma_list);
 			}
-			memcpy((void *)(pdma_mem + 0x1000), front_pdma_list, sizeof(front_pdma_list));
-			flush_dcache(pdma_mem, 0x100000, FALSE);
-			flush_dcache(pdma_scratch, 0x400000, FALSE);
+			cam_copy(pdma_mem + 0x1000, front_pdma_list, sizeof(front_pdma_list));
+			cam_flush(pdma_mem, 0x100000);
+			cam_flush(pdma_scratch, 0x400000);
+			LSTEP("PDMA memory set; mapping Android's IOVAs next");
 			mmu_map_android(frame_pa, FRONT_BUF_MB, side_pa);
+			LSTEP("IOVAs mapped; PDMA start next");
 			/* Android's start of the PDMA (11-17 trace), less the queue's first entry (just before stream on) */
 			wr(fe + 0x9002c, 1);
 			wr(fe + 0x90040, 0x1f);
@@ -2740,6 +2834,7 @@ front_capture(void)
 			printf("akita camera: capture: fe +0x200b0 = %#x\n", rd(fe + 0x200b0));
 		}
 	}
+	LSTEP("queue + stream-on next");
 	if (use_pdma) {
 		wr(fe + 0x90010, 0x10);
 	}
@@ -3014,10 +3109,10 @@ front_capture(void)
 	    rd(fe + 0x20540), rd(fe + 0x205c0), rd(fe + 0x205c4), rd(fe + 0x37904));
 	wr(fe + 0x20540, 0);
 	/* what came: the frame's bytes no longer 0xa5 */
-	flush_dcache(frame, FRONT_BUF, FALSE);
-	flush_dcache(side, FRONT_SIDE, FALSE);
-	for (unsigned i = 0; i < FRONT_BUF; i++) {
-		if (((uint8_t *)frame)[i] != 0xa5) {
+	cam_flush(frame, FRONT_BUF);
+	cam_flush(side, FRONT_SIDE);
+	for (unsigned i = 0; i < (cam_low ? LOW_FRAME_MAP : FRONT_BUF); i++) {
+		if (((volatile uint8_t *)frame)[i] != 0xa5) {
 			changed++;
 			first = first == ~0u ? i : first;
 		}
@@ -3772,7 +3867,7 @@ front_replay_capture(void)
 	frame_pa = kvtophys(frame);
 	side_pa = kvtophys(side);
 	memset((void *)frame, 0xa5, FRONT_BUF);
-	flush_dcache(frame, FRONT_BUF, FALSE);
+	cam_flush(frame, FRONT_BUF);
 	{
 		uint32_t *q = (uint32_t *)pdma_mem;
 
@@ -3785,8 +3880,8 @@ front_replay_capture(void)
 			q[e * 4 + 3] = sizeof(front_pdma_list);
 		}
 		memcpy((void *)(pdma_mem + 0x1000), front_pdma_list, sizeof(front_pdma_list));
-		flush_dcache(pdma_mem, 0x100000, FALSE);
-		flush_dcache(pdma_scratch, 0x400000, FALSE);
+		cam_flush(pdma_mem, 0x100000);
+		cam_flush(pdma_scratch, 0x400000);
 	}
 	if (!ispfe_mmu(true, frame_pa, FRONT_BUF_MB, side_pa)) {
 		return;
@@ -3881,7 +3976,7 @@ front_replay_capture(void)
 		i2c_write16(c->bus, 0x1a, 0x0100, &zero, 1);
 	}
 	delay(50000);
-	flush_dcache(frame, FRONT_BUF, FALSE);
+	cam_flush(frame, FRONT_BUF);
 	for (unsigned i = 0; i < FRONT_BUF; i++) {
 		changed += ((uint8_t *)frame)[i] != 0xa5;
 	}
@@ -3903,6 +3998,205 @@ down:
 		slg_ldo_off(c->ldo[on]);
 	}
 	printf("akita camera: replay: front camera powered down\n");
+}
+
+/*
+ * camera=10: the PDMA alone, as a probe of the front end's bus path: a list of one write (fe +0x20554 <- 0x1234 + try)
+ * queued 5 times through the SysMMUs (IOVA PDMA_IOVA, 1 MiB section onto our buffer) and 5 times with them off (physical
+ * addresses); each try says whether the queue was read (read pointer) and the list executed (the register).
+ */
+static void
+pdma_probe(void)
+{
+	vm_offset_t fe = ml_io_map(ISPFE_FE_PHYS, 0x100000), pmu = ml_io_map(0x15462000ULL, 0x2000), mem = 0, lowtab = 0;
+	uint64_t mem_pa = 0, lowtab_pa = 0;
+
+	if (!(rd(pmu + 0x484) & 1u)) {
+		printf("akita camera: pdma probe: pd-ispfe is off\n");
+		return;
+	}
+	{
+		unsigned low = 0;       /* camera_lowpa=ADDR: the queue/list (mem) and the SysMMU table at a physical address below
+		                         * 4 GB (outside XNU; mapped uncached): mem at ADDR, the table at ADDR + 0x100000 */
+
+		PE_parse_boot_argn("camera_lowpa", &low, sizeof(low));
+		if (low) {
+			mem = ml_io_map(low, 0x100000);
+			mem_pa = low;
+			lowtab_pa = (uint64_t)low + 0x100000;
+			lowtab = ml_io_map(lowtab_pa, 0x40000);
+			printf("akita camera: pdma probe: buffers below 4 GB: mem %#llx, table %#llx\n", mem_pa, lowtab_pa);
+		}
+	}
+	if (!mem) {
+		if (kmem_alloc_contig(kernel_map, &mem, 0x100000, 0xfffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			return;
+		}
+		mem_pa = kvtophys(mem);
+	}
+	if (!mmu_flpt && kmem_alloc_contig(kernel_map, &mmu_flpt, 0x40000, 0x3ffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return;
+	}
+	if (!mmu_flpt_pa) {
+		mmu_flpt_pa = kvtophys(mmu_flpt);
+	}
+	{
+		unsigned s2off = 1;
+
+		PE_parse_boot_argn("camera_s2off", &s2off, sizeof(s2off));
+		for (unsigned i = 0; s2off && i < 3; i++) {
+			static const uint64_t s2mpu_pa[3] = { 0x1c140000ULL, 0x1c180000ULL, 0x1c1c0000ULL };
+			vm_offset_t s2 = ml_io_map(s2mpu_pa[i], 0x3000);
+
+			wr(s2 + 0x54, 0xff);
+			wr(s2 + 0x1000, 1);
+		}
+	}
+	for (unsigned mode = 0; mode < 2; mode++) {
+		if (mode == 0) {        /* through the SysMMUs: our table, PDMA_IOVA's section onto mem */
+			ispfe_mmu(true, mem_pa, 1, mem_pa);
+			((uint32_t *)mmu_flpt)[PDMA_IOVA >> 20] = (uint32_t)(mem_pa >> 4) | 2u;
+			cam_flush(mmu_flpt, 0x40000);
+			if (lowtab) {   /* the table below 4 GB instead: a copy, and the SysMMUs pointed at it */
+				for (unsigned k = 0; k < 0x10000; k++) {
+					*(volatile uint32_t *)(lowtab + k * 4) = ((uint32_t *)mmu_flpt)[k];
+				}
+				__asm__ volatile ("dsb sy" ::: "memory");
+			}
+			for (unsigned m = 0; m < 3; m++) {
+				static const uint64_t mmus[3] = { 0x1c110000ULL, 0x1c150000ULL, 0x1c190000ULL };
+				vm_offset_t r = ml_io_map(mmus[m], 0x10000);
+
+				if (lowtab) {
+					wr(r + 0x8404, (uint32_t)(lowtab_pa >> 12));
+				}
+				wr(r + 0x8010, 1);
+			}
+		} else {
+			ispfe_mmu(false, 0, 0, 0);
+		}
+		for (unsigned t = 0; t < 5; t++) {
+			uint32_t *q = (uint32_t *)mem, *l = (uint32_t *)(mem + 0x1000);
+			uint64_t qa = mode ? mem_pa : PDMA_IOVA, la = qa + 0x1000;
+			uint32_t want = 0x1234 + t + mode * 16, r14 = 0, reg = 0;
+
+			for (unsigned k = 0; k < 0x800; k++) {
+				((volatile uint32_t *)mem)[k] = 0;
+			}
+			((volatile uint32_t *)l)[0] = 0x0000400b; ((volatile uint32_t *)l)[1] = 0; ((volatile uint32_t *)l)[2] = 0x00018002;
+			((volatile uint32_t *)l)[3] = 0x20554; ((volatile uint32_t *)l)[4] = want;
+			((volatile uint32_t *)q)[0] = 0xc003; ((volatile uint32_t *)q)[1] = (uint32_t)la;
+			((volatile uint32_t *)q)[2] = (uint32_t)(la >> 32); ((volatile uint32_t *)q)[3] = 20;
+			if (!lowtab) {
+				flush_dcache(mem, 0x2000, FALSE);
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			wr(fe + 0x20554, 0);
+			wr(fe + 0x90000, 0);
+			wr(fe + 0x9002c, 1);
+			wr(fe + 0x90040, 0x1f);
+			wr(fe + 0x90004, (uint32_t)qa);
+			wr(fe + 0x90008, (uint32_t)(qa >> 32));
+			wr(fe + 0x9000c, 0x3e8);
+			wr(fe + 0x90010, 0);
+			wr(fe + 0x90000, 1);
+			wr(fe + 0x90028, 1);
+			wr(fe + 0x90010, 0x10);
+			for (int i = 0; i < 100; i++) {
+				delay(100);
+				r14 = rd(fe + 0x90014);
+				reg = rd(fe + 0x20554);
+				if (reg == want) {
+					break;
+				}
+			}
+			printf("akita camera: pdma probe: %s try %u: rptr %#x, fe+0x20554 %#x (%s) [pdma +00 %#x +18 %#x +1c %#x +24 %#x +28 %#x +30 %#x +38 %#x]\n",
+			    mode ? "physical" : "IOVA", t, r14, reg, reg == want ? "list RAN" : "not run", rd(fe + 0x90000), rd(fe + 0x90018),
+			    rd(fe + 0x9001c), rd(fe + 0x90024), rd(fe + 0x90028), rd(fe + 0x90030), rd(fe + 0x90038));
+		}
+		for (unsigned i = 0; i < 3; i++) {
+			static const uint64_t s2mpu_pa[3] = { 0x1c140000ULL, 0x1c180000ULL, 0x1c1c0000ULL };
+			static const uint64_t mmus[3] = { 0x1c110000ULL, 0x1c150000ULL, 0x1c190000ULL };
+			vm_offset_t s2 = ml_io_map(s2mpu_pa[i], 0x3000), r = ml_io_map(mmus[i], 0x10000);
+
+			printf("akita camera: pdma probe: after %s: S2MPU %#llx FAULT %#x (vid0 %#x %#x %#x); SysMMU %#llx CTRL_VM %#x FAULT %#x VA %#x INFO %#x %#x %#x\n",
+			    mode ? "physical" : "IOVA", s2mpu_pa[i], rd(s2 + 0x2000), rd(s2 + 0x2004), rd(s2 + 0x2008), rd(s2 + 0x2010), mmus[i],
+			    rd(r + 0x8000), rd(r + 0x8060), rd(r + 0x8070), rd(r + 0x8074), rd(r + 0x8078), rd(r + 0x807c));
+		}
+	}
+	wr(fe + 0x90000, 0);
+}
+
+/*
+ * camera=11: which RAM below 4 GB (outside XNU) can be written: from camera_memfrom (default 0x98000000) to camera_memto
+ * (0xb6000000) one word per MiB written and read back, each address said first and 30 ms given (an access the secure
+ * world forbids resets the phone: the last address said is the culprit)
+ */
+static void
+low_mem_probe(void)
+{
+	unsigned from = 0x98000000, to = 0xb6000000;
+
+	PE_parse_boot_argn("camera_memfrom", &from, sizeof(from));
+	PE_parse_boot_argn("camera_memto", &to, sizeof(to));
+	{
+		unsigned fill = 0, flen = 0x200000;     /* camera_memfill=ADDR: first ADDR..+2 MiB filled by word stores, as the
+		                                         * capture's buffers are (camera_memfilllen to change the length) */
+
+		PE_parse_boot_argn("camera_memfill", &fill, sizeof(fill));
+		PE_parse_boot_argn("camera_memfilllen", &flen, sizeof(flen));
+		if (fill) {
+			vm_offset_t fv;
+
+			printf("akita camera: memprobe fill %#x + %#x: mapping\n", fill, flen);
+			delay_for_interval(200, NSEC_PER_MSEC);
+			fv = ml_io_map(fill, flen);
+			printf("akita camera: memprobe fill: mapped at %#lx, filling\n", (unsigned long)fv);
+			delay_for_interval(200, NSEC_PER_MSEC);
+			cam_fill(fv, 0xa5a5a5a5, flen);
+			printf("akita camera: memprobe fill: done, word 0 %#x, last %#x\n", *(volatile uint32_t *)fv,
+			    *(volatile uint32_t *)(fv + flen - 4));
+			delay_for_interval(200, NSEC_PER_MSEC);
+		}
+	}
+	{
+		unsigned dfrom = 0, dto = 0;    /* camera_memkill=FROM camera_memkillto=TO: each MiB in FROM..TO FILLED (destroyed),
+		                                 * said first and given 400 ms: whatever uses it dies with the phone, the last said */
+
+		PE_parse_boot_argn("camera_memkill", &dfrom, sizeof(dfrom));
+		PE_parse_boot_argn("camera_memkillto", &dto, sizeof(dto));
+		for (uint64_t pa = dfrom; dfrom && pa < dto; pa += 0x100000) {
+			vm_offset_t va;
+
+			printf("akita camera: memkill %#llx\n", pa);
+			delay_for_interval(400, NSEC_PER_MSEC);
+			va = ml_io_map(pa, 0x100000);
+			cam_fill(va, 0xa5a5a5a5, 0x100000);
+		}
+		if (dfrom) {
+			printf("akita camera: memkill done %#x-%#x, waiting 3 s\n", dfrom, dto);
+			delay_for_interval(3000, NSEC_PER_MSEC);
+			printf("akita camera: memkill: still alive\n");
+			return;
+		}
+	}
+	for (uint64_t pa = from; pa < to; pa += 0x100000) {
+		vm_offset_t va;
+		uint32_t old, back;
+
+		printf("akita camera: memprobe %#llx\n", pa);
+		delay_for_interval(pa >= 0xae000000ULL ? 300 : 30, NSEC_PER_MSEC);
+		va = ml_io_map(pa, 0x1000);
+		old = *(volatile uint32_t *)va;
+		*(volatile uint32_t *)va = 0x5a5a1234;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		back = *(volatile uint32_t *)va;
+		*(volatile uint32_t *)va = old;
+		if (back != 0x5a5a1234) {
+			printf("akita camera: memprobe %#llx: wrote 0x5a5a1234, read %#x\n", pa, back);
+		}
+	}
+	printf("akita camera: memprobe done %#x-%#x\n", from, to);
 }
 
 static void
@@ -4046,6 +4340,14 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 	}
 	if (camera_mode == 9) {
 		front_replay_capture();
+		return;
+	}
+	if (camera_mode == 10) {
+		pdma_probe();
+		return;
+	}
+	if (camera_mode == 11) {
+		low_mem_probe();
 		return;
 	}
 	if (camera_mode >= 3) {
