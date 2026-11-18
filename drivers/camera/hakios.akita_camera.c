@@ -2612,6 +2612,69 @@ pdma_patch_tables(void)
 	    (unsigned)(sizeof(front_pdma_tab_idx) / sizeof(front_pdma_tab_idx[0])));
 }
 
+/* the front sensor's exposure (IMX712, Sony's usual registers: 0x0202 COARSE_INTEG_TIME, 0x0204 ANA_GAIN_GLOBAL = 1024 -
+ * 1024/gain, 0x0340 FRM_LENGTH_LINES, under 0x0104's group hold), from one number: lines x gain. 30 fps (3128 lines a
+ * frame) while the exposure fits, then gain up to 16x, then longer frames down to 15 fps (6315 lines, Android's own
+ * dark-room setting) */
+static void
+front_set_exposure(int bus, uint32_t e_lines_x64)
+{
+	uint32_t lines, gain64 = 64, fll = 3128, reg;
+	uint8_t b[2], one = 1, zero = 0;
+
+	if (e_lines_x64 < 8 * 64) {
+		e_lines_x64 = 8 * 64;
+	}
+	lines = e_lines_x64 / 64;
+	if (lines > 3118) {
+		gain64 = (uint32_t)(((uint64_t)e_lines_x64) / 3118);
+		lines = 3118;
+		if (gain64 > 16 * 64) {
+			gain64 = 16 * 64;
+			lines = e_lines_x64 / gain64;
+			if (lines > 6304) {
+				lines = 6304;
+			}
+			if (lines > 3118) {
+				fll = lines + 11;
+			}
+		}
+	}
+	reg = 1024 - (1024 * 64) / gain64;
+	i2c_write16(bus, 0x1a, 0x0104, &one, 1);
+	b[0] = (uint8_t)(fll >> 8); b[1] = (uint8_t)fll;
+	i2c_write16(bus, 0x1a, 0x0340, b, 2);
+	b[0] = (uint8_t)(lines >> 8); b[1] = (uint8_t)lines;
+	i2c_write16(bus, 0x1a, 0x0202, b, 2);
+	b[0] = (uint8_t)(reg >> 8); b[1] = (uint8_t)reg;
+	i2c_write16(bus, 0x1a, 0x0204, b, 2);
+	i2c_write16(bus, 0x1a, 0x0104, &zero, 1);
+	printf("akita camera: exposure: %u lines, gain %u.%02ux (reg %u), frame %u lines\n", lines, gain64 / 64,
+	    (gain64 % 64) * 100 / 64, reg, fll);
+}
+
+/* a finished front frame's brightness: the green pixels of every 40th line (every 40th of them), their top 8 bits; the
+ * mean above the black level (16) x 16, and how many of 1000 are at the ceiling */
+static void
+front_measure(vm_offset_t frame, uint32_t *mean16, uint32_t *clipped_pm)
+{
+	uint32_t sum = 0, n = 0, clip = 0;
+
+	for (unsigned y = 0; y < FRONT_HEIGHT; y += 40) {
+		const volatile uint8_t *r = (const volatile uint8_t *)frame + (size_t)y * FRONT_STRIDE;
+
+		for (unsigned x = 0; x < 4200; x += 40) {
+			uint8_t v = r[(x / 4) * 5 + 1];         /* (BGGR: the odd pixel of an even line is green) */
+
+			sum += v > 16 ? v - 16u : 0;
+			clip += v >= 250;
+			n++;
+		}
+	}
+	*mean16 = n ? sum * 16 / n : 0;
+	*clipped_pm = n ? clip * 1000 / n : 0;
+}
+
 /* a front frame (the packed RAW10 as the front end wrote it, FRONT_STRIDE x FRONT_HEIGHT bytes) into a file AFC serves:
  * /var/mobile/Media/hakios-klog/front.raw (tools/usbmux-pull-frame.py fetches it and makes a picture). Copied through a
  * 1 MiB kernel buffer; up to 30 s waited for the data volume */
@@ -4423,6 +4486,8 @@ front_replay_capture(void)
 	uint32_t rp_mux, rp_div;
 	unsigned prog = 0;
 	unsigned kick = 0;
+	unsigned aeloop = 1, ae_target = 44, ae_frames = 36, polls = 400;
+	uint32_t ae_e = 6304u * 16 * 64;        /* (lines x gain x 64: Android's opening values, what the replay programs) */
 	unsigned one_frame = 1;         /* camera_one=0: keep streaming for the 400 polls */
 	uint64_t frame_pa, side_pa;
 	unsigned on = 0, changed = 0, ends = 0, starts = 0;
@@ -4567,7 +4632,12 @@ front_replay_capture(void)
 	    rd(fe + 0x90014));
 	PE_parse_boot_argn("camera_one", &one_frame, sizeof(one_frame));
 	PE_parse_boot_argn("camera_kick", &kick, sizeof(kick));
-	for (unsigned it = 0; it < 400; it++) {
+	PE_parse_boot_argn("camera_aeloop", &aeloop, sizeof(aeloop));
+	PE_parse_boot_argn("camera_aetarget", &ae_target, sizeof(ae_target));
+	if (aeloop && kick && !one_frame) {
+		polls = 1800;           /* (~2 s: the loop settles in a dozen frames; the last frame is the one saved) */
+	}
+	for (unsigned it = 0; it < polls; it++) {
 		uint32_t v424 = rd(fe + 0x20424), v438 = rd(fe + 0x20438), v4ac = rd(fe + 0x204ac);
 
 		if (v424 && v424 != last424 && (starts + ends) < 12) {
@@ -4589,6 +4659,37 @@ front_replay_capture(void)
 				ends++;
 				wr(fe + 0x500e8, 3);
 				wr(fe + 0x37300, 4);
+				/* auto-exposure (camera_aeloop=0: off): every third finished frame measured (a change takes two frames
+				 * to show), the exposure scaled towards a green mean of AE_TARGET above black -- less when more than 3 %
+				 * is clipped and the mean is not far below it */
+				if (aeloop && (ends % 3) == 0 && ends < ae_frames) {
+					uint32_t m16, cl, want = ae_target * 16, ne;
+
+					front_measure(frame, &m16, &cl);
+					if (cl > 30 && m16 > want * 3 / 4) {
+						want = m16 * 3 / 4;
+					}
+					if (m16 < 8) {
+						m16 = 8;
+					}
+					ne = (uint32_t)(((uint64_t)ae_e * want) / m16);
+					if (ne > ae_e * 4) {
+						ne = ae_e * 4;
+					}
+					if (ne < ae_e / 4) {
+						ne = ae_e / 4;
+					}
+					if (ne > 6304u * 16 * 64) {
+						ne = 6304u * 16 * 64;
+					}
+					printf("akita camera: ae: frame %u: green mean %u.%u above black, %u.%u %% clipped; exposure x%u.%02u\n", ends,
+					    m16 / 16, (m16 % 16) * 10 / 16, cl / 10, cl % 10, ne / (ae_e ? ae_e : 1),
+					    (uint32_t)(((uint64_t)ne * 100 / (ae_e ? ae_e : 1)) % 100));
+					if (ne > ae_e + ae_e / 12 || ne < ae_e - ae_e / 12) {
+						ae_e = ne;
+						front_set_exposure(c->bus, ae_e);
+					}
+				}
 			}
 			wr(fe + 0x2008c, 1);
 			wr(fe + 0x20404, 0);
