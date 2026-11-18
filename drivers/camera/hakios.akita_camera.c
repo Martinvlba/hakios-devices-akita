@@ -2017,6 +2017,83 @@ static const uint32_t front_pdma_iovas[] = {
 #define ANDROID_FRAME_IOVA      0xe7c00000u
 #define ANDROID_SIDE_IOVA       0xe78cb000u
 
+/* pmucal_lpm_init less the CPU clusters' entries (flexpmu_cal_system_zuma.h): pa, mask, value, PMU status (0: none) */
+static const struct { uint32_t pa, mask, val, cond; } lpm_init_all[] = {
+	{ 0x1a300860, 0x00000007, 0x00000007, 0x15462504 },	/* TPU_HCHGEN_CLKMUX_LPM */
+	{ 0x26040850, 0x00000001, 0x00000001, 0x00000000 },	/* CMU_HCHGEN_CLKMUX */
+	{ 0x27c00850, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_HCHGEN_CLKMUX_CMUREF */
+	{ 0x27d00850, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_HCHGEN_CLKMUX_CMUREF */
+	{ 0x27e00850, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_HCHGEN_CLKMUX_CMUREF */
+	{ 0x27f00850, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_HCHGEN_CLKMUX_CMUREF */
+	{ 0x26000840, 0x0000003f, 0x00000001, 0x00000000 },	/* NOCL0_HCHGEN_CLKMUX_CMUREF */
+	{ 0x26400840, 0x00000001, 0x00000001, 0x00000000 },	/* NOCL1A_HCHGEN_CLKMUX_CMUREF */
+	{ 0x26800840, 0x0000003f, 0x00000001, 0x00000000 },	/* NOCL1B_HCHGEN_CLKMUX_CMUREF */
+	{ 0x26c00840, 0x00000001, 0x00000001, 0x00000000 },	/* NOCL2AA_HCHGEN_CLKMUX_CMUREF */
+	{ 0x27000840, 0x00000001, 0x00000001, 0x00000000 },	/* NOCL2AB_HCHGEN_CLKMUX_CMUREF */
+	{ 0x1ee00820, 0x00000001, 0x00000001, 0x15461a84 },	/* G3D_SHORTSTOP */
+	{ 0x27c00820, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_SHORTSTOP */
+	{ 0x27d00820, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_SHORTSTOP */
+	{ 0x27e00820, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_SHORTSTOP */
+	{ 0x27f00820, 0x00000001, 0x00000001, 0x00000000 },	/* MIF_SHORTSTOP */
+	{ 0x26000820, 0x00000001, 0x00000001, 0x00000000 },	/* NOCL0_SHORTSTOP */
+	{ 0x20a00820, 0x00000001, 0x00000001, 0x15462304 },	/* AUR_SHORTSTOP */
+	{ 0x1a300820, 0x00000001, 0x00000001, 0x15462504 },	/* TPU_SHORTSTOP */
+	{ 0x27c4f240, 0x80000000, 0x00000000, 0x00000000 },	/* PWRMGMT_BUNDLE_PwrMgmtMode2 */
+	{ 0x27d4f240, 0x80000000, 0x00000000, 0x00000000 },	/* PWRMGMT_BUNDLE_PwrMgmtMode2 */
+	{ 0x27e4f240, 0x80000000, 0x00000000, 0x00000000 },	/* PWRMGMT_BUNDLE_PwrMgmtMode2 */
+	{ 0x27f4f240, 0x80000000, 0x00000000, 0x00000000 },	/* PWRMGMT_BUNDLE_PwrMgmtMode2 */
+	{ 0x15420104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x29c20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x29c2010c, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN_INT */
+	{ 0x1ee20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x19420104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x19820104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x19c20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1a820104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1d420104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN0 */
+	{ 0x1d420400, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN1 */
+	{ 0x1d820104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1d020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1a420104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1c420104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN0 */
+	{ 0x1c420400, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN1 */
+	{ 0x1cc20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN0 */
+	{ 0x1cc2010c, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN1 */
+	{ 0x1c820104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x19020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x20a40104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1a620104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x16c20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1c020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x1a320104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x27c20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x27d20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x27e20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x27f20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x10030104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x26020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT0_DRCG_EN */
+	{ 0x26420104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x26820104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x26c20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x27020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x11020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x12020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x13020104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x10820104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x10c20104, 0xffffffff, 0xffffffff, 0x00000000 },	/* BUS_COMPONENT_DRCG_EN */
+	{ 0x15463cb0, 0xffffffff, 0x00000244, 0x00000000 },	/* EXT_REGULATOR_MIF_DURATION */
+	{ 0x15463cb4, 0xffffffff, 0x000000a0, 0x00000000 },	/* EXT_REGULATOR_TOP_DURATION */
+	{ 0x15463cc0, 0xffffffff, 0x000000be, 0x00000000 },	/* EXT_REGULATOR_G3D_DURATION */
+	{ 0x15463cc4, 0xffffffff, 0x000000a0, 0x00000000 },	/* EXT_REGULATOR_TPU_DURATION */
+	{ 0x15463cc8, 0x000fffff, 0x0000066c, 0x00000000 },	/* TCXO_DURATION */
+	{ 0x26040880, 0x00000001, 0x00000001, 0x00000000 },	/* EARLY_WAKEUP_DPU_CTRL */
+	{ 0x26040898, 0xffffffff, 0x000000fe, 0x00000000 },	/* EARLY_WAKEUP_DPU_DEST */
+	{ 0x26040884, 0x00000001, 0x00000001, 0x00000000 },	/* EARLY_WAKEUP_ISPFE_CTRL */
+	{ 0x2604089c, 0xffffffff, 0x000000fe, 0x00000000 },	/* EARLY_WAKEUP_ISPFE_DEST */
+	{ 0x26040888, 0x00000001, 0x00000001, 0x00000000 },	/* EARLY_WAKEUP_GSE_CTRL */
+	{ 0x260408a0, 0xffffffff, 0x000004fc, 0x00000000 },	/* EARLY_WAKEUP_GSE_DEST */
+};
+
 extern uint64_t kvtophys(vm_offset_t va);
 extern void flush_dcache(vm_offset_t addr, unsigned count, int phys);
 
@@ -2174,7 +2251,7 @@ front_capture(void)
 	uint64_t frame_pa, side_pa;
 	uint8_t one = 1, zero = 0, fc = 0;
 	unsigned changed = 0, first = ~0u;
-	unsigned on = 0, use_pdma = 1, ch0_on = 1, arm37 = 0, phy_late = 1;
+	unsigned on = 0, use_pdma = 1, ch0_on = 1, arm37 = 0, phy_late = 1, s2off = 1;
 	uint32_t old_fe_mux = 0, old_fe_div = 0;
 	bool fe_clk_set = false;
 	bool mmu_used = false;
@@ -2266,6 +2343,63 @@ front_capture(void)
 				}
 				printf("akita camera: capture: pd-%s status %#x\n", pds[k].n, st);
 			}
+		}
+	}
+	/* pmucal_lpm_init (flexpmu_cal_system_zuma.h), which Android's kernel applies once at boot and ours never did: the
+	 * bus/camera part -- CMU_TOP HCHGEN_CLKMUX (+0x850), EARLY_WAKEUP DPU/ISPFE/GSE CTRL and DEST (+0x880..+0x8a0), the
+	 * NoCs' HCHGEN_CLKMUX_CMUREF (+0x840). Said as found; camera_lpminit=1 writes Android's values */
+	{
+		static const struct { uint32_t pa, val; } lpm[] = { { 0x26040850, 1 }, { 0x26040880, 1 }, { 0x26040898, 0xfe },
+			{ 0x26040884, 1 }, { 0x2604089c, 0xfe }, { 0x26040888, 1 }, { 0x260408a0, 0x4fc }, { 0x26000840, 1 },
+			{ 0x26400840, 1 }, { 0x26800840, 1 }, { 0x26c00840, 1 }, { 0x27000840, 1 } };
+		unsigned li = 0;
+		char line[300];
+		int n = 0;
+
+		PE_parse_boot_argn("camera_lpminit", &li, sizeof(li));
+		for (unsigned k = 0; k < sizeof(lpm) / sizeof(lpm[0]); k++) {
+			vm_offset_t va = ml_io_map(lpm[k].pa & ~0xfffULL, 0x1000) + (lpm[k].pa & 0xfff);
+
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %x:%x", lpm[k].pa, rd(va));
+			if (li) {
+				wr(va, lpm[k].val);
+			}
+		}
+		printf("akita camera: capture: lpm_init words as found:%s%s\n", line, li ? " (Android's written)" : "");
+	}
+	{
+		unsigned la = 0, done = 0, skipped = 0;
+
+		PE_parse_boot_argn("camera_lpmall", &la, sizeof(la));
+		for (unsigned k = 0; la && k < sizeof(lpm_init_all) / sizeof(lpm_init_all[0]); k++) {
+			uint32_t pa = lpm_init_all[k].pa, top = pa >> 20;
+
+			/* (TPU, AUR and G3D sides left alone: their domains may be off here, and a touch of them resets the phone) */
+			if (top == 0x1a3 || top == 0x1a4 || top == 0x1a6 || top == 0x1a8 || top == 0x20a || top == 0x1ee) {
+				skipped++;
+				continue;
+			}
+			if (lpm_init_all[k].cond) {
+				vm_offset_t cv = ml_io_map(lpm_init_all[k].cond & ~0xfffULL, 0x1000) + (lpm_init_all[k].cond & 0xfff);
+
+				if (!(rd(cv) & 1u)) {
+					skipped++;
+					continue;
+				}
+			}
+			if (top == 0x154 && (pa >> 16) == 0x1546) {
+				vm_offset_t va = ml_io_map(pa & ~0xfffULL, 0x1000) + (pa & 0xfff);
+
+				cam_smc(SMC_PRIV_REG, pa, PRIV_REG_WRITE, (rd(va) & ~lpm_init_all[k].mask) | lpm_init_all[k].val);
+			} else {
+				vm_offset_t va = ml_io_map(pa & ~0xfffULL, 0x1000) + (pa & 0xfff);
+
+				wr(va, (rd(va) & ~lpm_init_all[k].mask) | lpm_init_all[k].val);
+			}
+			done++;
+		}
+		if (la) {
+			printf("akita camera: capture: pmucal_lpm_init applied: %u written, %u skipped\n", done, skipped);
 		}
 	}
 	/* the front camera powered and set to its mode (not streaming) */
@@ -2554,7 +2688,8 @@ front_capture(void)
 	/* the isp-fe S2MPUs (stage-2 protection, programmed on Android by pKVM only) protection off for every VID, as the
 	 * GPU's needed (hakios.akita_mali.c mali_s2mpu=2: found on there, with a table letting a fifth of the pages through,
 	 * and refusing silently) -- only the registers Google's v9 code touches */
-	for (unsigned i = 0; i < 3; i++) {
+	PE_parse_boot_argn("camera_s2off", &s2off, sizeof(s2off));
+	for (unsigned i = 0; s2off && i < 3; i++) {
 		static const uint64_t s2mpu_pa[3] = { 0x1c140000ULL, 0x1c180000ULL, 0x1c1c0000ULL };
 		vm_offset_t s2 = ml_io_map(s2mpu_pa[i], 0x3000);
 
@@ -2895,10 +3030,20 @@ front_capture(void)
 		printf("akita camera: capture: row %u: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", row, b[0], b[1], b[2], b[3],
 		    b[4], b[5], b[6], b[7], b[8], b[9]);
 	}
-	{
-		vm_offset_t s2 = ml_io_map(0x1c140000ULL, 0x3000);
+	for (unsigned i = 0; i < 3; i++) {
+		/* the three isp-fe S2MPUs: VERSION, FAULT_STATUS (a bit per VID) and each faulting VID's address and info */
+		static const uint64_t s2mpu_pa[3] = { 0x1c140000ULL, 0x1c180000ULL, 0x1c1c0000ULL };
+		vm_offset_t s2 = ml_io_map(s2mpu_pa[i], 0x3000);
+		uint32_t fs = rd(s2 + 0x2000);
 
-		printf("akita camera: capture: S2MPU S0 FAULT_STATUS %#x\n", rd(s2 + 0x2000));
+		printf("akita camera: capture: S2MPU %#llx (protection %s): VERSION %#x FAULT_STATUS %#x\n", s2mpu_pa[i],
+		    s2off ? "switched off" : "as found", rd(s2 + 0x60), fs);
+		for (unsigned vid = 0; vid < 8; vid++) {
+			if (fs & (1u << vid)) {
+				printf("akita camera: capture:   vid %u: fault at %#x%08x, info %#x\n", vid, rd(s2 + 0x2008 + vid * 0x20),
+				    rd(s2 + 0x2004 + vid * 0x20), rd(s2 + 0x2010 + vid * 0x20));
+			}
+		}
 	}
 down:
 	if (fe_clk_set) {
@@ -3201,6 +3346,565 @@ down:
 	printf("akita camera: uw: powered down\n");
 }
 
+/* Android's fresh front-camera open (11-18 fresh-open-front.trace.gz), from its first write to the front end's start:
+ * every isp-fe write (front end, CSIS/PHY, sysreg, PDMA) and every front-sensor I2C write, in order; kind 0 MMIO (pa),
+ * 1 sensor register; delay_us = the gap before it (gaps under 50 us dropped) */
+struct replay_ev { uint8_t kind; uint32_t addr, val, delay_us; };
+static const struct replay_ev front_replay[] = {
+	{ 1, 0x136, 0x18, 0 },
+	{ 1, 0x137, 0x93, 90 },
+	{ 1, 0x3040, 0x1, 112 },
+	{ 1, 0x3041, 0x1, 90 },
+	{ 1, 0x101, 0x3, 78 },
+	{ 1, 0x300b, 0x0, 79 },
+	{ 1, 0x4350, 0x3c, 89 },
+	{ 1, 0x4516, 0x3e, 78 },
+	{ 1, 0x4518, 0x56, 74 },
+	{ 1, 0x451a, 0x2, 71 },
+	{ 1, 0x451b, 0xdb, 79 },
+	{ 1, 0x4527, 0x0, 79 },
+	{ 1, 0x4528, 0xff, 74 },
+	{ 1, 0x45be, 0x4b, 87 },
+	{ 1, 0x45bf, 0xcc, 76 },
+	{ 1, 0x45c6, 0x4b, 102 },
+	{ 1, 0x45c7, 0xcc, 90 },
+	{ 1, 0x4702, 0xa, 81 },
+	{ 1, 0x4828, 0x8, 71 },
+	{ 1, 0x484c, 0x2b, 68 },
+	{ 1, 0x484d, 0x2b, 87 },
+	{ 1, 0x484e, 0x2b, 83 },
+	{ 1, 0x484f, 0x2b, 90 },
+	{ 1, 0x4850, 0x20, 86 },
+	{ 1, 0x4851, 0x20, 84 },
+	{ 1, 0x4852, 0x20, 83 },
+	{ 1, 0x4853, 0x20, 69 },
+	{ 1, 0x4856, 0x5, 88 },
+	{ 1, 0x4857, 0x5, 108 },
+	{ 1, 0x4858, 0x5, 77 },
+	{ 1, 0x4859, 0x5, 70 },
+	{ 1, 0x485a, 0x4, 68 },
+	{ 1, 0x485b, 0x4, 76 },
+	{ 1, 0x485c, 0x4, 82 },
+	{ 1, 0x485d, 0x4, 100 },
+	{ 1, 0x4879, 0x0, 79 },
+	{ 1, 0x4899, 0xa, 84 },
+	{ 1, 0x48a9, 0x2e, 80 },
+	{ 1, 0x6a10, 0xa, 74 },
+	{ 1, 0x70b0, 0x0, 92 },
+	{ 1, 0x70ab, 0xff, 87 },
+	{ 1, 0x4012, 0x0, 77 },
+	{ 1, 0x4013, 0xdf, 70 },
+	{ 1, 0x708b, 0x0, 87 },
+	{ 1, 0x4108, 0x1, 112 },
+	{ 1, 0x4109, 0x7, 90 },
+	{ 1, 0x30a1, 0x1, 88 },
+	{ 1, 0x106, 0x1, 88 },
+	{ 1, 0x112, 0xa, 117 },
+	{ 1, 0x113, 0xa, 79 },
+	{ 1, 0x114, 0x3, 98 },
+	{ 1, 0x342, 0x14, 91 },
+	{ 1, 0x343, 0x48, 90 },
+	{ 1, 0x340, 0xc, 83 },
+	{ 1, 0x341, 0x38, 90 },
+	{ 1, 0x344, 0x0, 91 },
+	{ 1, 0x345, 0x0, 83 },
+	{ 1, 0x346, 0x0, 76 },
+	{ 1, 0x347, 0x18, 90 },
+	{ 1, 0x348, 0x10, 79 },
+	{ 1, 0x349, 0x6f, 102 },
+	{ 1, 0x34a, 0xc, 92 },
+	{ 1, 0x34b, 0x17, 74 },
+	{ 1, 0x900, 0x0, 72 },
+	{ 1, 0x901, 0x11, 72 },
+	{ 1, 0x902, 0x0, 108 },
+	{ 1, 0x3130, 0x1, 79 },
+	{ 1, 0x34c, 0x10, 226 },
+	{ 1, 0x34d, 0x70, 78 },
+	{ 1, 0x34e, 0xc, 82 },
+	{ 1, 0x34f, 0x0, 78 },
+	{ 0, 0x1c040004, 0x5002, 0 },
+	{ 0, 0x1c050004, 0x5002, 0 },
+	{ 0, 0x1c060004, 0x5002, 0 },
+	{ 0, 0x1c070004, 0x5002, 0 },
+	{ 0, 0x1c080004, 0x5002, 0 },
+	{ 0, 0x1c090004, 0x5002, 0 },
+	{ 0, 0x1c0a0004, 0x5002, 0 },
+	{ 0, 0x1c0b0004, 0x5002, 0 },
+	{ 0, 0x1c0c0004, 0x5002, 0 },
+	{ 0, 0x1c0d0004, 0x5002, 0 },
+	{ 0, 0x1c0e0004, 0x5002, 0 },
+	{ 0, 0x1c0f0004, 0x5002, 0 },
+	{ 1, 0x301, 0x4, 0 },
+	{ 0, 0x1c320008, 0xf, 0 },
+	{ 0, 0x1c320010, 0x1, 0 },
+	{ 1, 0x303, 0x2, 92 },
+	{ 1, 0x305, 0x3, 90 },
+	{ 1, 0x306, 0x0, 84 },
+	{ 1, 0x307, 0x77, 76 },
+	{ 1, 0x30b, 0x1, 94 },
+	{ 1, 0x30d, 0x3, 100 },
+	{ 1, 0x30e, 0x0, 78 },
+	{ 1, 0x30f, 0x87, 69 },
+	{ 1, 0x700, 0x0, 101 },
+	{ 1, 0x701, 0x30, 88 },
+	{ 1, 0x820, 0x11, 105 },
+	{ 1, 0x821, 0x47, 82 },
+	{ 1, 0x3100, 0x5, 81 },
+	{ 1, 0x7013, 0x1, 76 },
+	{ 0, 0x1c35000c, 0x0, 0 },
+	{ 0, 0x1c350000, 0x0, 0 },
+	{ 0, 0x1c350004, 0x0, 0 },
+	{ 0, 0x1c350008, 0x0, 0 },
+	{ 0, 0x1c35000c, 0xc10, 0 },
+	{ 0, 0x1c350010, 0xdddead, 0 },
+	{ 0, 0x1c350014, 0x0, 0 },
+	{ 0, 0x1c350018, 0x0, 0 },
+	{ 0, 0x1c35001c, 0x0, 0 },
+	{ 0, 0x1c350020, 0x20002, 0 },
+	{ 1, 0x202, 0xc, 0 },
+	{ 0, 0x1c350024, 0x0, 0 },
+	{ 0, 0x1c350028, 0x0, 0 },
+	{ 0, 0x1c35002c, 0x0, 0 },
+	{ 0, 0x1c350030, 0x0, 0 },
+	{ 0, 0x1c350034, 0x0, 0 },
+	{ 0, 0x1c350038, 0x0, 0 },
+	{ 0, 0x1c35003c, 0x0, 0 },
+	{ 0, 0x1c350040, 0x0, 0 },
+	{ 0, 0x1c350044, 0x0, 0 },
+	{ 0, 0x1c350048, 0x0, 0 },
+	{ 0, 0x1c35004c, 0x0, 0 },
+	{ 0, 0x1c350050, 0x0, 0 },
+	{ 0, 0x1c350054, 0x0, 0 },
+	{ 0, 0x1c350294, 0x6, 0 },
+	{ 0, 0x1c350298, 0x64, 0 },
+	{ 0, 0x1c35029c, 0x1f4, 0 },
+	{ 0, 0x1c3502a0, 0x1388, 0 },
+	{ 0, 0x1c3502a4, 0x0, 0 },
+	{ 0, 0x1c3502a8, 0x5a, 0 },
+	{ 0, 0x1c3502ac, 0x190, 0 },
+	{ 0, 0x1c35000c, 0xc11, 0 },
+	{ 0, 0x1c350058, 0x0, 0 },
+	{ 0, 0x1c35005c, 0x0, 0 },
+	{ 0, 0x1c350060, 0x0, 0 },
+	{ 0, 0x1c350064, 0x3fffffff, 0 },
+	{ 0, 0x1c350068, 0x0, 0 },
+	{ 0, 0x1c350088, 0x0, 0 },
+	{ 0, 0x1c35008c, 0x0, 0 },
+	{ 0, 0x1c350090, 0x0, 0 },
+	{ 0, 0x1c350094, 0x3fffffff, 0 },
+	{ 0, 0x1c350098, 0x0, 0 },
+	{ 0, 0x1c3500b8, 0x0, 0 },
+	{ 0, 0x1c3500bc, 0x0, 0 },
+	{ 0, 0x1c3500c0, 0x0, 0 },
+	{ 0, 0x1c3500c4, 0x3fffffff, 0 },
+	{ 0, 0x1c3500c8, 0x0, 0 },
+	{ 0, 0x1c3500e8, 0x0, 0 },
+	{ 0, 0x1c3500ec, 0x0, 0 },
+	{ 0, 0x1c3500f0, 0x0, 0 },
+	{ 0, 0x1c3500f4, 0x3fffffff, 0 },
+	{ 0, 0x1c3500f8, 0x0, 0 },
+	{ 0, 0x1c350118, 0x0, 0 },
+	{ 0, 0x1c35011c, 0x0, 0 },
+	{ 0, 0x1c350120, 0x0, 0 },
+	{ 0, 0x1c350124, 0x3fffffff, 0 },
+	{ 0, 0x1c350128, 0x0, 0 },
+	{ 0, 0x1c350148, 0x0, 0 },
+	{ 0, 0x1c35014c, 0x0, 0 },
+	{ 0, 0x1c350150, 0x0, 0 },
+	{ 0, 0x1c350154, 0x3ff, 0 },
+	{ 0, 0x1c350158, 0x0, 0 },
+	{ 0, 0x1c350160, 0x0, 0 },
+	{ 0, 0x1c350164, 0x0, 0 },
+	{ 0, 0x1c350168, 0x0, 0 },
+	{ 0, 0x1c35016c, 0x3ff, 0 },
+	{ 0, 0x1c350170, 0x0, 0 },
+	{ 0, 0x1c350178, 0x0, 0 },
+	{ 0, 0x1c35017c, 0x0, 0 },
+	{ 0, 0x1c350180, 0x0, 0 },
+	{ 0, 0x1c350184, 0x3ff, 0 },
+	{ 0, 0x1c350188, 0x0, 0 },
+	{ 0, 0x1c350190, 0x0, 0 },
+	{ 0, 0x1c350194, 0x0, 0 },
+	{ 0, 0x1c350198, 0x0, 0 },
+	{ 0, 0x1c35019c, 0x3ff, 0 },
+	{ 0, 0x1c3501a0, 0x0, 0 },
+	{ 1, 0x203, 0x2e, 0 },
+	{ 1, 0x204, 0x0, 86 },
+	{ 1, 0x205, 0x0, 76 },
+	{ 1, 0x20e, 0x1, 80 },
+	{ 0, 0x1c330f00, 0x1, 55 },
+	{ 1, 0x20f, 0x0, 0 },
+	{ 0, 0x1c330c00, 0x1, 0 },
+	{ 0, 0x1c330c04, 0x1, 0 },
+	{ 0, 0x1c330c0c, 0x0, 0 },
+	{ 0, 0x1c330d00, 0x1, 0 },
+	{ 0, 0x1c330d04, 0x1, 0 },
+	{ 0, 0x1c330d0c, 0x0, 0 },
+	{ 0, 0x1c330100, 0x53, 0 },
+	{ 1, 0xb06, 0x1, 0 },
+	{ 1, 0x484c, 0x54, 76 },
+	{ 1, 0x484d, 0x54, 71 },
+	{ 1, 0x484e, 0x54, 68 },
+	{ 1, 0x484f, 0x54, 68 },
+	{ 1, 0x4850, 0x20, 67 },
+	{ 1, 0x4851, 0x20, 67 },
+	{ 1, 0x4852, 0x20, 83 },
+	{ 1, 0x4853, 0x20, 92 },
+	{ 1, 0x500c, 0x1, 103 },
+	{ 1, 0x500d, 0x72, 90 },
+	{ 1, 0x500e, 0x0, 103 },
+	{ 1, 0x500f, 0x28, 165 },
+	{ 0, 0x1c320094, 0x3fffffff, 552 },
+	{ 0, 0x1c32011c, 0x1, 0 },
+	{ 0, 0x1c040004, 0x5002, 111 },
+	{ 0, 0x1c050004, 0x5002, 0 },
+	{ 0, 0x1c060004, 0x5002, 0 },
+	{ 0, 0x1c070004, 0x5002, 0 },
+	{ 0, 0x1c080004, 0x5002, 0 },
+	{ 0, 0x1c090004, 0x5002, 0 },
+	{ 0, 0x1c0a0004, 0x5002, 0 },
+	{ 0, 0x1c0b0004, 0x5002, 0 },
+	{ 0, 0x1c0c0004, 0x5002, 0 },
+	{ 0, 0x1c0d0004, 0x5002, 0 },
+	{ 0, 0x1c0e0004, 0x5002, 0 },
+	{ 0, 0x1c0f0004, 0x5002, 0 },
+	{ 0, 0x1c10131c, 0x200, 0 },
+	{ 0, 0x1c10141c, 0x200, 0 },
+	{ 0, 0x1c10151c, 0x200, 0 },
+	{ 0, 0x1c10181c, 0x200, 0 },
+	{ 0, 0x1c10191c, 0x200, 0 },
+	{ 0, 0x1c101a1c, 0x200, 0 },
+	{ 0, 0x1c10231c, 0x200, 0 },
+	{ 0, 0x1c10241c, 0x200, 0 },
+	{ 0, 0x1c10251c, 0x200, 0 },
+	{ 0, 0x1c10281c, 0x200, 0 },
+	{ 0, 0x1c10291c, 0x200, 0 },
+	{ 0, 0x1c102a1c, 0x200, 0 },
+	{ 0, 0x1c10321c, 0x200, 0 },
+	{ 0, 0x1c10331c, 0x200, 0 },
+	{ 0, 0x1c10341c, 0x200, 0 },
+	{ 0, 0x1c10381c, 0x200, 0 },
+	{ 0, 0x1c10391c, 0x200, 0 },
+	{ 0, 0x1c103a1c, 0x200, 0 },
+	{ 1, 0x104, 0x1, 18728 },
+	{ 1, 0x20e, 0x1, 110 },
+	{ 1, 0x20f, 0x0, 102 },
+	{ 1, 0x204, 0x3, 107 },
+	{ 1, 0x205, 0xc0, 90 },
+	{ 1, 0x202, 0x18, 95 },
+	{ 1, 0x203, 0xa0, 91 },
+	{ 1, 0x340, 0x18, 81 },
+	{ 1, 0x341, 0xab, 86 },
+	{ 0, 0x1c337308, 0x7fc, 0 },
+	{ 0, 0x1c33730c, 0x7f8, 78 },
+	{ 1, 0x3004, 0x0, 0 },
+	{ 0, 0x1c330c38, 0x40, 0 },
+	{ 0, 0x1c330c3c, 0x20, 0 },
+	{ 0, 0x1c330d38, 0x40, 0 },
+	{ 0, 0x1c330c08, 0x1a, 0 },
+	{ 0, 0x1c330d3c, 0x20, 0 },
+	{ 0, 0x1c330d08, 0x2, 0 },
+	{ 1, 0x104, 0x0, 60 },
+	{ 1, 0x138, 0x1, 99 },
+	{ 0, 0x1c3500f0, 0x103ffffe, 0 },
+	{ 0, 0x1c39002c, 0x1, 145 },
+	{ 0, 0x1c390040, 0x1f, 0 },
+	{ 0, 0x1c390004, 0x135cd000, 0 },
+	{ 0, 0x1c390008, 0x0, 0 },
+	{ 0, 0x1c39000c, 0x3e8, 0 },
+	{ 0, 0x1c390010, 0x0, 0 },
+	{ 0, 0x1c390000, 0x1, 0 },
+	{ 0, 0x1c390020, 0x0, 0 },
+	{ 0, 0x1c391020, 0x0, 0 },
+	{ 0, 0x1c392020, 0x0, 0 },
+	{ 0, 0x1c393020, 0x0, 0 },
+	{ 0, 0x1c394020, 0x0, 0 },
+	{ 0, 0x1c390034, 0x0, 0 },
+	{ 0, 0x1c391034, 0x0, 0 },
+	{ 0, 0x1c390028, 0x1, 0 },
+	{ 0, 0x1c392034, 0x0, 0 },
+	{ 0, 0x1c393034, 0x0, 0 },
+	{ 0, 0x1c394034, 0x0, 0 },
+	{ 0, 0x1c320410, 0x7, 70 },
+	{ 0, 0x1c320430, 0x12, 0 },
+	{ 0, 0x1c320444, 0x3fff, 0 },
+	{ 0, 0x1c320458, 0x3, 0 },
+	{ 0, 0x1c320418, 0x1, 56 },
+	{ 0, 0x1c328800, 0x1, 0 },
+	{ 0, 0x1c328804, 0x0, 0 },
+	{ 0, 0x1c3200b0, 0x1, 0 },
+	{ 0, 0x1c320478, 0x7ca00, 0 },
+	{ 0, 0x1c32047c, 0x15f0, 0 },
+	{ 0, 0x1c320460, 0x1, 0 },
+	{ 0, 0x1c320464, 0x1, 0 },
+	{ 0, 0x1c32046c, 0x1, 0 },
+	{ 0, 0x1c320470, 0x1, 0 },
+	{ 0, 0x1c32048c, 0x6000200, 0 },
+	{ 0, 0x1c320488, 0x0, 0 },
+	{ 0, 0x1c320474, 0xc001070, 0 },
+	{ 0, 0x1c32042c, 0x1b, 0 },
+	{ 0, 0x1c103100, 0x0, 2324 },
+	{ 0, 0x1c103600, 0x0, 0 },
+	{ 0, 0x1c103200, 0x0, 0 },
+	{ 0, 0x1c103300, 0x0, 0 },
+	{ 0, 0x1c103400, 0x0, 0 },
+	{ 0, 0x1c103500, 0x0, 0 },
+	{ 0, 0x1c101000, 0x10, 0 },
+	{ 0, 0x1c101004, 0x110, 0 },
+	{ 0, 0x1c101008, 0x3223, 0 },
+	{ 0, 0x1c10100c, 0x0, 0 },
+	{ 0, 0x1c101010, 0x200, 0 },
+	{ 0, 0x1c101014, 0x0, 0 },
+	{ 0, 0x1c103104, 0x1334, 0 },
+	{ 0, 0x1c103108, 0x5, 0 },
+	{ 0, 0x1c10310c, 0xf0ae, 0 },
+	{ 0, 0x1c103110, 0x2, 0 },
+	{ 0, 0x1c103114, 0x8600, 0 },
+	{ 0, 0x1c103118, 0x4000, 0 },
+	{ 0, 0x1c103130, 0x103, 0 },
+	{ 0, 0x1c103100, 0x3, 0 },
+	{ 0, 0x1c103140, 0x1, 0 },
+	{ 0, 0x1c103600, 0x3, 0 },
+	{ 0, 0x1c103204, 0x1334, 0 },
+	{ 0, 0x1c103208, 0xd, 0 },
+	{ 0, 0x1c10320c, 0x20ae, 0 },
+	{ 0, 0x1c103210, 0x302, 0 },
+	{ 0, 0x1c103214, 0x8600, 0 },
+	{ 0, 0x1c103218, 0x4000, 0 },
+	{ 0, 0x1c103230, 0x137, 0 },
+	{ 0, 0x1c103234, 0x3, 0 },
+	{ 0, 0x1c103240, 0x1, 0 },
+	{ 0, 0x1c103250, 0x81a, 0 },
+	{ 0, 0x1c103200, 0x1, 0 },
+	{ 0, 0x1c103304, 0x1334, 0 },
+	{ 0, 0x1c103308, 0xd, 0 },
+	{ 0, 0x1c10330c, 0x20ae, 0 },
+	{ 0, 0x1c103310, 0x302, 0 },
+	{ 0, 0x1c103314, 0x8600, 0 },
+	{ 0, 0x1c103318, 0x4000, 0 },
+	{ 0, 0x1c103330, 0x137, 0 },
+	{ 0, 0x1c103334, 0x3, 0 },
+	{ 0, 0x1c103340, 0x1, 0 },
+	{ 0, 0x1c103350, 0x81a, 0 },
+	{ 0, 0x1c103300, 0x1, 0 },
+	{ 0, 0x1c103404, 0x1334, 0 },
+	{ 0, 0x1c103408, 0xd, 0 },
+	{ 0, 0x1c10340c, 0x20ae, 0 },
+	{ 0, 0x1c103410, 0x302, 0 },
+	{ 0, 0x1c103414, 0x8600, 0 },
+	{ 0, 0x1c103418, 0x4000, 0 },
+	{ 0, 0x1c103430, 0x137, 0 },
+	{ 0, 0x1c103434, 0x3, 0 },
+	{ 0, 0x1c103440, 0x1, 0 },
+	{ 0, 0x1c103450, 0x81a, 0 },
+	{ 0, 0x1c103400, 0x1, 0 },
+	{ 0, 0x1c103504, 0x1334, 0 },
+	{ 0, 0x1c103508, 0xd, 0 },
+	{ 0, 0x1c10350c, 0x20ae, 0 },
+	{ 0, 0x1c103510, 0x302, 0 },
+	{ 0, 0x1c103514, 0x8600, 0 },
+	{ 0, 0x1c103518, 0x4000, 0 },
+	{ 0, 0x1c103530, 0x137, 0 },
+	{ 0, 0x1c103534, 0x3, 0 },
+	{ 0, 0x1c103540, 0x1, 0 },
+	{ 0, 0x1c103550, 0x81a, 0 },
+	{ 0, 0x1c103500, 0x1, 0 },
+	{ 0, 0x1c0a0690, 0x0, 114 },
+	{ 0, 0x1c0a0040, 0x30ac, 0 },
+	{ 0, 0x1c0a0044, 0xc001070, 0 },
+	{ 0, 0x1c0a0050, 0xb048, 0 },
+	{ 0, 0x1c0a0054, 0x11070, 0 },
+	{ 0, 0x1c0a0600, 0x7fff7fff, 0 },
+	{ 0, 0x1c0a0004, 0x5f01, 0 },
+	{ 0, 0x1c0a000c, 0xf, 0 },
+	{ 0, 0x1c0a0020, 0x0, 0 },
+	{ 0, 0x1c0a0028, 0x0, 0 },
+	{ 0, 0x1c020500, 0x60, 0 },
+	{ 0, 0x1c020504, 0x0, 0 },
+	{ 0, 0x1c0a0010, 0x1fff1ff, 183 },
+	{ 0, 0x1c0a0018, 0x7e, 0 },
+	{ 0, 0x1c33730c, 0x7fc, 161 },
+	{ 0, 0x1c3500f0, 0x103fffff, 0 },
+	{ 0, 0x1c320430, 0x1a, 0 },
+	{ 0, 0x1c320430, 0x1b, 0 },
+	{ 0, 0x1c390010, 0x10, 2198 },
+	{ 0, 0x1c32008c, 0x1, 288 },
+	{ 0, 0x1c320404, 0x0, 0 },
+	{ 0, 0x1c320424, 0x8, 0 },
+	{ 0, 0x1c320438, 0x0, 55 },
+	{ 0, 0x1c32044c, 0x0, 0 },
+	{ 0, 0x1c320110, 0x0, 63 },
+	{ 0, 0x1c331300, 0x0, 0 },
+	{ 0, 0x1c333300, 0x0, 0 },
+	{ 0, 0x1c335300, 0x0, 0 },
+	{ 0, 0x1c337300, 0x4, 0 },
+	{ 1, 0x100, 0x1, 73 },
+	{ 0, 0x1c339300, 0x0, 0 },
+	{ 0, 0x1c3200a0, 0x1, 0 },
+};
+
+/*
+ * camera=9: Android's fresh front-camera open replayed in its own order and timing (front_replay[]), after the sensor's
+ * power-up and the D-PHYs' isolation bypass; the PDMA's queue at our IOVA, Android's buffer IOVAs mapped onto ours (as
+ * camera_pdma). Then 300 polls of the front end's status (Android's interrupt acknowledgements mirrored) and the frame.
+ */
+static void
+front_replay_capture(void)
+{
+	const struct sensor *c = &sensors[1];
+	vm_offset_t fe = ml_io_map(ISPFE_FE_PHYS, 0x100000), csis = ml_io_map(ISPFE_CSIS_PHYS, 0xd0000);
+	vm_offset_t sysreg = ml_io_map(ISPFE_SYSREG_PHYS, 0x1000), pmu = ml_io_map(0x15462000ULL, 0x2000), frame = 0, side = 0;
+	uint64_t frame_pa, side_pa;
+	unsigned on = 0, changed = 0, ends = 0, starts = 0;
+	uint32_t last424 = 0;
+
+	if (!(rd(pmu + 0x484) & 1u)) {
+		printf("akita camera: replay: pd-ispfe is off\n");
+		return;
+	}
+	if (kmem_alloc_contig(kernel_map, &frame, FRONT_BUF_MB << 20, 0xfffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+	    kmem_alloc_contig(kernel_map, &side, FRONT_SIDE, 0xfffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+	    (!pdma_mem && kmem_alloc_contig(kernel_map, &pdma_mem, 0x100000, 0xfffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) ||
+	    (!pdma_scratch && kmem_alloc_contig(kernel_map, &pdma_scratch, 0x400000, 0xfffff, 0, 0, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)) {
+		printf("akita camera: replay: no memory\n");
+		return;
+	}
+	frame_pa = kvtophys(frame);
+	side_pa = kvtophys(side);
+	memset((void *)frame, 0xa5, FRONT_BUF);
+	flush_dcache(frame, FRONT_BUF, FALSE);
+	{
+		uint32_t *q = (uint32_t *)pdma_mem;
+
+		memset((void *)pdma_mem, 0, 0x100000);
+		memset((void *)pdma_scratch, 0, 0x400000);
+		for (unsigned e = 0; e < 256; e++) {
+			q[e * 4] = 0xc003;
+			q[e * 4 + 1] = PDMA_IOVA + 0x1000;
+			q[e * 4 + 2] = 0;
+			q[e * 4 + 3] = sizeof(front_pdma_list);
+		}
+		memcpy((void *)(pdma_mem + 0x1000), front_pdma_list, sizeof(front_pdma_list));
+		flush_dcache(pdma_mem, 0x100000, FALSE);
+		flush_dcache(pdma_scratch, 0x400000, FALSE);
+	}
+	if (!ispfe_mmu(true, frame_pa, FRONT_BUF_MB, side_pa)) {
+		return;
+	}
+	mmu_map_android(frame_pa, FRONT_BUF_MB, side_pa);
+	for (unsigned i = 0; i < 3; i++) {
+		static const uint64_t s2mpu_pa[3] = { 0x1c140000ULL, 0x1c180000ULL, 0x1c1c0000ULL };
+		vm_offset_t s2 = ml_io_map(s2mpu_pa[i], 0x3000);
+
+		wr(s2 + 0x54, 0xff);
+		wr(s2 + 0x1000, 1);
+	}
+	/* the sensor powered (not configured: the replay does it) */
+	if (!i2c_bus_up(c->bus)) {
+		return;
+	}
+	for (on = 0; on < 4 && c->ldo[on] != 0; on++) {
+		if (!slg_ldo_on(c->ldo[on], c->mv[on])) {
+			goto down;
+		}
+	}
+	delay(1000);
+	pin_out(c->reset_bank, c->reset_pin, true);
+	mclk(c->clk, c->clk_bank, c->clk_pin, true);
+	delay(10000);
+	cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) | 1u);
+	wr(sysreg + 0x104, 0x3ffffff);
+	for (unsigned i = 0; i < sizeof(front_replay) / sizeof(front_replay[0]); i++) {
+		const struct replay_ev *e = &front_replay[i];
+
+		if (e->delay_us) {
+			delay(e->delay_us);
+		}
+		if (e->kind == 1) {
+			uint8_t v = (uint8_t)e->val;
+
+			i2c_write16(c->bus, 0x1a, (uint16_t)e->addr, &v, 1);
+			continue;
+		}
+		{
+			uint32_t pa = e->addr, val = e->val;
+			vm_offset_t va;
+
+			if (pa == 0x1c390004) {
+				val = PDMA_IOVA;        /* (the queue: ours) */
+			}
+			if (pa >= ISPFE_FE_PHYS && pa < ISPFE_FE_PHYS + 0x100000) {
+				va = fe + (pa - ISPFE_FE_PHYS);
+			} else if (pa >= ISPFE_CSIS_PHYS && pa < ISPFE_CSIS_PHYS + 0xd0000) {
+				va = csis + (pa - ISPFE_CSIS_PHYS);
+			} else if (pa >= ISPFE_SYSREG_PHYS && pa < ISPFE_SYSREG_PHYS + 0x1000) {
+				va = sysreg + (pa - ISPFE_SYSREG_PHYS);
+			} else {
+				continue;
+			}
+			wr(va, val);
+		}
+	}
+	printf("akita camera: replay: Android's %u events done (pdma rptr %#x)\n", (unsigned)(sizeof(front_replay) / sizeof(front_replay[0])),
+	    rd(fe + 0x90014));
+	for (unsigned it = 0; it < 400; it++) {
+		uint32_t v424 = rd(fe + 0x20424), v438 = rd(fe + 0x20438), v4ac = rd(fe + 0x204ac);
+
+		if (v424 && v424 != last424 && (starts + ends) < 12) {
+			printf("akita camera: replay: %3u: 2008c %#x 20424 %#x 20438 %#x 204ac %#x 20420 %#x 2049c %#x pdma %#x/%#x 37300 %#x\n",
+			    it, rd(fe + 0x2008c), v424, v438, v4ac, rd(fe + 0x20420), rd(fe + 0x2049c), rd(fe + 0x90010), rd(fe + 0x90014),
+			    rd(fe + 0x37300));
+		}
+		if (v424) {
+			if (v424 & 1u) {
+				starts++;
+				wr(fe + 0x90010, (rd(fe + 0x90010) + 0x10) & 0xff0u);
+			}
+			if (v424 & 0x1au) {
+				ends++;
+				wr(fe + 0x500e8, 3);
+				wr(fe + 0x37300, 4);
+			}
+			wr(fe + 0x2008c, 1);
+			wr(fe + 0x20404, 0);
+			wr(fe + 0x20424, v424);
+			wr(fe + 0x20438, v438);
+			wr(fe + 0x2044c, 0);
+			wr(fe + 0x20110, 0);
+		}
+		last424 = v424;
+		delay(1000);
+	}
+	{
+		uint8_t zero = 0;
+
+		i2c_write16(c->bus, 0x1a, 0x0100, &zero, 1);
+	}
+	delay(50000);
+	flush_dcache(frame, FRONT_BUF, FALSE);
+	for (unsigned i = 0; i < FRONT_BUF; i++) {
+		changed += ((uint8_t *)frame)[i] != 0xa5;
+	}
+	printf("akita camera: replay: %u frame starts, %u frame ends, %u bytes of the frame written\n", starts, ends, changed);
+	for (unsigned row = 0; row < FRONT_HEIGHT && changed; row += 1024) {
+		const uint8_t *b = (const uint8_t *)frame + row * FRONT_STRIDE + 2000;
+
+		printf("akita camera: replay: row %u: %02x %02x %02x %02x %02x %02x %02x %02x\n", row, b[0], b[1], b[2], b[3], b[4], b[5],
+		    b[6], b[7]);
+	}
+	wr(fe + 0x90000, 0);
+	ispfe_mmu(false, 0, 0, 0);
+	wr(sysreg + 0x500, rd(sysreg + 0x500) & ~FRONT_DPHY_RESET_BITS);
+	cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) & ~1u);
+down:
+	mclk(c->clk, c->clk_bank, c->clk_pin, false);
+	pin_out(c->reset_bank, c->reset_pin, false);
+	while (on-- > 0) {
+		slg_ldo_off(c->ldo[on]);
+	}
+	printf("akita camera: replay: front camera powered down\n");
+}
+
 static void
 sensor_probe(const struct sensor *c)
 {
@@ -3338,6 +4042,10 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 	}
 	if (camera_mode == 8) {
 		uw_receiver_test();
+		return;
+	}
+	if (camera_mode == 9) {
+		front_replay_capture();
 		return;
 	}
 	if (camera_mode >= 3) {
