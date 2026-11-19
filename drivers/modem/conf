@@ -1,0 +1,10 @@
+# devices/akita/drivers/modem/conf: the Pixel 8a's cellular modem (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_MODEM
+	file    bsd/dev/hakios.akita_modem.c
+	file    bsd/dev/hakios.akita_modem_fs.c
+	file    bsd/dev/hakios.akita_pcie0.c
+	requires UFS
+	help    the Pixel 8a's modem, a Samsung Exynos 5300 on zuma's PCIe channel 0, started step by step (modem=N): its pins
+	help    and power, the link, the first-stage loader given to its ROM, the firmware read from the phone's own modem_a
+	help    partition and sent to the loader, the start handshake. Research; needs fw-modem-akita/ (this phone's NV files)
