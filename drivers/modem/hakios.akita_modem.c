@@ -197,9 +197,18 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define SIT_VERIFY_SIM_PIN              0x0201u
 #define SIT_IND_SIM_STATUS_CHANGED      0x0210u
 #define SIT_GET_CS_REG_STATE            0x0700u
+#define SIT_GET_CS_REG_STATE            0x0700u
 #define SIT_GET_PS_REG_STATE            0x0701u
+#define SIT_GET_PREFERRED_NTW_TYPE      0x070bu
 #define SIT_GET_OPERATOR                0x0702u
 #define SIT_SET_RADIO_POWER             0x0800u
+#define SIT_SET_ALLOW_NETWORK            0x074fu
+#define SIT_SET_PREFERRED_DATA_MODEM    0x0740u
+#define SIT_SET_VOICE_OPERATION         0x091au
+#define SIT_SET_VONR_CAPABILITY         0x0954u
+#define SIT_SET_INITIAL_ATTACH_APN      0x0603u
+#define SIT_SET_MODEM_CONFIG            0x093fu
+#define SIT_SET_SGC                     0x0404u
 #define SIT_GET_RADIO_POWER             0x0801u
 #define SIT_IND_RADIO_STATE_CHANGED     0x0802u
 #define SIT_IND_RADIO_READY             0x0803u
@@ -1084,7 +1093,10 @@ static bool sit_request(unsigned id, const uint8_t *parameters, uint32_t len);
  * cellular_pin_state: 0 no PIN is wanted (or not known), 1 wanted, 2 sent and not answered yet, 3 accepted, 4 refused
  * (wrong: cellular_pin_tries says how many tries the card has left before it wants its PUK).
  */
-static int cellular_pin_state, cellular_pin_tries = -1;
+static int cellular_pin_state, cellular_pin_tries = -1, cellular_cs_registered;
+static unsigned int allow_networks = 0x000403fe;
+static char attach_apn[64];
+static bool allow_said;
 static uint8_t sim_aid[16], sim_aid_len;
 static char pin_waiting[9];
 static volatile bool pin_to_send;
@@ -1170,6 +1182,7 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 	if (type == 2 && id == SIT_IND_SIM_STATUS_CHANGED) {
 		(void)sit_request(SIT_GET_SIM_STATUS, NULL, 0);
 	} else if (type == 2 && id == SIT_IND_NTW_STATE_CHANGED) {
+		(void)sit_request(SIT_GET_CS_REG_STATE, NULL, 0);
 		(void)sit_request(SIT_GET_PS_REG_STATE, NULL, 0);
 		(void)sit_request(SIT_GET_OPERATOR, NULL, 0);
 		(void)sit_request(SIT_GET_SIGNAL_STRENGTH, NULL, 0);
@@ -1197,6 +1210,40 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 				if (cellular_pin_state != 0) {
 					cellular_pin_state = 3;
 				}
+				/*
+				 * (11-19) The networks the modem may use, said once the card is ready, as Android says them right after
+				 * the PIN (its trace with the tester's SIM: SET_ALLOW_NETWORK fe 03 04 00 -- a set of radio technologies,
+				 * GSM to LTE and NR). Without it the modem measured GSM alone and was refused there, where Android
+				 * is at home on LTE. Boot-arg modem_allow=0xNNNN: another set (0: not said).
+				 */
+				if (!allow_said && allow_networks != 0) {
+					static const uint8_t zero4[4] = { 0, 0, 0, 0 }, voice[4] = { 3, 0, 0, 0 }, on[6] = { 2, 0, 0, 0, 0, 0 };
+					uint8_t set[4] = { (uint8_t)allow_networks, (uint8_t)(allow_networks >> 8), (uint8_t)(allow_networks >> 16),
+						           (uint8_t)(allow_networks >> 24) };
+
+					/* (... with what Android says around it, in its order: the data modem, the voice operation, VoNR off,
+					 * the networks, the APN the phone attaches to LTE with -- boot-arg modem_apn=NAME, the carrier's;
+					 * none: not said --, and the radio's power once more: Android turns it on only now) */
+					allow_said = true;
+					(void)sit_request(SIT_SET_PREFERRED_DATA_MODEM, zero4, 1);
+					(void)sit_request(SIT_SET_VOICE_OPERATION, voice, sizeof(voice));
+					(void)sit_request(SIT_SET_VONR_CAPABILITY, zero4, sizeof(zero4));
+					(void)sit_request(SIT_SET_ALLOW_NETWORK, set, sizeof(set));
+					if (attach_apn[0] != 0) {
+						static uint8_t apn[239];
+
+						bzero(apn, sizeof(apn));
+						apn[0] = 1;
+						apn[1] = 0x0e;
+						strlcpy((char *)apn + 4, attach_apn, 100);
+						apn[206] = 3;           /* (IPv4 and IPv6, at home and roaming) */
+						apn[236] = 3;
+						(void)sit_request(SIT_SET_INITIAL_ATTACH_APN, apn, sizeof(apn));
+					}
+					if (radio_on) {
+						(void)sit_request(SIT_SET_RADIO_POWER, on, sizeof(on));
+					}
+				}
 			} else if (d[4] == 2 && cellular_pin_state != 2 && cellular_pin_state != 4) {
 				cellular_pin_state = 1;         /* (the PIN is wanted) */
 			}
@@ -1212,7 +1259,23 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 		printf("modem: %u: the SIM's PIN: %s (error %u); %d tries left\n", step, sit_answer_error == 0 ? "ACCEPTED" : "refused",
 		    sit_answer_error, cellular_pin_tries);
 		(void)sit_request(SIT_GET_SIM_STATUS, NULL, 0);
+		(void)sit_request(SIT_GET_CS_REG_STATE, NULL, 0);
 		(void)sit_request(SIT_GET_PS_REG_STATE, NULL, 0);
+		(void)sit_request(SIT_GET_PREFERRED_NTW_TYPE, NULL, 0);        /* (only looked at: which networks the modem may use) */
+	} else if (type == 1 && id == SIT_GET_CS_REG_STATE && n >= 4) {
+		/* (11-19) the circuit-switched registration -- calls and SMS; where only GSM is heard there may be no packet one.
+		 * Its answer is taken to begin as the packet one's does (state, reject cause, ?, technology): said, to be checked */
+		static int said = -1;
+
+		if (said != d[0]) {
+			said = d[0];
+			printf("modem: %u: circuit registration: state %u (1 home, 5 roaming, 2 searching, 3 denied), then %u %u %u\n", step,
+			    d[0], d[1], d[2], d[3]);
+		}
+		cellular_cs_registered = d[0] == 1 || d[0] == 5 ? d[0] : 0;
+		if (cellular_cs_registered && !cellular_registered) {
+			cellular_up = 1;
+		}
 	} else if (type == 1 && id == SIT_GET_PS_REG_STATE && n >= 4) {
 		bool registered = d[0] == 1 || d[0] == 5;
 
@@ -1220,9 +1283,9 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 			printf("modem: %u: packet registration: state %u (1 home, 5 roaming, 2 searching, 3 denied), reject cause %u, technology %u\n",
 			    step, d[0], d[1], d[3]);
 		}
-		cellular_registered = registered ? d[0] : 0;
+		cellular_registered = registered ? d[0] : cellular_cs_registered;      /* (either registration is one) */
 		cellular_rat = d[3];
-		cellular_up = registered;
+		cellular_up = registered || cellular_cs_registered;
 		/* (the bars are the signal's own: a network heard without a SIM has a strength too, and the next signal
 		 * indication, a second later, says it again) */
 	} else if (type == 1 && id == SIT_GET_OPERATOR && n >= 102) {
@@ -1267,10 +1330,14 @@ static const char *
 sit_name(unsigned id)
 {
 	static const struct { uint16_t id; const char *name; } names[] = {
-		{ SIT_GET_SIM_STATUS, "GET_SIM_STATUS" }, { SIT_VERIFY_SIM_PIN, "VERIFY_SIM_PIN" }, { SIT_IND_SIM_STATUS_CHANGED, "IND_SIM_STATUS_CHANGED" },
+		{ SIT_GET_SIM_STATUS, "GET_SIM_STATUS" }, { SIT_VERIFY_SIM_PIN, "VERIFY_SIM_PIN" },
+		{ SIT_GET_CS_REG_STATE, "GET_CS_REG_STATE" }, { SIT_GET_PREFERRED_NTW_TYPE, "GET_PREFERRED_NTW_TYPE" }, { SIT_IND_SIM_STATUS_CHANGED, "IND_SIM_STATUS_CHANGED" },
 		{ 0x0246, "IND_SIM_PB_READY" }, { 0x024d, "GET_SLOT_STATUS" }, { 0x024e, "IND_SIM_SLOT_STATUS_CHANGED" },
 		{ SIT_GET_CS_REG_STATE, "GET_CS_REG_STATE" }, { SIT_GET_PS_REG_STATE, "GET_PS_REG_STATE" },
 		{ SIT_GET_OPERATOR, "GET_OPERATOR" }, { SIT_SET_RADIO_POWER, "SET_RADIO_POWER" },
+		{ SIT_SET_ALLOW_NETWORK, "SET_ALLOW_NETWORK" }, { SIT_SET_INITIAL_ATTACH_APN, "SET_INITIAL_ATTACH_APN" },
+		{ SIT_SET_PREFERRED_DATA_MODEM, "SET_PREFERRED_DATA_MODEM" }, { SIT_SET_VOICE_OPERATION, "SET_VOICE_OPERATION" },
+		{ SIT_SET_VONR_CAPABILITY, "SET_VONR_CAPABILITY" }, { SIT_SET_MODEM_CONFIG, "SET_MODEM_CONFIG" }, { SIT_SET_SGC, "SET_SGC" },
 		{ SIT_GET_RADIO_POWER, "GET_RADIO_POWER" }, { SIT_IND_RADIO_STATE_CHANGED, "IND_RADIO_STATE_CHANGED" },
 		{ SIT_IND_RADIO_READY, "IND_RADIO_READY" }, { SIT_GET_SIGNAL_STRENGTH, "GET_SIGNAL_STRENGTH" },
 		{ SIT_GET_BASEBAND_VERSION, "GET_BASEBAND_VERSION" }, { SIT_IND_SIGNAL_STRENGTH, "IND_SIGNAL_STRENGTH" },
@@ -1747,6 +1814,13 @@ restart:
 		strlcpy((char *)info + 64, "akita", 32);
 		strlcpy((char *)info + 96, "16", 32);
 		(void)sit_request(SIT_SET_DEVICE_INFO, info, sizeof(info));
+		{
+			/* (11-19: two more of Android's start: SET_MODEM_CONFIG 1 and SET_SGC 1 1 0..., as its trace has them) */
+			static const uint8_t config[1] = { 1 }, sgc[12] = { 1, 1 };
+
+			(void)sit_request(SIT_SET_MODEM_CONFIG, config, sizeof(config));
+			(void)sit_request(SIT_SET_SGC, sgc, sizeof(sgc));
+		}
 		if (radio_on) {
 			static const uint8_t on[6] = { 2, 0, 0, 0, 0, 0 };     /* u32 2: on; not for an emergency call */
 
@@ -1818,6 +1892,7 @@ restart:
 			boot_log_say();
 			cellular_up = cellular_registered = cellular_bars = cellular_dbm = 0;
 			cellular_radio = cellular_sim = -1;
+			allow_said = false;
 			if (link_up) {
 				link_up = false;
 				akita_pcie0_down();
@@ -1887,6 +1962,8 @@ akita_modem_init(void)
 	PE_parse_boot_argn("modem_crash_after", &crash_after_s, sizeof(crash_after_s));
 	PE_parse_boot_argn("modem_irq", &use_irq, sizeof(use_irq));
 	PE_parse_boot_argn("modem_ask_every", &ask_every_s, sizeof(ask_every_s));
+	PE_parse_boot_argn("modem_allow", &allow_networks, sizeof(allow_networks));
+	(void)PE_parse_boot_arg_str("modem_apn", attach_apn, sizeof(attach_apn));
 	printf("modem: steps 1 to %u in %u s\n", steps, delay_s);
 	call = thread_call_allocate(modem_start, NULL);
 	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
