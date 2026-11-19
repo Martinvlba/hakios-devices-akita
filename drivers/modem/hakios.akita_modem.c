@@ -203,6 +203,10 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define SIT_GET_OPERATOR                0x0702u
 #define SIT_SET_RADIO_POWER             0x0800u
 #define SIT_SET_ALLOW_NETWORK            0x074fu
+#define SIT_SET_DEBUG_TRACE                     0x090bu
+#define SIT_SET_NULL_CIPHER_INTEGRITY_ENABLE    0x096du
+#define SIT_SET_IND_CMD_FILTER                  0x0928u
+#define SIT_SET_SCREEN_STATE                    0x0902u
 #define SIT_SET_PREFERRED_DATA_MODEM    0x0740u
 #define SIT_SET_VOICE_OPERATION         0x091au
 #define SIT_SET_VONR_CAPABILITY         0x0954u
@@ -1217,7 +1221,7 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 				 * is at home on LTE. Boot-arg modem_allow=0xNNNN: another set (0: not said).
 				 */
 				if (!allow_said && allow_networks != 0) {
-					static const uint8_t zero4[4] = { 0, 0, 0, 0 }, voice[4] = { 3, 0, 0, 0 }, on[6] = { 2, 0, 0, 0, 0, 0 };
+					static const uint8_t zero4[4] = { 0, 0, 0, 0 }, voice[4] = { 3, 0, 0, 0 };
 					uint8_t set[4] = { (uint8_t)allow_networks, (uint8_t)(allow_networks >> 8), (uint8_t)(allow_networks >> 16),
 						           (uint8_t)(allow_networks >> 24) };
 
@@ -1239,9 +1243,6 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 						apn[206] = 3;           /* (IPv4 and IPv6, at home and roaming) */
 						apn[236] = 3;
 						(void)sit_request(SIT_SET_INITIAL_ATTACH_APN, apn, sizeof(apn));
-					}
-					if (radio_on) {
-						(void)sit_request(SIT_SET_RADIO_POWER, on, sizeof(on));
 					}
 				}
 			} else if (d[4] == 2 && cellular_pin_state != 2 && cellular_pin_state != 4) {
@@ -1815,16 +1816,32 @@ restart:
 		strlcpy((char *)info + 96, "16", 32);
 		(void)sit_request(SIT_SET_DEVICE_INFO, info, sizeof(info));
 		{
-			/* (11-19: two more of Android's start: SET_MODEM_CONFIG 1 and SET_SGC 1 1 0..., as its trace has them) */
-			static const uint8_t config[1] = { 1 }, sgc[12] = { 1, 1 };
+			/*
+			 * (11-19) Android's start, in its order (its trace through a modem restart with a SIM): the modem's
+			 * configuration, the radio's power, the data modem, the null-cipher setting, the indications' filter,
+			 * the screen's state -- and THE NETWORKS THE MODEM MAY USE, before any PIN. Said only after the card was
+			 * ready, the modem had begun on GSM alone: the home network refused it there (circuit registration 3,
+			 * cause 3) and it never looked further, where Android's goes GSM, UMTS, LTE in eight seconds.
+			 */
+			static const uint8_t trace[1] = { 0 }, config[1] = { 1 }, sgc[12] = { 1, 1 }, on[6] = { 2, 0, 0, 0, 0, 0 };
+			static const uint8_t data_modem[1] = { 0 }, cipher[] = "{\"enabled\":1}", filter[4] = { 0x7f, 0, 0, 0 };
+			static const uint8_t screen[4] = { 1, 0, 0, 0 };
+			uint8_t set[4] = { (uint8_t)allow_networks, (uint8_t)(allow_networks >> 8), (uint8_t)(allow_networks >> 16),
+				           (uint8_t)(allow_networks >> 24) };
 
+			(void)sit_request(SIT_SET_DEBUG_TRACE, trace, sizeof(trace));
 			(void)sit_request(SIT_SET_MODEM_CONFIG, config, sizeof(config));
 			(void)sit_request(SIT_SET_SGC, sgc, sizeof(sgc));
-		}
-		if (radio_on) {
-			static const uint8_t on[6] = { 2, 0, 0, 0, 0, 0 };     /* u32 2: on; not for an emergency call */
-
-			(void)sit_request(SIT_SET_RADIO_POWER, on, sizeof(on));
+			if (radio_on) {
+				(void)sit_request(SIT_SET_RADIO_POWER, on, sizeof(on));
+			}
+			(void)sit_request(SIT_SET_PREFERRED_DATA_MODEM, data_modem, sizeof(data_modem));
+			(void)sit_request(SIT_SET_NULL_CIPHER_INTEGRITY_ENABLE, cipher, sizeof(cipher));
+			(void)sit_request(SIT_SET_IND_CMD_FILTER, filter, sizeof(filter));
+			(void)sit_request(SIT_SET_SCREEN_STATE, screen, sizeof(screen));
+			if (allow_networks != 0) {
+				(void)sit_request(SIT_SET_ALLOW_NETWORK, set, sizeof(set));
+			}
 		}
 		next_at = now_ms() + 1500;
 
