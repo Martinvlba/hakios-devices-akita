@@ -201,6 +201,7 @@ spi_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 static uint8_t spi_tx[8 + GOODIX_MAX_READ], spi_rx[8 + GOODIX_MAX_READ];
 static uint32_t touch_address, point_length = 8;
+static uint32_t command_address;
 static uint32_t max_x = 1080, max_y = 2400;
 static uint32_t flip;           /* boot-arg touch_flip: 1 = mirror left-right, 2 = mirror top-bottom */
 
@@ -319,6 +320,7 @@ goodix_probe(void)
 		printf("akita touch: chip description too short (%u, lists end at %u)\n", length, offset);
 		return false;
 	}
+	command_address = le32(info + offset);          /* (the "misc" part begins with where commands are written) */
 	touch_address = le32(info + offset + 44);
 	point_length = le16(info + offset + 50);
 	if (point_length < 8 || point_length > 32) {
@@ -564,6 +566,64 @@ interrupt_line_low(void)
 	return (rd(pin_int + 4) & 1u) == 0;
 }
 
+/*
+ * (11-19) A command to the chip, as Google's driver sends one (goodix_brl_hw.c, brl_send_cmd): at the command address
+ * { state 0, ack 0, the length (itself, the command, its data and two bytes of sum), the command, the data, the sum of
+ * those bytes }; the chip then writes 0x80 into the ack. False: not taken.
+ */
+static bool
+goodix_command(uint8_t command, const uint8_t *data, uint32_t n)
+{
+	uint8_t m[16] = { 0, 0, (uint8_t)(4 + n), command }, back[2] = { 0, 0 };
+	uint32_t sum = 0;
+
+	if (command_address == 0 || n > 8) {
+		return false;
+	}
+	memcpy(m + 4, data, n);
+	for (uint32_t i = 2; i < 4 + n; i++) {
+		sum += m[i];
+	}
+	m[4 + n] = (uint8_t)sum;
+	m[5 + n] = (uint8_t)(sum >> 8);
+	if (!goodix_write(command_address, m, 6 + n)) {
+		return false;
+	}
+	for (int tries = 0; tries < 20; tries++) {
+		sleep_ms(2);
+		if (goodix_read(command_address, back, sizeof(back)) && back[1] == 0x80) {
+			return true;
+		}
+	}
+	printf("akita touch: command %#x not acknowledged (state %#x, ack %#x)\n", command, back[0], back[1]);
+	return false;
+}
+
+/*
+ * (11-19) THE CHIP SET AS ANDROID SETS IT. The tester's swipes recorded on Android (getevent, 54 strokes): a report
+ * every 4.08 ms without fail while a finger is down -- 2692 of 2900 gaps at 4 ms, a resting finger too -- where this
+ * driver saw the chip report "on only some scans", 18 % of the gaps over 17 ms, and repeats positions itself. Android's
+ * driver (goodix_brl_touch.ko, disassembled) turns on CONTINUOUS REPORTING (command 0xc6, data 0: every scan is
+ * reported) and sets the report rate to 240 a second (0x9d, data 0; 1 would be 120). The chip's own coordinate
+ * filter, grip and palm rejection are left as they come (on). Boot-arg touch_android=0: not sent, as before.
+ */
+static void
+goodix_set_as_android(void)
+{
+	static const uint8_t zero[1] = { 0 };
+	uint32_t on = 1;
+	bool continuous, rate;
+
+	PE_parse_boot_argn("touch_android", &on, sizeof(on));
+	if (!on) {
+		return;
+	}
+	rate = goodix_command(0x9d, zero, 1);
+	continuous = goodix_command(0xc6, zero, 1);
+	printf("akita touch: as Android sets the chip: 240 reports a second %s, every scan reported %s\n", rate ? "taken" : "NOT taken",
+	    continuous ? "taken" : "NOT taken");
+}
+
 static void
 akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -605,6 +665,7 @@ akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
+	goodix_set_as_android();
 	PE_parse_boot_argn("touch_dark_us", &dark_us, sizeof(dark_us));
 	printf("akita touch: ready; the interrupt line is looked at every %u us\n", poll_us);
 	uint64_t next_say = 0, minute;
@@ -617,11 +678,47 @@ akita_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		 * velocity from -- swipes that ran ahead of the finger. touch_fast_us=N, 4000 for the old pace.
 		 */
 		bool fast = any_down || mach_absolute_time() < fast_until;
+		/* (11-19, a measurement: how long this loop really sleeps while a finger is down, and how long a read takes --
+		 * the chip reports every 4 ms now and the reports still came 8-10 ms apart) */
+		static uint64_t woke_before;
+		static uint32_t wake_gap[6], read_us_sum, read_us_max, reads;
+		uint64_t woke = mach_absolute_time(), span = 0;
 
-		if (interrupt_line_low()) {
+		if (fast && woke_before != 0) {
+			absolutetime_to_nanoseconds(woke - woke_before, &span);
+			wake_gap[span <= 1500000 ? 0 : span <= 2500000 ? 1 : span <= 4500000 ? 2 : span <= 9000000 ? 3 : span <= 17000000 ? 4 : 5]++;
+		}
+		woke_before = woke;
+		if (tick % 4096 == 0 && reads != 0) {
+			printf("akita touch: timing: the loop's wakes with a finger down (ms): <=1.5 %u, <=2.5 %u, <=4.5 %u, <=9 %u, <=17 %u, longer "
+			    "%u; a read of the chip: %u us on average, %u at most (%u reads)\n", wake_gap[0], wake_gap[1], wake_gap[2], wake_gap[3],
+			    wake_gap[4], wake_gap[5], read_us_sum / reads, read_us_max, reads);
+		}
+
+		/*
+		 * (11-19) WITH A FINGER DOWN THE REPORT IS READ AT EVERY LOOK, the line low or not. The loop wakes every
+		 * millisecond and a read takes 0.1 ms (measured), yet reports came 8-10 ms apart and often 17 or more, where
+		 * Android has one every 4 ms: the chip's line is low too briefly for a look a millisecond apart to catch every
+		 * time (Linux takes its falling edge as an interrupt). A report that is not there costs one short read.
+		 */
+		/* (... and with no finger down but the panel lit, at every look too -- 250 a second: a finger coming down is
+		 * then seen within 4 ms, not at the next time its brief pulse happens to be caught or 80 ms later) */
+		if (interrupt_line_low() || fast || !akita_display_dark()) {
+			uint64_t t0 = mach_absolute_time(), took = 0;
+
+			unsigned reports_before = seen.reports;
+
 			idle = 0;
 			goodix_poll();
-			fast_until = mach_absolute_time() + fast_span;
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &took);
+			read_us_sum += (uint32_t)(took / 1000);
+			read_us_max = (uint32_t)(took / 1000) > read_us_max ? (uint32_t)(took / 1000) : read_us_max;
+			reads++;
+			if (seen.reports != reports_before) {
+				/* (only a report that came keeps the fast pace: a look that found none must not -- it kept the loop at
+				 * a thousand wakes a second for good) */
+				fast_until = mach_absolute_time() + fast_span;
+			}
 		} else if (++idle >= (fast ? idle_looks * (poll_us / fast_us) : idle_looks)) {
 			idle = 0;
 			goodix_poll();
