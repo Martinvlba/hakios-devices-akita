@@ -74,7 +74,9 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define ELBI_IRQ1_EN            0x014
 #define ELBI_IRQ2_EN            0x018
 #define ELBI_LTSSM_ENABLE       0x054
+#define ELBI_REQ_EXIT_L1        0x06c
 #define ELBI_XFER_PENDING       0x074
+#define ELBI_XMIT_PME_TURNOFF   0x118
 #define ELBI_DEVICE_TYPE        0x080
 #define ELBI_LINKUP             0x2c8
 #define ELBI_LINKDOWN_RST_CTRL  0x3a0
@@ -594,8 +596,27 @@ akita_pcie0_down(void)
 	if (!prepared) {
 		return;
 	}
-	printf("pcie0: the link down (LTSSM 0x%02x)\n", rd(elbi, ELBI_LINKUP) & 0x3f);
+	uint32_t state = rd(elbi, ELBI_LINKUP) & 0x3f, acked = 0, l2 = 0;
+
 	link_is_up = false;
+	clear_bits(elbi, ELBI_IRQ1_EN, 0x400);
+	if (state >= 0x0d && state <= 0x14) {
+		/* the far end told the link is going off (PME_Turn_Off), its acknowledgement and L2 waited for, 20 ms each */
+		wr(elbi, ELBI_REQ_EXIT_L1, 1);
+		wr(elbi, ELBI_REQ_EXIT_L1_MODE, (rd(elbi, ELBI_REQ_EXIT_L1_MODE) & ~0x1u) | 0x10);
+		wr(elbi, ELBI_XMIT_PME_TURNOFF, 1);
+		for (unsigned i = 0; i < 2000 && !acked; i++) {
+			acked = (rd(elbi, ELBI_IRQ0) >> 29) & 1;
+			delay(10);
+		}
+		wr(elbi, ELBI_XMIT_PME_TURNOFF, 0);
+		for (unsigned i = 0; i < 2000 && !l2; i++) {
+			l2 = (rd(elbi, ELBI_LINKUP) & 0x3f) == 0x15;
+			delay(10);
+		}
+	}
+	printf("pcie0: the link down (LTSSM was 0x%02x; turn-off %s, L2 %s)\n", state, acked ? "acknowledged" : "not acknowledged",
+	    l2 ? "reached" : "not reached");
 	clear_bits(elbi, ELBI_HISTORY_CHECK, 0x3);
 	perst(0);
 	clear_bits(socr, 0x0, 0x3);

@@ -58,7 +58,10 @@
  *   the modem: 4 { id, n } + a path             open a file of Android's by name (6 with direction 1 then reads it):
  *                                               not answered here -- the files are Android's vendor partition's
  *
- * More boot-args: modem_delay=SECONDS (25) after the kernel's start before step 1; modem_listen=SECONDS (20).
+ * More boot-args: modem_delay=SECONDS (25) after the kernel's start before step 1; modem_listen=SECONDS (20);
+ * modem_link_sleep=0: step 9 keeps the link up (by default it follows the modem's wake pin: down when the modem lets
+ * it go, up when either side has something); modem_ask_every=SECONDS: step 9 asks the radio's power that often (a test
+ * of the wake from our side).
  */
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -225,14 +228,14 @@ struct toc_entry { char name[12]; uint32_t file_offset, load_address, size, crc,
 #define TOC_ENTRIES             8u
 #define DOWNLOAD_CHUNK          0xc000u
 
-static unsigned int steps, step, listen_s = 20;
+static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s;
 static volatile uint8_t *ipc, *msi, *pktproc, *pin_hsi1, *pin_alive, *doorbell;
 static struct akita_modem_file *firmware;
 static struct toc_entry toc[TOC_ENTRIES];
 static uint8_t toc_raw[TOC_BYTES];
 static uint16_t frame_count;
 static uint8_t channel_count[256];
-static uint32_t ep_saved_msi[4];
+static uint32_t ep_saved_msi[4], ep_pm_cap;
 
 /* ---- small things ---- */
 
@@ -601,6 +604,9 @@ frame_put(const struct queue *q, uint8_t channel, const uint8_t *head, uint32_t 
 	return queue_put(q, frame, total, 3000);
 }
 
+static bool link_up, doorbell_owed;
+static unsigned link_sleeps, link_wakes;
+
 static void
 ring(uint32_t value)
 {
@@ -608,12 +614,20 @@ ring(uint32_t value)
 	(void)rd(doorbell, 0);
 }
 
-/* a word for the modem and the doorbell that makes it look */
+/*
+ * A word for the modem and the doorbell that makes it look. With the link asleep (step 9) the doorbell is owed: our
+ * wake pin goes up, the modem answers with its own, the link comes up and the doorbell is rung then (link_follow).
+ */
 static void
 message(uint32_t word)
 {
 	wr(ipc, IPC_AP2CP_MSG, word);
-	ring(DOORBELL_MSG);
+	if (link_up) {
+		ring(DOORBELL_MSG);
+	} else {
+		doorbell_owed = true;
+		pin_out(&AP2CP_WAKEUP, 1, 0);
+	}
 }
 
 /* ---- the download ---- */
@@ -775,6 +789,10 @@ endpoint_setup(bool first)
 		printf("modem: %u: the endpoint's identity reads 0x%08x, not Samsung's (0x144d): stopped\n", step, id);
 		return false;
 	}
+	if (!first && ep_pm_cap != 0) {
+		akita_pcie0_ep_write(ep_pm_cap + 4, akita_pcie0_ep_read(ep_pm_cap + 4) & ~0x3u);       /* D0 */
+		sleep_ms(10);
+	}
 	akita_pcie0_ep_write(0x10, EP_BAR0_BUS);
 	akita_pcie0_ep_write(0x14, 0);
 	akita_pcie0_ep_write(0x04, (akita_pcie0_ep_read(0x04) & 0xffff0000u) | 0x6);
@@ -804,10 +822,72 @@ endpoint_setup(bool first)
 		printf("modem: %u: the endpoint %04x:%04x again; BAR0 0x%08x; command 0x%04x; MSI %08x\n", step, id & 0xffff, id >> 16,
 		    akita_pcie0_ep_read(0x10), akita_pcie0_ep_read(0x04) & 0xffff, akita_pcie0_ep_read(EP_MSI_CAP));
 	}
+	if (first) {
+		/* its power-management capability, for D3hot before the link sleeps */
+		for (uint32_t at = akita_pcie0_ep_read(0x34) & 0xfc, n = 0; at >= 0x40 && n < 16; n++) {
+			uint32_t cap = akita_pcie0_ep_read(at);
+
+			if ((cap & 0xff) == 0x01) {
+				ep_pm_cap = at;
+				break;
+			}
+			at = (cap >> 8) & 0xfc;
+		}
+	}
 	if (doorbell == NULL) {
 		doorbell = akita_pcie0_window(DOORBELL_OFFSET, 0x1000);
 	}
-	return doorbell != NULL;
+	link_up = doorbell != NULL;
+	return link_up;
+}
+
+/*
+ * The link's sleep, as Android's driver keeps it: the modem's wake pin low says the link may go; with nothing of
+ * ours waiting in the queues it is taken down (the modem to D3hot, mastering off, PME_Turn_Off) and our wake pin
+ * dropped. The modem's wake pin high -- by itself, or answering ours -- brings it up again at Gen3, the modem's
+ * configuration put back, the "link ack" doorbell rung and then the one that was owed.
+ */
+static void
+link_follow(void)
+{
+	static uint64_t idle_since;
+	int cp_wake = pin_get(&CP2AP_WAKEUP);
+
+	if (link_up) {
+		bool idle = cp_wake == 0 && !doorbell_owed && rd(ipc, IPC_FMT_TX_HEAD) == rd(ipc, IPC_FMT_TX_TAIL) &&
+		    rd(ipc, IPC_RAW_TX_HEAD) == rd(ipc, IPC_RAW_TX_TAIL) && queue_used(&FMT_RX) == 0 && queue_used(&RAW_RX) == 0;
+
+		if (!idle) {
+			idle_since = 0;
+		} else if (idle_since == 0) {
+			idle_since = now_ms();
+		} else if (now_ms() - idle_since >= 30) {
+			idle_since = 0;
+			link_up = false;
+			akita_pcie0_ep_write(0x04, akita_pcie0_ep_read(0x04) & ~0x4u);
+			if (ep_pm_cap != 0) {
+				akita_pcie0_ep_write(ep_pm_cap + 4, akita_pcie0_ep_read(ep_pm_cap + 4) | 0x3);  /* D3hot */
+			}
+			pin_out(&AP2CP_WAKEUP, 0, 5);
+			akita_pcie0_down();
+			link_sleeps++;
+		}
+	} else if (cp_wake != 0) {
+		uint64_t t0 = now_ms();
+
+		pin_out(&AP2CP_WAKEUP, 1, 5);
+		if (!akita_pcie0_up(3) || !endpoint_setup(false)) {
+			printf("modem: %u: the link did not come back (active %d)\n", step, pin_get(&CP2AP_CP_ACTIVE));
+			return;
+		}
+		ring(DOORBELL_LINK_ACK);
+		if (doorbell_owed) {
+			doorbell_owed = false;
+			ring(DOORBELL_MSG);
+		}
+		link_wakes++;
+		printf("modem: %u: the link is up again after %llu ms (sleep %u, wake %u)\n", step, now_ms() - t0, link_sleeps, link_wakes);
+	}
 }
 
 /* a word from the modem (cp2ap_msg), waited for; what else it says meanwhile is said */
@@ -1214,6 +1294,7 @@ modem_run(void)
 	}
 	sleep_ms(30);
 	pin_out(&AP2CP_WAKEUP, 0, 5);
+	link_up = false;
 	akita_pcie0_down();
 	t0 = now_ms();
 	while (pin_get(&CP2AP_WAKEUP) == 0) {
@@ -1373,6 +1454,7 @@ modem_run(void)
 	if (!announce(9, "stays: the modem's file service answered, what it says said")) {
 		return;
 	}
+	t0 = now_ms();
 	for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS), wake = (uint32_t)pin_get(&CP2AP_WAKEUP);;) {
 		uint32_t w = rd(ipc, IPC_CP2AP_MSG), st = rd(ipc, IPC_CP2AP_STATUS), k = (uint32_t)pin_get(&CP2AP_WAKEUP);
 
@@ -1385,6 +1467,13 @@ modem_run(void)
 		}
 		frames_say(&FMT_RX);
 		raw_serve();
+		if (link_sleep) {
+			link_follow();
+		}
+		if (ask_every_s != 0 && now_ms() - t0 >= 1000ull * ask_every_s) {
+			t0 = now_ms();
+			(void)sit_request(SIT_GET_RADIO_POWER, NULL, 0);        /* (a request now and then: the wake from our side) */
+		}
 		sleep_ms(5);
 	}
 }
@@ -1418,6 +1507,8 @@ akita_modem_init(void)
 	}
 	PE_parse_boot_argn("modem_delay", &delay_s, sizeof(delay_s));
 	PE_parse_boot_argn("modem_listen", &listen_s, sizeof(listen_s));
+	PE_parse_boot_argn("modem_link_sleep", &link_sleep, sizeof(link_sleep));
+	PE_parse_boot_argn("modem_ask_every", &ask_every_s, sizeof(ask_every_s));
 	printf("modem: steps 1 to %u in %u s\n", steps, delay_s);
 	call = thread_call_allocate(modem_start, NULL);
 	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
