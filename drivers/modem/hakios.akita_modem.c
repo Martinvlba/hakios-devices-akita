@@ -44,6 +44,20 @@
  *     (MAIN only) 21 a3 00 00 + the table's checksum word, answered 20 c3;  sd a1 00 00
  *   00 a4 00 00                                         run it
  *
+ *   9  stays   the modem's file service answered (channel 41, Android's rfsd: the modem saves its NV data to the
+ *              phone a few seconds after it starts) and everything it says said, until the phone restarts. The NV
+ *              data it sends is kept in memory and counted, not written anywhere yet
+ *
+ * The file service, as rfsd was seen to speak it: messages { u16 command, u16 sequence, u32 length } + values, the
+ * answer under the request's sequence number.
+ *   the modem: 7 { id }                         open an NV file (3: protected, 1: normal)    we: 3 { 0, id }
+ *   the modem: 6 { id, offset, size, 2 }        "take size bytes from me"                    we: 2 { id, offset, n } ...
+ *   the modem: 2 { 0, id, n } + n bytes         ... each answered so, n <= 0x7dc, then       we: 3 { 0, id }
+ *   the modem: 5 { id }                         close                                        we: 3 { 0, id }
+ *   the modem: 3 { 0, id, 0 }                   its acknowledgement of our 3
+ *   the modem: 4 { id, n } + a path             open a file of Android's by name (6 with direction 1 then reads it):
+ *                                               not answered here -- the files are Android's vendor partition's
+ *
  * More boot-args: modem_delay=SECONDS (25) after the kernel's start before step 1; modem_listen=SECONDS (20).
  */
 #include <kern/clock.h>
@@ -156,6 +170,7 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define FRAME_SINGLE            0xc000u
 #define FRAME_HEADER            12u
 #define CH_BOOT                 241u
+#define CH_RFS                  41u             /* umts_rfs0: the modem's file service */
 #define CH_RIL                  245u            /* umts_ipc0: the command protocol, SIM 1's stack */
 
 /*
@@ -941,6 +956,131 @@ frames_say(const struct queue *q)
 	}
 }
 
+/* ---- the file service ---- */
+
+#define RFS_CHUNK               0x7dcu
+#define RFS_MAX_FILE            0x100000u
+
+static struct {
+	uint32_t id, size, offset;      /* the transfer under way (size 0: none) */
+	uint16_t sequence;
+	uint8_t *data;
+	uint32_t saved[8];              /* bytes kept, by file id */
+} rfs;
+
+static void
+rfs_send(unsigned command, unsigned sequence, uint32_t a, uint32_t b, uint32_t c, unsigned words)
+{
+	uint8_t m[20] = { (uint8_t)command, 0, (uint8_t)sequence, (uint8_t)(sequence >> 8), (uint8_t)(4 * words) };
+
+	memcpy(m + 8, &a, 4);
+	memcpy(m + 12, &b, 4);
+	memcpy(m + 16, &c, 4);
+	if (frame_put(&RAW_TX, CH_RFS, m, 8, m + 8, 4 * words)) {
+		message(MSG_SEND_RAW);
+	}
+}
+
+static void
+rfs_message(const uint8_t *m, uint32_t length)
+{
+	uint32_t command, sequence, v[4] = { 0, 0, 0, 0 };
+
+	if (length < 8) {
+		return;
+	}
+	command = m[0] | m[1] << 8;
+	sequence = m[2] | m[3] << 8;
+	memcpy(v, m + 8, length - 8 < sizeof(v) ? length - 8 : sizeof(v));
+	switch (command) {
+	case 7:
+		printf("modem: %u: files: the modem opens NV file %u\n", step, v[0]);
+		rfs_send(3, sequence, 0, v[0], 0, 2);
+		break;
+	case 5:
+		printf("modem: %u: files: the modem closes file %u\n", step, v[0]);
+		rfs_send(3, sequence, 0, v[0], 0, 2);
+		break;
+	case 6:
+		if (v[3] != 2 || v[2] == 0 || v[2] > RFS_MAX_FILE || v[1] != 0 || rfs.size != 0) {
+			printf("modem: %u: files: a transfer not served: file %u, offset 0x%x, 0x%x bytes, direction %u\n", step, v[0], v[1], v[2],
+			    v[3]);
+			break;
+		}
+		if (rfs.data == NULL && (rfs.data = kalloc_data(RFS_MAX_FILE, Z_WAITOK)) == NULL) {
+			break;
+		}
+		rfs.id = v[0];
+		rfs.size = v[2];
+		rfs.offset = 0;
+		rfs.sequence = (uint16_t)sequence;
+		printf("modem: %u: files: the modem saves file %u: 0x%x bytes\n", step, rfs.id, rfs.size);
+		rfs_send(2, sequence, rfs.id, 0, rfs.size < RFS_CHUNK ? rfs.size : RFS_CHUNK, 3);
+		break;
+	case 2:
+		if (rfs.size == 0 || length < 20 || v[1] != rfs.id || v[2] > length - 20 || v[2] > rfs.size - rfs.offset) {
+			printf("modem: %u: files: data nobody asked for (file %u, %u bytes, %u in the message)\n", step, v[1], v[2], length);
+			break;
+		}
+		memcpy(rfs.data + rfs.offset, m + 20, v[2]);
+		rfs.offset += v[2];
+		if (rfs.offset < rfs.size) {
+			rfs_send(2, rfs.sequence, rfs.id, rfs.offset, rfs.size - rfs.offset < RFS_CHUNK ? rfs.size - rfs.offset : RFS_CHUNK, 3);
+		} else {
+			uint32_t sum = 0;
+
+			for (uint32_t i = 0; i < rfs.size; i++) {
+				sum = sum * 31 + rfs.data[i];
+			}
+			printf("modem: %u: files: file %u: 0x%x bytes taken (kept in memory only; sum 0x%08x)\n", step, rfs.id, rfs.size, sum);
+			if (rfs.id < 8) {
+				rfs.saved[rfs.id] = rfs.size;
+			}
+			rfs_send(3, rfs.sequence, 0, rfs.id, 0, 2);
+			rfs.size = 0;
+		}
+		break;
+	case 3:
+		break;          /* its acknowledgement */
+	case 4:
+		printf("modem: %u: files: the modem asks for a file of Android's (not served): %.*s\n", step,
+		    length > 16 ? (int)(length - 16 < 120 ? length - 16 : 120) : 0, (const char *)m + 16);
+		break;
+	default:
+		printf("modem: %u: files: command %u (sequence %u, %u bytes): %08x %08x %08x %08x\n", step, command, sequence, length, v[0], v[1],
+		    v[2], v[3]);
+		break;
+	}
+}
+
+/* the raw queue's frames: the file service's served, the others said */
+static void
+raw_serve(void)
+{
+	static uint8_t *payload;
+
+	if (payload == NULL && (payload = kalloc_data(2048, Z_WAITOK)) == NULL) {
+		return;
+	}
+	for (;;) {
+		uint8_t channel = 0;
+		uint32_t length = 0;
+		uint16_t config = 0;
+
+		if (frame_take(&RAW_RX, &channel, payload, 2048, &length, &config) <= 0) {
+			return;
+		}
+		if (channel == CH_RFS && length <= 2048 && (config & 0xc000) == 0xc000) {
+			rfs_message(payload, length);
+		} else if (channel == CH_RFS && length <= 2048 && config == 0) {
+			rfs_message(payload, length);   /* (the modem's own frames here carry 0: whole messages all the same) */
+		} else {
+			printf("modem: %u: RAW rx: channel %u, %u bytes (frame config 0x%04x): %02x %02x %02x %02x %02x %02x %02x %02x\n", step,
+			    channel, length, config, payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]);
+		}
+	}
+}
+
 static void
 modem_run(void)
 {
@@ -1223,12 +1363,30 @@ modem_run(void)
 				status = st;
 			}
 			frames_say(&FMT_RX);
-			frames_say(&RAW_RX);
+			raw_serve();
 			sleep_ms(2);
 		}
 	}
-	shared_say("at the end");
-	pins_say("at the end");
+	shared_say("after the requests");
+	pins_say("after the requests");
+
+	if (!announce(9, "stays: the modem's file service answered, what it says said")) {
+		return;
+	}
+	for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS), wake = (uint32_t)pin_get(&CP2AP_WAKEUP);;) {
+		uint32_t w = rd(ipc, IPC_CP2AP_MSG), st = rd(ipc, IPC_CP2AP_STATUS), k = (uint32_t)pin_get(&CP2AP_WAKEUP);
+
+		(void)akita_pcie0_msi_take();
+		if (w != word || st != status || k != wake) {
+			printf("modem: 9: the modem's word 0x%x, status 0x%x, its wake pin %u, active %d\n", w, st, k, pin_get(&CP2AP_CP_ACTIVE));
+			word = w;
+			status = st;
+			wake = k;
+		}
+		frames_say(&FMT_RX);
+		raw_serve();
+		sleep_ms(5);
+	}
 }
 
 static void
