@@ -16,7 +16,7 @@ what was seen on the one phone this port is developed on.
 | Touch and buttons | touch, power, volume |
 | GPU | Mali-G715 with a Metal driver of our own: the system's interface, the applications, Safari and WebGL draw with it (a 600-draw WebGL aquarium demo at the page's full 60 frames a second); Maps draws its map (land, water, roads, labels) |
 | Bluetooth | on (on 16.6.1 too, since 2026-11-17): Settings' switch, discoverable as "iPhone", finds nearby devices; earbuds pair and play (YouTube in Safari heard through Nothing Ear (3)); calls' audio, keyboards and LE accessories not tried yet |
-| Wi-Fi | joins WPA2 networks, DHCP, HTTPS; joined by the time the home screen is up; each phone has its own address |
+| Wi-Fi | joins WPA2 networks, DHCP, HTTPS; a network joined once in Settings is joined again by iOS itself after a restart (about 50 seconds after start); each phone has its own address |
 | Sound | both speakers, with the iPhone 13 mini's own speaker processing (its speaker protection runs without live amplifier feedback for now) |
 | Vibration | yes: the system's taps and vibrations, Core Haptics patterns |
 | Flashlight | the LED works (Control Center's button not confirmed yet) |
