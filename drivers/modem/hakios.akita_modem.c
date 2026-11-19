@@ -62,7 +62,8 @@
  * modem_link_sleep=0: step 9 keeps the link up (by default it follows the modem's wake pin: down when the modem lets
  * it go, up when either side has something); modem_ask_every=SECONDS: step 9 asks the radio's power that often (a test
  * of the wake from our side); modem_radio=1: step 8 also turns the radio on (SET_RADIO_POWER), as Android does with a SIM.
-; modem_crash_after=SECONDS: a test of
+; modem_irq=0: step 9 by the clock
+ * alone (200 looks a second) instead of woken by the modem's interrupts; modem_crash_after=SECONDS: a test of
  * step 9's restart -- the modem is asked to stop that long into step 9 (the dump-request pin).
  *
  * For Darwin: sysctl kern.hakios.cellular_radio, _sim, _baseband, _registered, _rat, _operator, _dbm, _bars, _up, kept
@@ -87,6 +88,11 @@ extern vm_map_address_t pmap_map(vm_map_address_t virt, vm_offset_t start, vm_of
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes);
 extern kern_return_t thread_terminate(thread_t thread);
+
+/* osfmk/arm64/gic_v3_irq.c */
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
 
 /* hakios.akita_modem_fs.c */
 struct akita_modem_file;
@@ -219,6 +225,16 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define PIN_CON                 0x00
 #define PIN_DAT                 0x04
 #define PIN_PUD                 0x08
+/* the alive controller's pins as interrupts (one line of the GIC a pin): how each triggers, masked or not, what waits */
+#define EINT_CON_GPA6           0x714           /* 4 bits a pin: 4 = both edges */
+#define EINT_CON_GPA7           0x718
+#define EINT_MASK_GPA6          0x914           /* a bit a pin: 1 = masked */
+#define EINT_MASK_GPA7          0x918
+#define EINT_PEND_GPA6          0xa14           /* a bit a pin: written 1 to clear */
+#define EINT_PEND_GPA7          0xa18
+#define INTID_CP2AP_WAKEUP      67u             /* gpa6-5: SPI 35 */
+#define INTID_CP2AP_ACTIVE      68u             /* gpa7-0: SPI 36 */
+#define INTID_MSI0              448u            /* the root complex's MSI group 0: SPI 416 */
 
 struct pin { uint8_t alive, bank, bit; const char *name; };
 static const struct pin AP2CP_WAKEUP = { 0, BANK_GPH0, 2, "AP2CP_WAKEUP" }, AP2CP_DUMP_NOTI = { 0, BANK_GPH0, 3, "AP2CP_DUMP_NOTI" },
@@ -234,7 +250,7 @@ struct toc_entry { char name[12]; uint32_t file_offset, load_address, size, crc,
 #define TOC_ENTRIES             8u
 #define DOWNLOAD_CHUNK          0xc000u
 
-static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s, radio_on, restarts, crash_after_s;
+static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s, radio_on, restarts, crash_after_s, use_irq = 1;
 static volatile uint8_t *ipc, *msi, *pktproc, *pin_hsi1, *pin_alive, *doorbell;
 static struct akita_modem_file *firmware;
 static struct toc_entry toc[TOC_ENTRIES];
@@ -848,6 +864,82 @@ endpoint_setup(bool first)
 }
 
 /*
+ * Interrupts for step 9, so that it need not look 200 times a second: the modem's MSIs (group 0 of the root complex,
+ * a level that stays until the status is cleared: masked here, the thread clears it and lets it in again) and the two
+ * pins the modem speaks with -- its wake pin and its "active" pin, both edges, through the alive pin controller's
+ * interrupt registers. Each only wakes the thread. A line that fires without end (a wrong register here) is masked
+ * for good and said, and the thread goes on by the clock as before.
+ */
+static volatile uint32_t irq_event, irq_msi_masked, irq_count[3], irq_storm;
+static bool irq_on, irq_attached;
+
+static void
+modem_interrupt(void *context, uint32_t intid)
+{
+	unsigned which = (unsigned)(uintptr_t)context;
+
+	if (which == 0) {
+		gic_v3_spi_mask(intid);         /* (until the thread has cleared the status) */
+		irq_msi_masked = 1;
+	} else if (which == 1) {
+		wr(pin_alive, EINT_PEND_GPA6, 1u << 5);
+	} else {
+		wr(pin_alive, EINT_PEND_GPA7, 1u << 0);
+	}
+	if (++irq_count[which] > 20000 && !irq_storm && which != 0) {
+		gic_v3_spi_mask(intid);
+		irq_storm = 1 + which;
+	}
+	irq_event = 1;
+	thread_wakeup((event_t)&irq_event);
+}
+
+static void
+interrupts_on(void)
+{
+	volatile uint8_t *b6 = pin_alive + BANK_GPA6, *b7 = pin_alive + BANK_GPA7;
+
+	/* the two pins as interrupt inputs (their level still reads in DAT), both edges, nothing waiting, let in */
+	wr(pin_alive, EINT_MASK_GPA6, rd(pin_alive, EINT_MASK_GPA6) | (1u << 5));
+	wr(pin_alive, EINT_MASK_GPA7, rd(pin_alive, EINT_MASK_GPA7) | (1u << 0));
+	wr(b6, PIN_CON, rd(b6, PIN_CON) | (0xfu << 20));
+	wr(b7, PIN_CON, rd(b7, PIN_CON) | 0xfu);
+	wr(pin_alive, EINT_CON_GPA6, (rd(pin_alive, EINT_CON_GPA6) & ~(0xfu << 20)) | (4u << 20));
+	wr(pin_alive, EINT_CON_GPA7, (rd(pin_alive, EINT_CON_GPA7) & ~0xfu) | 4u);
+	wr(pin_alive, EINT_PEND_GPA6, 1u << 5);
+	wr(pin_alive, EINT_PEND_GPA7, 1u << 0);
+	if (!irq_attached && (gic_v3_spi_attach(INTID_MSI0, false, modem_interrupt, (void *)0) != KERN_SUCCESS ||
+	    gic_v3_spi_attach(INTID_CP2AP_WAKEUP, false, modem_interrupt, (void *)1) != KERN_SUCCESS ||
+	    gic_v3_spi_attach(INTID_CP2AP_ACTIVE, false, modem_interrupt, (void *)2) != KERN_SUCCESS)) {
+		printf("modem: %u: the interrupts could not be attached: by the clock\n", step);
+		return;
+	}
+	irq_attached = true;
+	wr(pin_alive, EINT_MASK_GPA6, rd(pin_alive, EINT_MASK_GPA6) & ~(1u << 5));
+	wr(pin_alive, EINT_MASK_GPA7, rd(pin_alive, EINT_MASK_GPA7) & ~(1u << 0));
+	irq_on = true;
+	printf("modem: %u: interrupts: the MSIs (%u), the modem's wake pin (%u) and active pin (%u); gpa6 CON 0x%08x, gpa7 CON 0x%08x\n",
+	    step, INTID_MSI0, INTID_CP2AP_WAKEUP, INTID_CP2AP_ACTIVE, rd(b6, PIN_CON), rd(b7, PIN_CON));
+}
+
+/* the thread's wait in step 9: until an interrupt, or ms at most (without interrupts: 5 ms as before) */
+static void
+stay_wait(uint32_t ms)
+{
+	if (!irq_on || irq_storm) {
+		sleep_ms(5);
+		return;
+	}
+	assert_wait_timeout((event_t)&irq_event, THREAD_UNINT, ms, NSEC_PER_MSEC);
+	if (irq_event) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+	} else {
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+	irq_event = 0;
+}
+
+/*
  * The link's sleep, as Android's driver keeps it: the modem's wake pin low says the link may go; with nothing of
  * ours waiting in the queues it is taken down (the modem to D3hot, mastering off, PME_Turn_Off) and our wake pin
  * dropped. The modem's wake pin high -- by itself, or answering ours -- brings it up again at Gen3, the modem's
@@ -1294,7 +1386,8 @@ static void
 modem_run(void)
 {
 	const uint8_t *handover;
-	uint64_t handover_size = 0, t0, t_stay;
+	uint64_t handover_size = 0, t0, t_stay, t_said;
+	uint32_t turns = 0;
 	uint8_t *boot;
 	uint32_t stage = 0;
 
@@ -1589,11 +1682,23 @@ restart:
 	if (!announce(9, "stays: the modem's file service answered, what it says said")) {
 		return;
 	}
-	t0 = t_stay = now_ms();
+	if (use_irq) {
+		interrupts_on();        /* (again after a restart: the power sequence makes the pins plain inputs) */
+	}
+	t0 = t_stay = t_said = now_ms();
 	for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS), wake = (uint32_t)pin_get(&CP2AP_WAKEUP);;) {
 		uint32_t w = rd(ipc, IPC_CP2AP_MSG), st = rd(ipc, IPC_CP2AP_STATUS), k = (uint32_t)pin_get(&CP2AP_WAKEUP);
 
 		(void)akita_pcie0_msi_take();
+		if (irq_msi_masked && link_up) {
+			irq_msi_masked = 0;
+			gic_v3_spi_unmask(INTID_MSI0);
+		}
+		if (irq_storm > 1) {
+			printf("modem: 9: the interrupt of the modem's %s pin fired without end: masked, by the clock from here\n",
+			    irq_storm == 2 ? "wake" : "active");
+			irq_storm = 1;
+		}
 		if (w != word || st != status || k != wake) {
 			printf("modem: 9: the modem's word 0x%x, status 0x%x, its wake pin %u, active %d\n", w, st, k, pin_get(&CP2AP_CP_ACTIVE));
 			word = w;
@@ -1638,7 +1743,15 @@ restart:
 			t0 = now_ms();
 			(void)sit_request(SIT_GET_RADIO_POWER, NULL, 0);        /* (a request now and then: the wake from our side) */
 		}
-		sleep_ms(5);
+		if (now_ms() - t_said >= 60000) {
+			t_said = now_ms();
+			printf("modem: 9: a minute: %u turns of this loop; interrupts: MSI %u, wake pin %u, active pin %u; link sleeps %u, wakes %u\n",
+			    turns, irq_count[0], irq_count[1], irq_count[2], link_sleeps, link_wakes);
+			turns = 0;
+		}
+		turns++;
+		/* with the link up the queues are looked at every 10 ms (and its idle time counted); asleep: once a second */
+		stay_wait(link_up || doorbell_owed ? 10 : 1000);
 	}
 }
 
@@ -1674,6 +1787,7 @@ akita_modem_init(void)
 	PE_parse_boot_argn("modem_link_sleep", &link_sleep, sizeof(link_sleep));
 	PE_parse_boot_argn("modem_radio", &radio_on, sizeof(radio_on));
 	PE_parse_boot_argn("modem_crash_after", &crash_after_s, sizeof(crash_after_s));
+	PE_parse_boot_argn("modem_irq", &use_irq, sizeof(use_irq));
 	PE_parse_boot_argn("modem_ask_every", &ask_every_s, sizeof(ask_every_s));
 	printf("modem: steps 1 to %u in %u s\n", steps, delay_s);
 	call = thread_call_allocate(modem_start, NULL);
