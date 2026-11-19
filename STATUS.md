@@ -51,6 +51,7 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
 | Microphone | reaches the kernel; iOS does not record from it yet |
 | Camera | all three sensors are powered and identified (main Sony IMX787, front and ultra-wide Sony IMX712); the front camera streams 30 frames a second from our kernel; no picture in iOS yet |
+| Modem | the Exynos 5300 is started by our kernel (`modem=8`, off by default): PCIe link at Gen3 on two lanes, its firmware read from the phone's own `modem_a` partition and loaded, the start handshake done; it answers requests in its command protocol (radio power, baseband version, SIM state) and sends its indications. No SIM was in the phone: registration, signal and data are not done, and nothing of it reaches iOS yet |
 
 ## Not yet
 
