@@ -6272,6 +6272,9 @@ static struct { bool pending; uint32_t lines, gain64, fll; } fd_ask;
 static uint32_t fd_lines = 6304, fd_gain64 = 16 * FD_GAIN_UNITY, fd_fll = 6315;        /* (what Android's open leaves) */
 static uint32_t fd_sensor = 2;                          /* the number the frames carry (what was last asked for) */
 static unsigned fd_reopen, fd_sessions;                 /* camera_reopen=N, a test: the first session closed after N frames */
+/* camera=15: BOTH cameras behind the device -- sensor 1 (Darwin's back camera) is the main one, sensor 2 its front one;
+ * a session of the other camera is closed (fd_close) and the wanted one opened when Darwin asks for the other sensor */
+static bool fd_both;
 
 static uint64_t
 fd_ms_since(uint64_t t)
@@ -6330,7 +6333,7 @@ fd_exposure(int bus, uint32_t lines, uint32_t gain64, uint32_t fll)
  * came"). The sensor must be in standby already.
  */
 static void
-fd_close_main(vm_offset_t fe, vm_offset_t csis, vm_offset_t sreg)
+fd_close(vm_offset_t fe, vm_offset_t csis, vm_offset_t sreg, bool main)
 {
 	static const struct { uint8_t where; uint32_t off, val; uint16_t wait_us; } close_seq[] = {
 		{ 1, 0xc1800, 0, 0 }, { 1, 0xc1900, 0, 0 }, { 1, 0xc1a00, 0, 0 }, { 1, 0x10004, 0x205e03, 0 },
@@ -6356,6 +6359,17 @@ fd_close_main(vm_offset_t fe, vm_offset_t csis, vm_offset_t sreg)
 	};
 
 	for (unsigned i = 0; i < sizeof(close_seq) / sizeof(close_seq[0]); i++) {
+		uint32_t off = close_seq[i].off;
+
+		/*
+		 * After the FRONT camera (no trace of Android's close after it): the same, without what is the main camera's
+		 * alone -- its link and PHY lanes, block 7 (fe+0x22000, and its stop bit 0x80), the 0x3b000 unit, the
+		 * 0x50148 group (0x50150) -- so that no register of a unit the front session never ran is touched.
+		 */
+		if (!main && (close_seq[i].where == 1 || (close_seq[i].where == 0 && ((off >= 0x22000 && off < 0x23000) ||
+		    (off >= 0x3b000 && off < 0x3c000) || off == 0x50150 || (off == 0x200a4 && close_seq[i].val == 0x80))))) {
+			continue;
+		}
 		switch (close_seq[i].where) {
 		case 0:
 			wr(fe + close_seq[i].off, close_seq[i].val);
@@ -6673,7 +6687,8 @@ fd_session(void)
 			}
 			wr(fe + 0x20110, 0);
 		}
-		if (!closing && g != NULL && fd_reopen != 0 && fd_sessions == 1 && ends >= fd_reopen) {
+		if (!closing && ((fd_reopen != 0 && fd_sessions == 1 && ends >= fd_reopen) ||
+		    (fd_both && (fd_sensor == 1) != (g != NULL) && ends >= 2))) {
 			/* (camera_reopen=N: the session ended on purpose -- the sensor stopped between frames as below, then the front
 			 * end closed as Android closes it; the next read opens it again) */
 			closing = true;
@@ -6720,7 +6735,8 @@ fd_session(void)
 			printf("akita camera: device: no frame ended in 700 ms: the sensor to standby where it is\n");
 		}
 		if (closing && stop_sent && fd_ms_since(stop_time) > 40) {
-			printf("akita camera: device: the %s camera's session is closed after %u frames (a test: camera_reopen)\n", FD_NAME, ends);
+			printf("akita camera: device: the %s camera's session is closed after %u frames (%s)\n", FD_NAME, ends,
+			    fd_both && (fd_sensor == 1) != (g != NULL) ? "the other camera is wanted" : "a test: camera_reopen");
 			break;
 		}
 		if (stopping && !closing && stop_sent && fd_ms_since(stop_time) > 20) {
@@ -6766,8 +6782,8 @@ stop:
 	delay(50000);
 	printf("akita camera: device: the %s camera stopped (%s): %u frames, %u starts, %u errors\n", FD_NAME,
 	    closing ? "closed for another open" : !fd_is_open ? "closed" : "nobody reads", ends, starts, errs);
-	if (closing && g != NULL) {
-		fd_close_main(fe, csis, sreg);
+	if (closing) {
+		fd_close(fe, csis, sreg, g != NULL);
 	}
 	wr(fe + 0x90000, 0);
 	wr(sreg + 0x500, rd(sreg + 0x500) & ~(g ? g->dphy_reset : FRONT_DPHY_RESET_BITS));
@@ -6873,7 +6889,9 @@ fd_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.frame_lines_min = FD_FLL_MIN;
 	f.frame_lines_max = FD_FLL_MAX;
 	f.margin = FD_MARGIN;
-	f.sensor = fd_sensor;
+	/* (camera=15: the camera the frame is really from -- frames of the camera being left are still read while Darwin has
+	 * asked for the other one, and userland throws those away by this number) */
+	f.sensor = fd_both ? (FD_MAIN ? 1 : 2) : fd_sensor;
 	f.focus = HAKIOS_CAMERA_NO_FOCUS;
 	lck_mtx_unlock(&fd_lock);
 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
@@ -6910,8 +6928,11 @@ fd_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			return EINVAL;
 		}
 		if (c.a != fd_sensor) {
-			printf("akita camera: device: sensor %u asked for: the front sensor's frames under that number%s\n", c.a,
-			    c.a == 1 ? " (the wide camera is not there yet)" : "");
+			if (fd_both) {
+				printf("akita camera: device: sensor %u asked for: the %s camera\n", c.a, c.a == 1 ? "main" : "front");
+			} else {
+				printf("akita camera: device: sensor %u asked for: the %s sensor's frames under that number\n", c.a, FD_NAME);
+			}
 		}
 		fd_sensor = c.a;
 		return 0;
@@ -6978,7 +6999,11 @@ fd_serve(void)
 			(void)msleep(&fd_wanted, &fd_lock, PZERO, "akita-camera-idle", NULL);
 		}
 		lck_mtx_unlock(&fd_lock);
-		/* (a session that started does not come back: it sleeps with the sensor in standby when nobody reads) */
+		if (fd_both) {
+			fd_g = fd_sensor == 1 ? &cam_main : NULL;       /* (the camera Darwin asked for last) */
+		}
+		/* (a session that started comes back only closed, for the other camera or a test: else it sleeps with the sensor
+		 * in standby when nobody reads) */
 		if (fd_session()) {
 			continue;
 		}
@@ -7619,7 +7644,7 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 	if (camera_mode < 2) {
 		return;
 	}
-	if ((camera_mode == 13 || camera_mode == 14) && !fd_made) {
+	if ((camera_mode >= 13 && camera_mode <= 15) && !fd_made) {
 		printf("akita camera: device: /dev/hakios-camera was not made\n");
 		return;
 	}
@@ -7674,8 +7699,9 @@ akita_camera_thread(__unused void *arg, __unused wait_result_t w)
 		cam_capture(&cam_main);
 		return;
 	}
-	if (camera_mode == 13 || camera_mode == 14) {   /* 13: the front camera is Darwin's; 14: the main one */
+	if (camera_mode >= 13 && camera_mode <= 15) {   /* 13: the front camera is Darwin's; 14: the main one; 15: both */
 		fd_g = camera_mode == 14 ? &cam_main : NULL;
+		fd_both = camera_mode == 15;
 		fd_serve();
 		return;
 	}
@@ -7718,7 +7744,7 @@ akita_camera_init(void)
 	start = thread_call_allocate(akita_camera_start, NULL);
 	clock_interval_to_deadline(12, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(start, deadline);
-	if (mode == 13 || mode == 14) {
+	if (mode >= 13 && mode <= 15) {
 		static thread_call_t early;
 
 		early = thread_call_allocate(fd_early_start, NULL);
