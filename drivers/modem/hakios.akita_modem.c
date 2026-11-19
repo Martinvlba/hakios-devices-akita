@@ -62,6 +62,8 @@
  * modem_link_sleep=0: step 9 keeps the link up (by default it follows the modem's wake pin: down when the modem lets
  * it go, up when either side has something); modem_ask_every=SECONDS: step 9 asks the radio's power that often (a test
  * of the wake from our side); modem_radio=1: step 8 also turns the radio on (SET_RADIO_POWER), as Android does with a SIM.
+; modem_crash_after=SECONDS: a test of
+ * step 9's restart -- the modem is asked to stop that long into step 9 (the dump-request pin).
  *
  * For Darwin: sysctl kern.hakios.cellular_radio, _sim, _baseband, _registered, _rat, _operator, _dbm, _bars, _up, kept
  * from the modem's answers and indications while step 8 or 9 runs.
@@ -232,7 +234,7 @@ struct toc_entry { char name[12]; uint32_t file_offset, load_address, size, crc,
 #define TOC_ENTRIES             8u
 #define DOWNLOAD_CHUNK          0xc000u
 
-static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s, radio_on;
+static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s, radio_on, restarts, crash_after_s;
 static volatile uint8_t *ipc, *msi, *pktproc, *pin_hsi1, *pin_alive, *doorbell;
 static struct akita_modem_file *firmware;
 static struct toc_entry toc[TOC_ENTRIES];
@@ -1292,7 +1294,7 @@ static void
 modem_run(void)
 {
 	const uint8_t *handover;
-	uint64_t handover_size = 0, t0;
+	uint64_t handover_size = 0, t0, t_stay;
 	uint8_t *boot;
 	uint32_t stage = 0;
 
@@ -1315,6 +1317,7 @@ modem_run(void)
 		return;
 	}
 
+restart:
 	if (!announce(2, "writes: the shared memory for a boot, the handover block, the first-stage loader; the modem off and on")) {
 		return;
 	}
@@ -1586,7 +1589,7 @@ modem_run(void)
 	if (!announce(9, "stays: the modem's file service answered, what it says said")) {
 		return;
 	}
-	t0 = now_ms();
+	t0 = t_stay = now_ms();
 	for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS), wake = (uint32_t)pin_get(&CP2AP_WAKEUP);;) {
 		uint32_t w = rd(ipc, IPC_CP2AP_MSG), st = rd(ipc, IPC_CP2AP_STATUS), k = (uint32_t)pin_get(&CP2AP_WAKEUP);
 
@@ -1596,6 +1599,35 @@ modem_run(void)
 			word = w;
 			status = st;
 			wake = k;
+		}
+		if (crash_after_s != 0 && now_ms() - t_stay >= 1000ull * crash_after_s) {
+			crash_after_s = 0;
+			printf("modem: 9: a test: the modem asked to stop (the dump-request pin high, as Android's forced crash)\n");
+			pin_out(&AP2CP_DUMP_NOTI, 1, 0);
+		}
+		if (pin_get(&CP2AP_CP_ACTIVE) == 0) {
+			/*
+			 * Its "active" pin low after the start: the modem's firmware stopped (a crash, as Android's driver takes
+			 * it). What it left is said; then it is started again from the power sequence, three times at most.
+			 */
+			printf("modem: 9: THE MODEM STOPPED (its active pin is low): its word 0x%x, status 0x%x\n", w, st);
+			shared_say("stopped");
+			pins_say("stopped");
+			boot_log_say();
+			cellular_up = cellular_registered = cellular_bars = cellular_dbm = 0;
+			cellular_radio = cellular_sim = -1;
+			if (link_up) {
+				link_up = false;
+				akita_pcie0_down();
+			}
+			doorbell_owed = false;
+			rfs.size = 0;
+			if (++restarts > 3) {
+				printf("modem: 9: started again three times already: left off\n");
+				return;
+			}
+			printf("modem: 9: starting it again (%u)\n", restarts);
+			goto restart;
 		}
 		frames_say(&FMT_RX);
 		raw_serve();
@@ -1641,6 +1673,7 @@ akita_modem_init(void)
 	PE_parse_boot_argn("modem_listen", &listen_s, sizeof(listen_s));
 	PE_parse_boot_argn("modem_link_sleep", &link_sleep, sizeof(link_sleep));
 	PE_parse_boot_argn("modem_radio", &radio_on, sizeof(radio_on));
+	PE_parse_boot_argn("modem_crash_after", &crash_after_s, sizeof(crash_after_s));
 	PE_parse_boot_argn("modem_ask_every", &ask_every_s, sizeof(ask_every_s));
 	printf("modem: steps 1 to %u in %u s\n", steps, delay_s);
 	call = thread_call_allocate(modem_start, NULL);
