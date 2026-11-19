@@ -1126,9 +1126,8 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 		cellular_registered = registered ? d[0] : 0;
 		cellular_rat = d[3];
 		cellular_up = registered;
-		if (!registered) {
-			cellular_bars = 0;
-		}
+		/* (the bars are the signal's own: a network heard without a SIM has a strength too, and the next signal
+		 * indication, a second later, says it again) */
 	} else if (type == 1 && id == SIT_GET_OPERATOR && n >= 102) {
 		/* the network's number (6 characters, '#' for none), a short name (32), a long one (64) */
 		char name[72];
