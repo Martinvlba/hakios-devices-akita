@@ -51,7 +51,7 @@ layered rendering (one draw into several layers of an array texture, colour or d
 | Passcode | not tied to the phone's hardware: its keys are in a file on the data volume, not in the secure chip |
 | Microphone | reaches the kernel; iOS does not record from it yet |
 | Camera | the back camera (the main sensor, Sony IMX787) and the front camera (Sony IMX712) are iOS's cameras: the Camera application shows the live picture, takes photographs and flips between the two (about half a second). Not yet: the ultra-wide, focus, colour and white balance tuning (pictures are tinted), video recording |
-| Modem | the Exynos 5300 is started by our kernel (`modem=9`, off by default): PCIe link at Gen3 on two lanes, its firmware read from the phone's own `modem_a` partition and loaded, the start handshake, its file service answered, the link put to sleep and woken as the modem asks. It answers requests in its command protocol (radio power, baseband version, SIM state); with the radio on (`modem_radio=1`) and no SIM it hears a network and reports the signal. Not done: registration with a SIM, data, calls and messages; nothing of it shows in iOS yet (the kernel keeps `sysctl kern.hakios.cellular_*` for it) |
+| Modem | the Exynos 5300 is started by our kernel and kept running: PCIe link (put to sleep and woken as the modem asks), its firmware read from the phone's own `modem_a` partition, the start handshake, its file service, a restart if it stops. With the radio on it hears a network and reports its strength: the status bar shows the signal bars. Not done: registration with a SIM (none was in the phone), the carrier's name, data, calls and messages |
 
 ## Not yet
 
