@@ -61,7 +61,10 @@
  * More boot-args: modem_delay=SECONDS (25) after the kernel's start before step 1; modem_listen=SECONDS (20);
  * modem_link_sleep=0: step 9 keeps the link up (by default it follows the modem's wake pin: down when the modem lets
  * it go, up when either side has something); modem_ask_every=SECONDS: step 9 asks the radio's power that often (a test
- * of the wake from our side).
+ * of the wake from our side); modem_radio=1: step 8 also turns the radio on (SET_RADIO_POWER), as Android does with a SIM.
+ *
+ * For Darwin: sysctl kern.hakios.cellular_radio, _sim, _baseband, _registered, _rat, _operator, _dbm, _bars, _up, kept
+ * from the modem's answers and indications while step 8 or 9 runs.
  */
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -73,6 +76,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <vm/vm_kern.h>
 #include <vm/pmap.h>
 
@@ -228,7 +232,7 @@ struct toc_entry { char name[12]; uint32_t file_offset, load_address, size, crc,
 #define TOC_ENTRIES             8u
 #define DOWNLOAD_CHUNK          0xc000u
 
-static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s;
+static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s, radio_on;
 static volatile uint8_t *ipc, *msi, *pktproc, *pin_hsi1, *pin_alive, *doorbell;
 static struct akita_modem_file *firmware;
 static struct toc_entry toc[TOC_ENTRIES];
@@ -951,6 +955,124 @@ pktproc_headers(bool uplink)
 	}
 }
 
+/*
+ * What the modem said last, for Darwin's side: the names userland/src/inject_sb.c reads for the status bar (the same
+ * as the other phone's modem driver gives: cellular_up, _registered, _bars, _dbm, _operator, _radio) and three more.
+ * Layouts: the vendor's parsers read (vendor.radio.protocol.sit.stream), checked against a start without a SIM; the
+ * registration, operator and signal ones have not been seen filled yet (no SIM was in the phone).
+ */
+static int cellular_up, cellular_registered, cellular_bars, cellular_dbm, cellular_radio = -1, cellular_sim = -1, cellular_rat;
+static char cellular_operator[72], cellular_baseband[64];
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_up, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_up, 0, "1: the modem is registered on a network");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_registered, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_registered, 0,
+    "the packet registration state: 1 home, 5 roaming");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_bars, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_bars, 0, "signal, 0 to 4 bars");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_dbm, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_dbm, 0, "signal, dBm; 0: none read");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_radio, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_radio, 0,
+    "the modem's radio state (0 off, 1 unavailable, 3 no SIM or locked, 4 SIM ready, 10 on; -1: not asked)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_sim, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_sim, 0,
+    "the SIM: 0 absent, 1 present, 2 error, 5 present and ready; -1: not asked");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_rat, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_rat, 0, "radio technology (14 LTE, 21 NR, 3 UMTS, 16 GSM)");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_operator, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_operator, 0, "the network's name");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_baseband, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_baseband, 0, "the baseband's version");
+
+static bool sit_request(unsigned id, const uint8_t *parameters, uint32_t len);
+
+static int32_t
+s32_at(const uint8_t *d, uint32_t off)
+{
+	int32_t v;
+
+	memcpy(&v, d + off, 4);
+	return v;
+}
+
+/* a message of SIM 1's stack understood: d is what follows its header (12 bytes of an answer, 8 of an indication) */
+static void
+sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
+{
+	if (type == 2 && id == SIT_IND_SIM_STATUS_CHANGED) {
+		(void)sit_request(SIT_GET_SIM_STATUS, NULL, 0);
+	} else if (type == 2 && id == SIT_IND_NTW_STATE_CHANGED) {
+		(void)sit_request(SIT_GET_PS_REG_STATE, NULL, 0);
+		(void)sit_request(SIT_GET_OPERATOR, NULL, 0);
+		(void)sit_request(SIT_GET_SIGNAL_STRENGTH, NULL, 0);
+	} else if (type == 2 && (id == SIT_IND_RADIO_STATE_CHANGED || id == SIT_IND_RADIO_READY)) {
+		(void)sit_request(SIT_GET_RADIO_POWER, NULL, 0);
+	} else if (type == 1 && id == SIT_GET_RADIO_POWER && n >= 4) {
+		if (cellular_radio != s32_at(d, 0)) {
+			printf("modem: %u: the radio's state: %d (was %d)\n", step, s32_at(d, 0), cellular_radio);
+		}
+		cellular_radio = s32_at(d, 0);
+	} else if (type == 1 && id == SIT_GET_BASEBAND_VERSION && n >= 2) {
+		strlcpy(cellular_baseband, (const char *)d + 1, n - 1 < sizeof(cellular_baseband) ? n - 1 : sizeof(cellular_baseband));
+	} else if (type == 1 && id == SIT_GET_SIM_STATUS && n >= 3) {
+		/* the card's state, then 63 bytes an application: its type, its state (5: ready; 2: PIN wanted, 3: PUK) */
+		int state = d[0] == 3 ? 1 : d[0];
+
+		if (state == 1 && d[2] != 0 && n >= 3 + 63) {
+			printf("modem: %u: the SIM: present, %u application%s; the first: type %u, state %u (5 ready, 2 PIN, 3 PUK), PIN1 state %u\n",
+			    step, d[2], d[2] == 1 ? "" : "s", d[3], d[4], d[3 + 57]);
+			if (d[4] == 5) {
+				state = 5;
+			}
+		} else if (state != cellular_sim) {
+			printf("modem: %u: the SIM: card state %u (0 absent, 1 present, 2 error), %u applications\n", step, d[0], d[2]);
+		}
+		cellular_sim = state;
+	} else if (type == 1 && id == SIT_GET_PS_REG_STATE && n >= 4) {
+		bool registered = d[0] == 1 || d[0] == 5;
+
+		if (cellular_registered != d[0] || cellular_rat != d[3]) {
+			printf("modem: %u: packet registration: state %u (1 home, 5 roaming, 2 searching, 3 denied), reject cause %u, technology %u\n",
+			    step, d[0], d[1], d[3]);
+		}
+		cellular_registered = registered ? d[0] : 0;
+		cellular_rat = d[3];
+		cellular_up = registered;
+		if (!registered) {
+			cellular_bars = 0;
+		}
+	} else if (type == 1 && id == SIT_GET_OPERATOR && n >= 102) {
+		/* the network's number (6 characters, '#' for none), a short name (32), a long one (64) */
+		char name[72];
+		const char *from = d[38] != 0 ? (const char *)d + 38 : d[6] != 0 ? (const char *)d + 6 : (const char *)d;
+		size_t room = d[38] != 0 ? 64 : d[6] != 0 ? 32 : 6, k = 0;
+
+		for (size_t i = 0; i < room && from[i] != 0 && from[i] != '#' && k < sizeof(name) - 1; i++) {
+			name[k++] = from[i] >= 0x20 && from[i] < 0x7f ? from[i] : '?';
+		}
+		name[k] = 0;
+		if (strcmp(name, cellular_operator) != 0) {
+			printf("modem: %u: the network: \"%s\"\n", step, name);
+		}
+		strlcpy(cellular_operator, name, sizeof(cellular_operator));
+	} else if ((id == SIT_GET_SIGNAL_STRENGTH && type == 1 || id == SIT_IND_SIGNAL_STRENGTH && type == 2) && n >= 102) {
+		/* which technologies have a reading (a mask), then 32-bit values: LTE's RSRP at 66, NR's at 90 (both as -dBm),
+		 * WCDMA's RSCP at 22, GSM's strength at 2 (0..31: -113 + 2n dBm) */
+		unsigned mask = d[0] | d[1] << 8;
+		int dbm = 0, v;
+
+		if ((mask & 0x40) != 0 && (v = s32_at(d, 90)) > 0 && v < 200) {
+			dbm = -v;
+		} else if ((mask & 0x84) != 0 && (v = s32_at(d, 66)) > 0 && v < 200) {
+			dbm = -v;
+		} else if ((mask & 0x02) != 0 && (v = s32_at(d, 22)) != 0 && v != 0x7fffffff) {
+			dbm = v > 0 ? -v : v;
+		} else if ((mask & 0x01) != 0 && (v = s32_at(d, 2)) >= 0 && v <= 31) {
+			dbm = -113 + 2 * v;
+		}
+		if (dbm != cellular_dbm) {
+			printf("modem: %u: the signal: mask 0x%x: %d dBm (GSM %d, WCDMA RSCP %d, LTE RSRP %d RSRQ %d, NR RSRP %d)\n", step, mask, dbm,
+			    s32_at(d, 2), s32_at(d, 22), s32_at(d, 66), s32_at(d, 70), s32_at(d, 90));
+		}
+		cellular_dbm = dbm;
+		cellular_bars = dbm == 0 ? 0 : dbm >= -95 ? 4 : dbm >= -105 ? 3 : dbm >= -115 ? 2 : 1;
+	}
+}
+
 static const char *
 sit_name(unsigned id)
 {
@@ -996,7 +1118,7 @@ sit_request(unsigned id, const uint8_t *parameters, uint32_t len)
 static unsigned
 frames_say(const struct queue *q)
 {
-	static uint8_t payload[97];
+	static uint8_t payload[1025];
 	unsigned n = 0;
 
 	for (;;) {
@@ -1018,12 +1140,17 @@ frames_say(const struct queue *q)
 			unsigned type = payload[0] | payload[1] << 8, id = payload[2] | payload[3] << 8, head = type == 2 ? 8 : 12;
 			const char *name = sit_name(id);
 
-			if (type == 1 && length >= 12) {
+			if (type == 2 && id == SIT_IND_SIGNAL_STRENGTH) {
+				/* (once a second while a cell is heard: only a change is said, by sit_understand) */
+			} else if (type == 1 && length >= 12) {
 				printf("modem: %u: SIM stack %u: answer 0x%04x %s (token 0x%x, error %u), %u bytes:%s\n", step, channel - CH_RIL + 1, id,
 				    name, payload[6] | payload[7] << 8, payload[10] | payload[11] << 8, length - head, text + 3 * head);
 			} else {
 				printf("modem: %u: SIM stack %u: %s 0x%04x %s, %u bytes:%s\n", step, channel - CH_RIL + 1,
 				    type == 2 ? "indication" : "message", id, name, length > head ? length - head : 0, shown > head ? text + 3 * head : "");
+			}
+			if (channel == CH_RIL && length >= head && length <= sizeof(payload) - 1) {
+				sit_understand(type, id, payload + head, length - head);
 			}
 			if (type == 1 && id == SIT_GET_BASEBAND_VERSION && shown > 14) {
 				payload[shown < sizeof(payload) ? shown : sizeof(payload) - 1] = 0;
@@ -1427,6 +1554,11 @@ modem_run(void)
 		strlcpy((char *)info + 64, "akita", 32);
 		strlcpy((char *)info + 96, "16", 32);
 		(void)sit_request(SIT_SET_DEVICE_INFO, info, sizeof(info));
+		if (radio_on) {
+			static const uint8_t on[6] = { 2, 0, 0, 0, 0, 0 };     /* u32 2: on; not for an emergency call */
+
+			(void)sit_request(SIT_SET_RADIO_POWER, on, sizeof(on));
+		}
 		next_at = now_ms() + 1500;
 
 		t0 = now_ms();
@@ -1508,6 +1640,7 @@ akita_modem_init(void)
 	PE_parse_boot_argn("modem_delay", &delay_s, sizeof(delay_s));
 	PE_parse_boot_argn("modem_listen", &listen_s, sizeof(listen_s));
 	PE_parse_boot_argn("modem_link_sleep", &link_sleep, sizeof(link_sleep));
+	PE_parse_boot_argn("modem_radio", &radio_on, sizeof(radio_on));
 	PE_parse_boot_argn("modem_ask_every", &ask_every_s, sizeof(ask_every_s));
 	printf("modem: steps 1 to %u in %u s\n", steps, delay_s);
 	call = thread_call_allocate(modem_start, NULL);
