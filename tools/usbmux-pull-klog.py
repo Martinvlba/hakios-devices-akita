@@ -3,7 +3,7 @@
 /var/mobile/Media/hakios-klog, written twice a second) over AFC, with the PC's pairing as usbmux-install.py makes the
 connection. Reads only.
 
-usage: usbmux-pull-klog.py OUTDIR [--all]      the newest three files (--all: every one), whole
+usage: usbmux-pull-klog.py OUTDIR [--all | --camera]      the newest three files (--all: every one), whole
        usbmux-pull-klog.py --summary FILE...   battery and CPU-idle lines of fetched files, condensed
 
 (the phone's kernel is started with battery_say=6 -- "akita battery say: N mA ..." every 30 s -- and cpuidle=1 --
@@ -77,6 +77,8 @@ def main():
     if '--all' not in sys.argv:
         names, wired = names[-3:], wired[-3:]
     names += wired
+    if '--camera' in sys.argv:          # the cameras' kept frames (camera_test raw N keepraw sensor S: camera-S.raw) and nothing else
+        names = sorted(n for n in every if n.startswith('camera-'))
     got = []
     for name in names:
         _, data = afc.call(base.AFC_OPEN, struct.pack('<Q', 1) + ('%s/%s' % (DIR, name)).encode() + b'\0')   # 1: read
@@ -93,7 +95,8 @@ def main():
         print('usbmux-pull-klog: %s, %d bytes' % (name, size))
         got.append(os.path.join(out, name))
     afc.s.close()
-    summary(got)
+    if '--camera' not in sys.argv:
+        summary(got)
 
 
 if __name__ == '__main__':
