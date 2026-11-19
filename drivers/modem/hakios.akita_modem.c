@@ -203,6 +203,8 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define SIT_GET_OPERATOR                0x0702u
 #define SIT_SET_RADIO_POWER             0x0800u
 #define SIT_SET_ALLOW_NETWORK            0x074fu
+#define SIT_OEM_SET_CARRIER_CONFIG       0x4600u /* (unnamed in rild's table: the carrier configuration's place and manifest) */
+#define SIT_OEM_IND_CARRIER_INFO         0x4602u /* (... the modem saying whose card it has) */
 #define SIT_SET_DEBUG_TRACE                     0x090bu
 #define SIT_SET_NULL_CIPHER_INTEGRITY_ENABLE    0x096du
 #define SIT_SET_IND_CMD_FILTER                  0x0928u
@@ -1087,6 +1089,7 @@ SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_operator, CTLFLAG_RD | CTLFLAG_LO
 SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_baseband, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_baseband, 0, "the baseband's version");
 
 static bool sit_request(unsigned id, const uint8_t *parameters, uint32_t len);
+static void carrier_answer(unsigned channel, const uint8_t *d, uint32_t n);
 
 /*
  * (11-19) The SIM's PIN. A card whose application waits for its PIN (state 2) registers nowhere; Darwin has no telephony
@@ -1098,6 +1101,7 @@ static bool sit_request(unsigned id, const uint8_t *parameters, uint32_t len);
  * (wrong: cellular_pin_tries says how many tries the card has left before it wants its PUK).
  */
 static int cellular_pin_state, cellular_pin_tries = -1, cellular_cs_registered;
+static char carrier_name[32], carrier_number[8];        /* (whose card it is, as the modem said: see carrier_answer) */
 static unsigned int allow_networks = 0x000403fe;
 static char attach_apn[64];
 static bool allow_said;
@@ -1299,6 +1303,11 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 			name[k++] = from[i] >= 0x20 && from[i] < 0x7f ? from[i] : '?';
 		}
 		name[k] = 0;
+		/* (a network that gives only its number, and it is the card's own -- its number begins the IMSI: the carrier's
+		 * name as the modem said it with the card, "Telia" for "24801") */
+		if (d[38] == 0 && d[6] == 0 && carrier_name[0] != 0 && k >= 5 && strncmp(name, carrier_number, k) == 0) {
+			strlcpy(name, carrier_name, sizeof(name));
+		}
 		if (strcmp(name, cellular_operator) != 0) {
 			printf("modem: %u: the network: \"%s\"\n", step, name);
 		}
@@ -1372,6 +1381,145 @@ sit_request(unsigned id, const uint8_t *parameters, uint32_t len)
 	return true;
 }
 
+/*
+ * (11-19) THE CARRIER'S CONFIGURATION. Once the modem knows whose card it has it says so (indication 0x4602: ICCID, IMSI,
+ * the network's name -- never printed) and waits to be told the carrier's configuration: request 0x4600 with the
+ * directory "/vendor/firmware/carrierconfig" and the 20-byte name of that carrier's manifest; it then reads
+ * /vendor/firmware/carrierconfig/manifests/<name in hex> through the file service (below) and applies it. WITHOUT THIS
+ * THE MODEM MEASURED GSM ALONE and registered nowhere, where Android's goes GSM, UMTS, LTE within eight seconds of the
+ * PIN -- its trace has the exchange right after the PIN, and once at the start for the stack without a card (the
+ * default manifest). The manifests and which network takes which are fw/carrierconfig.pack of the image
+ * (devices/akita/tools/mkcarrierpack.py, out of Android's /vendor/firmware/carrierconfig).
+ */
+static const uint8_t *carrier_pack;
+static uint64_t carrier_pack_size;
+
+static bool
+carrier_pack_there(void)
+{
+	static bool looked;
+
+	if (!looked) {
+		looked = true;
+		carrier_pack = hakios_image_file("fw", "carrierconfig.pack", &carrier_pack_size, NULL);
+		if (carrier_pack == NULL || carrier_pack_size < 16 || memcmp(carrier_pack, "HKCC0001", 8) != 0) {
+			printf("modem: %u: no fw/carrierconfig.pack in the image: the modem keeps its own defaults (GSM alone)\n", step);
+			carrier_pack = NULL;
+		}
+	}
+	return carrier_pack != NULL;
+}
+
+/* the manifest (its 20-byte name) of the network NUMBER (5 or 6 digits; "" or unknown: the default's) */
+static const uint8_t *
+carrier_manifest_of(const char *number)
+{
+	uint32_t networks;
+	const uint8_t *found = NULL;
+
+	if (!carrier_pack_there()) {
+		return NULL;
+	}
+	memcpy(&networks, carrier_pack + 8, 4);
+	if (16 + 28ull * networks > carrier_pack_size || networks == 0) {
+		return NULL;
+	}
+	for (unsigned digits = 6; digits >= 5 && found == NULL && number[0] != 0; digits--) {
+		for (uint32_t i = 1; i < networks; i++) {
+			const char *n = (const char *)carrier_pack + 16 + 28 * i;
+
+			if (strnlen(n, 8) == digits && strncmp(n, number, digits) == 0) {
+				found = (const uint8_t *)n + 8;
+				break;
+			}
+		}
+	}
+	return found != NULL ? found : carrier_pack + 16 + 8;  /* (the first entry: everybody else's) */
+}
+
+/* a manifest's bytes by its name in hex (40 characters) */
+static const uint8_t *
+carrier_manifest_bytes(const char *hex, uint32_t *size)
+{
+	uint32_t networks, manifests;
+	uint8_t name[20];
+
+	if (!carrier_pack_there()) {
+		return NULL;
+	}
+	for (int i = 0; i < 20; i++) {
+		int hi = hex[2 * i], lo = hex[2 * i + 1];
+
+		hi = hi >= '0' && hi <= '9' ? hi - '0' : hi >= 'a' && hi <= 'f' ? hi - 'a' + 10 : -1;
+		lo = lo >= '0' && lo <= '9' ? lo - '0' : lo >= 'a' && lo <= 'f' ? lo - 'a' + 10 : -1;
+		if (hi < 0 || lo < 0) {
+			return NULL;
+		}
+		name[i] = (uint8_t)(hi << 4 | lo);
+	}
+	memcpy(&networks, carrier_pack + 8, 4);
+	memcpy(&manifests, carrier_pack + 12, 4);
+	for (uint32_t i = 0; i < manifests && 16 + 28ull * networks + 28ull * (i + 1) <= carrier_pack_size; i++) {
+		const uint8_t *e = carrier_pack + 16 + 28 * networks + 28 * i;
+		uint32_t offset, bytes;
+
+		memcpy(&offset, e + 20, 4);
+		memcpy(&bytes, e + 24, 4);
+		if (memcmp(e, name, 20) == 0 && (uint64_t)offset + bytes <= carrier_pack_size) {
+			*size = bytes;
+			return carrier_pack + offset;
+		}
+	}
+	return NULL;
+}
+
+/* the modem said whose card a stack has (D: the indication's bytes; the IMSI is 15 digits at +25, none without a card) */
+static void
+carrier_answer(unsigned channel, const uint8_t *d, uint32_t n)
+{
+	static uint8_t request[12 + 520];
+	static uint16_t token = 0x4000;
+	char number[8] = "";
+	const uint8_t *manifest;
+
+	if (n >= 25 + 6) {
+		for (unsigned i = 0; i < 6 && d[25 + i] >= '0' && d[25 + i] <= '9'; i++) {
+			number[i] = (char)d[25 + i];
+		}
+	}
+	if (channel == CH_RIL) {
+		/* (the carrier's name as the card or the modem's table has it, a byte and then the text at +57: what the status
+		 * bar shows when the network gives only its number) */
+		size_t k = 0;
+
+		for (unsigned i = 58; i < n && i < 58 + sizeof(carrier_name) - 1 && d[i] >= 0x20 && d[i] < 0x7f; i++) {
+			carrier_name[k++] = (char)d[i];
+		}
+		carrier_name[k] = 0;
+		strlcpy(carrier_number, number, sizeof(carrier_number));
+	}
+	if ((manifest = carrier_manifest_of(number)) == NULL) {
+		return;
+	}
+	bzero(request, sizeof(request));
+	request[2] = (uint8_t)SIT_OEM_SET_CARRIER_CONFIG;
+	request[3] = (uint8_t)(SIT_OEM_SET_CARRIER_CONFIG >> 8);
+	request[4] = (uint8_t)sizeof(request);
+	request[5] = (uint8_t)(sizeof(request) >> 8);
+	token++;
+	request[6] = (uint8_t)token;
+	request[7] = (uint8_t)(token >> 8);
+	request[12] = 30;
+	memcpy(request + 12 + 4, "/vendor/firmware/carrierconfig", 30);
+	request[12 + 260] = 20;
+	memcpy(request + 12 + 264, manifest, 20);
+	if (frame_put(&FMT_TX, (uint8_t)channel, request, 12, request + 12, 520)) {
+		message(MSG_SEND_FMT);
+	}
+	printf("modem: %u: SIM stack %u: the carrier's configuration told: manifest %02x%02x%02x%02x... (%s)\n", step, channel - CH_RIL + 1,
+	    manifest[0], manifest[1], manifest[2], manifest[3], number[0] != 0 ? "the card's network's" : "no card: the default");
+}
+
 /* every whole frame in a queue said: its channel, its length, its first bytes */
 static unsigned
 frames_say(const struct queue *q)
@@ -1403,9 +1551,16 @@ frames_say(const struct queue *q)
 			} else if (type == 1 && length >= 12) {
 				printf("modem: %u: SIM stack %u: answer 0x%04x %s (token 0x%x, error %u), %u bytes:%s\n", step, channel - CH_RIL + 1, id,
 				    name, payload[6] | payload[7] << 8, payload[10] | payload[11] << 8, length - head, text + 3 * head);
+			} else if (id == SIT_OEM_IND_CARRIER_INFO) {
+				/* (the card's numbers are in it -- ICCID, IMSI --: NEVER printed) */
+				printf("modem: %u: SIM stack %u: indication 0x%04x (whose card it is), %u bytes not shown\n", step, channel - CH_RIL + 1,
+				    id, length > head ? length - head : 0);
 			} else {
 				printf("modem: %u: SIM stack %u: %s 0x%04x %s, %u bytes:%s\n", step, channel - CH_RIL + 1,
 				    type == 2 ? "indication" : "message", id, name, length > head ? length - head : 0, shown > head ? text + 3 * head : "");
+			}
+			if (type == 2 && id == SIT_OEM_IND_CARRIER_INFO && length >= head) {
+				carrier_answer(channel, payload + head, length - head);
 			}
 			if (channel == CH_RIL && length >= head && length <= sizeof(payload) - 1) {
 				sit_answer_error = type == 1 && length >= 12 ? payload[10] | payload[11] << 8 : 0;
@@ -1425,7 +1580,40 @@ frames_say(const struct queue *q)
 /* ---- the file service ---- */
 
 #define RFS_CHUNK               0x7dcu
+#define RFS_CHUNK_OUT           0x7dcu
 #define RFS_MAX_FILE            0x100000u
+
+/* (11-19) a file of Android's the modem reads by its path: a carrier's manifest out of the pack. As rfsd answers (its
+ * trace): the open (command 4: a handle, the path) is answered with command 3 { 0, handle, the file's size }; a read
+ * (command 6: handle, offset, bytes, direction 1) with command 1 messages { handle, offset, bytes, the data } of at most
+ * 2012 bytes, each acknowledged by the modem with a command 1 before the next, and a command 3 { 0, handle } at the end */
+static struct {
+	const uint8_t *data;
+	uint32_t size, handle;
+	uint32_t at, end;               /* the read under way (end 0: none) */
+	uint16_t sequence;
+} rfs_file;
+
+static void
+rfs_file_send(void)
+{
+	static uint8_t m[8 + 12 + RFS_CHUNK_OUT];
+	uint32_t n = rfs_file.end - rfs_file.at < RFS_CHUNK_OUT ? rfs_file.end - rfs_file.at : RFS_CHUNK_OUT, len = 12 + n;
+
+	bzero(m, 20);
+	m[0] = 1;
+	m[2] = (uint8_t)rfs_file.sequence;
+	m[3] = (uint8_t)(rfs_file.sequence >> 8);
+	memcpy(m + 4, &len, 4);
+	memcpy(m + 8, &rfs_file.handle, 4);
+	memcpy(m + 12, &rfs_file.at, 4);
+	memcpy(m + 16, &n, 4);
+	memcpy(m + 20, rfs_file.data + rfs_file.at, n);
+	if (frame_put(&RAW_TX, CH_RFS, m, 8, m + 8, len)) {
+		message(MSG_SEND_RAW);
+	}
+	rfs_file.at += n;
+}
 
 static struct {
 	uint32_t id, size, offset;      /* the transfer under way (size 0: none) */
@@ -1464,10 +1652,21 @@ rfs_message(const uint8_t *m, uint32_t length)
 		rfs_send(3, sequence, 0, v[0], 0, 2);
 		break;
 	case 5:
-		printf("modem: %u: files: the modem closes file %u\n", step, v[0]);
 		rfs_send(3, sequence, 0, v[0], 0, 2);
 		break;
 	case 6:
+		if (v[3] == 1 && rfs_file.data != NULL && v[0] == rfs_file.handle && v[1] <= rfs_file.size && v[2] <= rfs_file.size - v[1]) {
+			rfs_file.at = v[1];
+			rfs_file.end = v[1] + v[2];
+			rfs_file.sequence = (uint16_t)sequence;
+			if (rfs_file.end == rfs_file.at) {
+				rfs_file.end = 0;
+				rfs_send(3, sequence, 0, rfs_file.handle, 0, 2);
+			} else {
+				rfs_file_send();
+			}
+			break;
+		}
 		if (v[3] != 2 || v[2] == 0 || v[2] > RFS_MAX_FILE || v[1] != 0 || rfs.size != 0) {
 			printf("modem: %u: files: a transfer not served: file %u, offset 0x%x, 0x%x bytes, direction %u\n", step, v[0], v[1], v[2],
 			    v[3]);
@@ -1506,12 +1705,59 @@ rfs_message(const uint8_t *m, uint32_t length)
 			rfs.size = 0;
 		}
 		break;
+	case 1:
+		/* (its acknowledgement of a piece of a file it reads: the next piece, or the end) */
+		if (rfs_file.end != 0 && rfs_file.at < rfs_file.end) {
+			rfs_file_send();
+		} else if (rfs_file.end != 0) {
+			rfs_file.end = 0;
+			rfs_send(3, rfs_file.sequence, 0, rfs_file.handle, 0, 2);
+		}
+		break;
 	case 3:
 		break;          /* its acknowledgement */
-	case 4:
-		printf("modem: %u: files: the modem asks for a file of Android's (not served): %.*s\n", step,
-		    length > 16 ? (int)(length - 16 < 120 ? length - 16 : 120) : 0, (const char *)m + 16);
+	case 4: {
+		/* (a carrier's manifest, then the configuration sequences it names: files called by their SHA-1 in two directories) */
+		static const char dir[] = "/vendor/firmware/carrierconfig/manifests/", dir2[] = "/vendor/firmware/carrierconfig/confseqs/";
+		const char *path = (const char *)m + 16;
+		uint32_t n = length > 16 ? length - 16 : 0, size = 0;
+		const uint8_t *file = NULL;
+
+		if (n >= sizeof(dir) - 1 + 40 && strncmp(path, dir, sizeof(dir) - 1) == 0) {
+			file = carrier_manifest_bytes(path + sizeof(dir) - 1, &size);
+		} else if (n >= sizeof(dir2) - 1 + 40 && strncmp(path, dir2, sizeof(dir2) - 1) == 0) {
+			file = carrier_manifest_bytes(path + sizeof(dir2) - 1, &size);
+		}
+		if (file == NULL) {
+			printf("modem: %u: files: the modem asks for a file of Android's that is not here: %.*s\n", step, (int)(n < 120 ? n : 120),
+			    path);
+			rfs_send(3, sequence, 2, v[0], 0, 3);          /* (no such file; what rfsd says then is not known) */
+			break;
+		}
+		rfs_file.data = file;
+		rfs_file.size = size;
+		rfs_file.handle = v[0];
+		rfs_file.end = 0;
+		{
+			static unsigned opened;
+
+			if (opened++ < 6 || opened % 20 == 0) {
+				printf("modem: %u: files: the modem opens a file of the carrier's configuration (%u bytes), handle %u; %u so far\n",
+				    step, size, v[0], opened);
+			}
+		}
+		{
+			/* (as rfsd: three words, the length saying two) */
+			uint8_t reply[20] = { 3, 0, (uint8_t)sequence, (uint8_t)(sequence >> 8), 8 };
+
+			memcpy(reply + 12, &v[0], 4);
+			memcpy(reply + 16, &size, 4);
+			if (frame_put(&RAW_TX, CH_RFS, reply, 8, reply + 8, 12)) {
+				message(MSG_SEND_RAW);
+			}
+		}
 		break;
+	}
 	default:
 		printf("modem: %u: files: command %u (sequence %u, %u bytes): %08x %08x %08x %08x\n", step, command, sequence, length, v[0], v[1],
 		    v[2], v[3]);
