@@ -6408,7 +6408,8 @@ fd_session(void)
 	uint32_t mux, div;
 	unsigned on = 0, starts = 0, ends = 0, errs = 0;
 	int newest = -1;
-	bool marked[2] = { false, false }, ok = false, stopping = false, stop_sent = false, closing = false;
+	bool marked[2] = { false, false }, ok = false, stopping = false, stop_sent = false, closing = false, late_ack = false;
+	unsigned refills = 0;
 	uint64_t stop_time = 0;
 	unsigned stop_after = 0, queued = 1;
 
@@ -6664,6 +6665,24 @@ fd_session(void)
 					__asm__ volatile ("dsb sy" ::: "memory");
 					queued++;
 					wr(fe + 0x90010, (queued * 16u) % FD_QUEUE_BYTES);
+					/*
+					 * (11-19) Never an empty queue: this thread looks every 0.7 ms but may be kept away for longer than
+					 * a frame, and two frame starts seen as one leave the queue an entry short for good -- until a
+					 * frame starts with no list (error bit 4), after which the main camera's frames stopped ending
+					 * (92 frames, 442 starts). So when the front end has read all there is, one more goes in.
+					 */
+					if (g != NULL && rd(fe + 0x90014) == (queued * 16u) % FD_QUEUE_BYTES) {
+						uint32_t more[4] = { 0xc003, PDMA_IOVA + ((queued & 1) ? 0x4000 : 0x1000), 0, list_bytes };
+
+						at = (queued * 16u) % FD_QUEUE_BYTES;
+						for (unsigned i = 0; i < 16; i++) {
+							ring[(at + i) % FD_QUEUE_BYTES] = ((const uint8_t *)more)[i];
+						}
+						__asm__ volatile ("dsb sy" ::: "memory");
+						queued++;
+						wr(fe + 0x90010, (queued * 16u) % FD_QUEUE_BYTES);
+						refills++;
+					}
 				}
 			}
 			errs += v438 != 0;
@@ -6679,6 +6698,23 @@ fd_session(void)
 			if (g != NULL) {                /* block 7 (the main camera's second stream): its status acknowledged with block 0's */
 				uint32_t st7 = rd(fe + 0x22024), er7 = rd(fe + 0x22038);
 
+				if ((v438 | er7) != 0 && errs < 12) {
+					printf("akita camera: device: an error: block 0 status %#x error %#x, block 7 status %#x error %#x; frame %u, start "
+					    "%u; the queue %#x read to %#x (%u refills)\n", v424, v438, st7, er7, ends, starts, rd(fe + 0x90010),
+					    rd(fe + 0x90014), refills);
+				}
+				if (late_ack) {
+					/* (... and the list that came late commits: its two acknowledgements, as Android's handler) */
+					wr(fe + 0x500e8, 0x1);
+					wr(fe + 0x50148, 0x10);
+					late_ack = false;
+				}
+				if (((v438 | er7) & 0x10u) != 0) {
+					/* a frame that started with no new list (error bit 4): dropped; what Android's handler writes then */
+					wr(fe + 0x37300, 0x40);
+					wr(fe + 0x3b300, 0x1);
+					late_ack = true;
+				}
 				errs += er7 != 0;
 				wr(fe + 0x22004, 0);
 				wr(fe + 0x22024, st7);
