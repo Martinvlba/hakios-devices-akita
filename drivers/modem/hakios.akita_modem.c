@@ -23,8 +23,10 @@
  *              phone's calibration and identity: pulled from its Android into fw-modem-akita/, never in git)
  *   6  writes  the start handshake: INIT_START from the modem, PIF_INIT_DONE, PHONE_START, INIT_END: the modem is
  *              online
- *   7  reads   what the modem then says by itself, for modem_listen seconds (20): every frame's channel, length and
- *              first bytes
+ *   7  reads   what the modem then says by itself, for three seconds: every frame's channel, length and first bytes
+ *   8  writes  requests in the modem's command protocol (SIT, on channel 245 as Android's rild): radio power, the
+ *              baseband's version, the SIM's state, the registration states, the operator, the signal; the answers
+ *              and whatever else comes are said for modem_listen seconds (20). The device's identity is not asked for
  *
  * Where everything comes from: Google's driver for this phone (google-modules/soc/gs, drivers/soc/google/cpif:
  * modem_ctrl_s5100.c, link_device.c, link_device_memory*.c, s51xx_pcie.c; the layout of the shared memory, the pins'
@@ -154,6 +156,25 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define FRAME_SINGLE            0xc000u
 #define FRAME_HEADER            12u
 #define CH_BOOT                 241u
+#define CH_RIL                  245u            /* umts_ipc0: the command protocol, SIM 1's stack */
+
+/*
+ * The command protocol ("SIT"; the numbers are the names' in Android's vendor.radio.protocol.sit.base, the layout as
+ * rild was seen to use it): a request is { u16 0, u16 id, u16 length, u16 token, u32 0 } + parameters; its answer
+ * { u16 1, id, length, token, u16 0, u16 error } + values; an indication { u16 2, id, length, u16 0 } + values.
+ */
+#define SIT_GET_SIM_STATUS              0x0200u
+#define SIT_IND_SIM_STATUS_CHANGED      0x0210u
+#define SIT_GET_CS_REG_STATE            0x0700u
+#define SIT_GET_PS_REG_STATE            0x0701u
+#define SIT_GET_OPERATOR                0x0702u
+#define SIT_SET_RADIO_POWER             0x0800u
+#define SIT_GET_RADIO_POWER             0x0801u
+#define SIT_IND_RADIO_STATE_CHANGED     0x0802u
+#define SIT_IND_RADIO_READY             0x0803u
+#define SIT_GET_SIGNAL_STRENGTH         0x0900u
+#define SIT_GET_BASEBAND_VERSION        0x0901u
+#define SIT_IND_SIGNAL_STRENGTH         0x0906u
 
 /* the endpoint */
 #define EP_VENDOR_SAMSUNG       0x144du
@@ -440,6 +461,7 @@ firmware_open(void)
 struct queue { uint32_t head, tail, buffer, size; const char *name; };
 static const struct queue RAW_TX = { IPC_RAW_TX_HEAD, IPC_RAW_TX_TAIL, IPC_RAW_TX_BUF, IPC_RAW_TX_SIZE, "RAW tx" },
     RAW_RX = { IPC_RAW_RX_HEAD, IPC_RAW_RX_TAIL, IPC_RAW_RX_BUF, IPC_RAW_RX_SIZE, "RAW rx" },
+    FMT_TX = { IPC_FMT_TX_HEAD, IPC_FMT_TX_TAIL, IPC_FMT_TX_BUF, IPC_FMT_TX_SIZE, "FMT tx" },
     FMT_RX = { IPC_FMT_RX_HEAD, IPC_FMT_RX_TAIL, IPC_FMT_RX_BUF, IPC_FMT_RX_SIZE, "FMT rx" };
 
 /* Bytes into a queue we fill (we move the head, the modem the tail); false if they do not fit within wait_ms. */
@@ -831,29 +853,85 @@ pktproc_headers(bool uplink)
 	}
 }
 
+static const char *
+sit_name(unsigned id)
+{
+	static const struct { uint16_t id; const char *name; } names[] = {
+		{ SIT_GET_SIM_STATUS, "GET_SIM_STATUS" }, { SIT_IND_SIM_STATUS_CHANGED, "IND_SIM_STATUS_CHANGED" },
+		{ 0x0246, "IND_SIM_PB_READY" }, { 0x024d, "GET_SLOT_STATUS" }, { 0x024e, "IND_SIM_SLOT_STATUS_CHANGED" },
+		{ SIT_GET_CS_REG_STATE, "GET_CS_REG_STATE" }, { SIT_GET_PS_REG_STATE, "GET_PS_REG_STATE" },
+		{ SIT_GET_OPERATOR, "GET_OPERATOR" }, { SIT_SET_RADIO_POWER, "SET_RADIO_POWER" },
+		{ SIT_GET_RADIO_POWER, "GET_RADIO_POWER" }, { SIT_IND_RADIO_STATE_CHANGED, "IND_RADIO_STATE_CHANGED" },
+		{ SIT_IND_RADIO_READY, "IND_RADIO_READY" }, { SIT_GET_SIGNAL_STRENGTH, "GET_SIGNAL_STRENGTH" },
+		{ SIT_GET_BASEBAND_VERSION, "GET_BASEBAND_VERSION" }, { SIT_IND_SIGNAL_STRENGTH, "IND_SIGNAL_STRENGTH" },
+	};
+
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		if (names[i].id == id) {
+			return names[i].name;
+		}
+	}
+	return "";
+}
+
+/* a request of the command protocol on SIM 1's stack; the modem told to look */
+static bool
+sit_request(unsigned id, const uint8_t *parameters, uint32_t len)
+{
+	static uint16_t token = 0x100;
+	uint8_t head[12] = { 0, 0, (uint8_t)id, (uint8_t)(id >> 8), (uint8_t)(12 + len), (uint8_t)((12 + len) >> 8) };
+
+	token++;
+	head[6] = (uint8_t)token;
+	head[7] = (uint8_t)(token >> 8);
+	if (!frame_put(&FMT_TX, CH_RIL, head, sizeof(head), parameters, len)) {
+		return false;
+	}
+	message(MSG_SEND_FMT);
+	printf("modem: %u: asked 0x%04x %s (token 0x%x)\n", step, id, sit_name(id), token);
+	return true;
+}
+
 /* every whole frame in a queue said: its channel, its length, its first bytes */
 static unsigned
 frames_say(const struct queue *q)
 {
-	static uint8_t payload[64];
+	static uint8_t payload[97];
 	unsigned n = 0;
 
 	for (;;) {
 		uint8_t channel = 0;
 		uint32_t length = 0, shown;
 		uint16_t config = 0;
-		char text[3 * 48 + 1];
-		int r = frame_take(q, &channel, payload, sizeof(payload), &length, &config);
+		char text[3 * 96 + 1];
+		int r = frame_take(q, &channel, payload, sizeof(payload) - 1, &length, &config);
 
 		if (r <= 0) {
 			return n;
 		}
-		shown = length < 48 ? length : 48;
+		shown = length < 96 ? length : 96;
 		for (uint32_t i = 0; i < shown; i++) {
 			snprintf(text + 3 * i, 4, " %02x", payload[i]);
 		}
 		text[3 * shown] = 0;
-		printf("modem: %u: %s: channel %u, %u bytes (frame config 0x%04x):%s\n", step, q->name, channel, length, config, text);
+		if ((channel == CH_RIL || channel == CH_RIL + 1) && length >= 8) {
+			unsigned type = payload[0] | payload[1] << 8, id = payload[2] | payload[3] << 8, head = type == 2 ? 8 : 12;
+			const char *name = sit_name(id);
+
+			if (type == 1 && length >= 12) {
+				printf("modem: %u: SIM stack %u: answer 0x%04x %s (token 0x%x, error %u), %u bytes:%s\n", step, channel - CH_RIL + 1, id,
+				    name, payload[6] | payload[7] << 8, payload[10] | payload[11] << 8, length - head, text + 3 * head);
+			} else {
+				printf("modem: %u: SIM stack %u: %s 0x%04x %s, %u bytes:%s\n", step, channel - CH_RIL + 1,
+				    type == 2 ? "indication" : "message", id, name, length > head ? length - head : 0, shown > head ? text + 3 * head : "");
+			}
+			if (type == 1 && id == SIT_GET_BASEBAND_VERSION && shown > 14) {
+				payload[shown < sizeof(payload) ? shown : sizeof(payload) - 1] = 0;
+				printf("modem: %u: the baseband's version: %s\n", step, (const char *)payload + 13);
+			}
+		} else {
+			printf("modem: %u: %s: channel %u, %u bytes (frame config 0x%04x):%s\n", step, q->name, channel, length, config, text);
+		}
 		n++;
 	}
 }
@@ -1061,7 +1139,7 @@ modem_run(void)
 		return;
 	}
 	t0 = now_ms();
-	for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS); now_ms() - t0 < 1000ull * listen_s;) {
+	for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS); now_ms() - t0 < 3000;) {
 		uint32_t w = rd(ipc, IPC_CP2AP_MSG), s = rd(ipc, IPC_CP2AP_STATUS), taken = akita_pcie0_msi_take();
 
 		if (w != word || s != status) {
@@ -1075,6 +1153,40 @@ modem_run(void)
 	}
 	shared_say("after listening");
 	pins_say("after listening");
+
+	if (!announce(8, "writes: requests to the modem (radio power, version, SIM, registration, operator, signal)")) {
+		return;
+	}
+	{
+		static const struct { uint16_t id; uint8_t len; uint8_t parameters[4]; } asks[] = {
+			{ SIT_GET_RADIO_POWER, 0, { 0 } }, { SIT_GET_BASEBAND_VERSION, 1, { 0xff } }, { SIT_GET_SIM_STATUS, 0, { 0 } },
+			{ SIT_GET_CS_REG_STATE, 0, { 0 } }, { SIT_GET_PS_REG_STATE, 0, { 0 } }, { SIT_GET_OPERATOR, 0, { 0 } },
+			{ SIT_GET_SIGNAL_STRENGTH, 0, { 0 } },
+		};
+		unsigned next = 0;
+		uint64_t next_at = now_ms();
+
+		t0 = now_ms();
+		for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS); now_ms() - t0 < 1000ull * listen_s;) {
+			uint32_t w = rd(ipc, IPC_CP2AP_MSG), st = rd(ipc, IPC_CP2AP_STATUS), taken = akita_pcie0_msi_take();
+
+			if (next < sizeof(asks) / sizeof(asks[0]) && now_ms() >= next_at) {
+				(void)sit_request(asks[next].id, asks[next].parameters, asks[next].len);
+				next++;
+				next_at = now_ms() + 400;
+			}
+			if (w != word || st != status) {
+				printf("modem: 8: the modem's word 0x%x, status 0x%x (MSI 0x%x; %llu ms)\n", w, st, taken, now_ms() - t0);
+				word = w;
+				status = st;
+			}
+			frames_say(&FMT_RX);
+			frames_say(&RAW_RX);
+			sleep_ms(2);
+		}
+	}
+	shared_say("at the end");
+	pins_say("at the end");
 }
 
 static void
