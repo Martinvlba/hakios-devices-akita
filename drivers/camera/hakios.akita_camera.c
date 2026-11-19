@@ -5553,7 +5553,8 @@ static const uint32_t main_tab[3112] = {
 	0x00780980, 0x00501600, 0x300e0740, 0x00380401, 0x00d81c00, 0x800c0040, 0x00280800, 0x00f00c00,
 };
 
-/* main: Android's fresh open (main2.trace), 566 events: mkreplay.py */
+/* main: Android's fresh open (main2.trace), 640 events: mkreplay.py -- with the batch writes
+ * (lwis_ioreg_io_entry_rw_locked) the first table lacked: the 0x50000 unit's 74, fe+0x50000..0x501a0, 11-19 */
 static const struct replay_ev main_replay[] = {
 	{ 1, 0x136, 0x18, 0 },
 	{ 1, 0x137, 0x93, 92 },
@@ -5816,8 +5817,82 @@ static const struct replay_ev main_replay[] = {
 	{ 0, 0x1c320008, 0xf, 26 },
 	{ 0, 0x1c320010, 0x1, 1 },
 	{ 0, 0x1c35000c, 0x0, 1173 },
-	{ 0, 0x1c35000c, 0xc11, 3101 },
-	{ 0, 0x1c330f00, 0x1, 2202 },
+	{ 0, 0x1c350000, 0x0, 3049 },
+	{ 0, 0x1c350004, 0x0, 2 },
+	{ 0, 0x1c350008, 0x0, 0 },
+	{ 0, 0x1c35000c, 0xc10, 1 },
+	{ 0, 0x1c350010, 0xdddead, 0 },
+	{ 0, 0x1c350014, 0x0, 1 },
+	{ 0, 0x1c350018, 0x0, 0 },
+	{ 0, 0x1c35001c, 0x0, 1 },
+	{ 0, 0x1c350020, 0x20002, 0 },
+	{ 0, 0x1c350024, 0x0, 0 },
+	{ 0, 0x1c350028, 0x0, 1 },
+	{ 0, 0x1c35002c, 0x0, 1 },
+	{ 0, 0x1c350030, 0x0, 0 },
+	{ 0, 0x1c350034, 0x0, 0 },
+	{ 0, 0x1c350038, 0x0, 1 },
+	{ 0, 0x1c35003c, 0x0, 0 },
+	{ 0, 0x1c350040, 0x0, 1 },
+	{ 0, 0x1c350044, 0x0, 1 },
+	{ 0, 0x1c350048, 0x0, 0 },
+	{ 0, 0x1c35004c, 0x0, 0 },
+	{ 0, 0x1c350050, 0x0, 0 },
+	{ 0, 0x1c350054, 0x0, 1 },
+	{ 0, 0x1c350294, 0x6, 22 },
+	{ 0, 0x1c350298, 0x64, 1 },
+	{ 0, 0x1c35029c, 0x1f4, 1 },
+	{ 0, 0x1c3502a0, 0x1388, 0 },
+	{ 0, 0x1c3502a4, 0x0, 1 },
+	{ 0, 0x1c3502a8, 0x5a, 0 },
+	{ 0, 0x1c3502ac, 0x190, 1 },
+	{ 0, 0x1c35000c, 0xc11, 8 },
+	{ 0, 0x1c350058, 0x0, 7 },
+	{ 0, 0x1c35005c, 0x0, 1 },
+	{ 0, 0x1c350060, 0x0, 0 },
+	{ 0, 0x1c350064, 0x3fffffff, 1 },
+	{ 0, 0x1c350068, 0x0, 0 },
+	{ 0, 0x1c350088, 0x0, 1 },
+	{ 0, 0x1c35008c, 0x0, 0 },
+	{ 0, 0x1c350090, 0x0, 1 },
+	{ 0, 0x1c350094, 0x3fffffff, 1 },
+	{ 0, 0x1c350098, 0x0, 0 },
+	{ 0, 0x1c3500b8, 0x0, 0 },
+	{ 0, 0x1c3500bc, 0x0, 1 },
+	{ 0, 0x1c3500c0, 0x0, 0 },
+	{ 0, 0x1c3500c4, 0x3fffffff, 1 },
+	{ 0, 0x1c3500c8, 0x0, 0 },
+	{ 0, 0x1c3500e8, 0x0, 1 },
+	{ 0, 0x1c3500ec, 0x0, 0 },
+	{ 0, 0x1c3500f0, 0x0, 1 },
+	{ 0, 0x1c3500f4, 0x3fffffff, 0 },
+	{ 0, 0x1c3500f8, 0x0, 1 },
+	{ 0, 0x1c350118, 0x0, 0 },
+	{ 0, 0x1c35011c, 0x0, 1 },
+	{ 0, 0x1c350120, 0x0, 0 },
+	{ 0, 0x1c350124, 0x3fffffff, 1 },
+	{ 0, 0x1c350128, 0x0, 1 },
+	{ 0, 0x1c350148, 0x0, 0 },
+	{ 0, 0x1c35014c, 0x0, 1 },
+	{ 0, 0x1c350150, 0x0, 1 },
+	{ 0, 0x1c350154, 0x3ff, 0 },
+	{ 0, 0x1c350158, 0x0, 0 },
+	{ 0, 0x1c350160, 0x0, 1 },
+	{ 0, 0x1c350164, 0x0, 1 },
+	{ 0, 0x1c350168, 0x0, 0 },
+	{ 0, 0x1c35016c, 0x3ff, 0 },
+	{ 0, 0x1c350170, 0x0, 1 },
+	{ 0, 0x1c350178, 0x0, 1 },
+	{ 0, 0x1c35017c, 0x0, 0 },
+	{ 0, 0x1c350180, 0x0, 0 },
+	{ 0, 0x1c350184, 0x3ff, 1 },
+	{ 0, 0x1c350188, 0x0, 0 },
+	{ 0, 0x1c350190, 0x0, 1 },
+	{ 0, 0x1c350194, 0x0, 1 },
+	{ 0, 0x1c350198, 0x0, 0 },
+	{ 0, 0x1c35019c, 0x3ff, 0 },
+	{ 0, 0x1c3501a0, 0x0, 1 },
+	{ 0, 0x1c330f00, 0x1, 2162 },
 	{ 0, 0x1c330c00, 0x1, 2 },
 	{ 0, 0x1c330c04, 0x1, 1 },
 	{ 0, 0x1c330c0c, 0x0, 1 },
@@ -6971,12 +7046,12 @@ cam_capture(const struct cam_cfg *g)
 		printf("akita camera: %s: CMU_ISPFE gates %s: 0x2000 %#x 0x2154 %#x\n", g->name, gates ? "forced on" : "left automatic",
 		    rd(cmu_fe + 0x2000), rd(cmu_fe + 0x2154));
 	}
-	/* the 0x50000 unit's one-time setup (control words, timings, every context's masks: ~70 writes). Android does it at
-	 * the first camera open after its HAL starts and not again -- it is in the front camera's trace and NOT in the main
-	 * camera's, which was opened later in the same session. Without it that unit's registers cannot be touched (reads and
-	 * writes hung the phone) and the main camera's frame stalled 2.4 ms in. Taken from front_replay[]: its writes to
-	 * fe+0x50000..0x502ff before the first interrupt-enable (0x500f0). camera_lmpinit=1: done. OFF by default: it did not
-	 * make those registers safe (the hang stayed), and with it the PDMA stopped fetching after its third entry */
+	/* (camera_lmpinit=1, a test of 11-18 kept for the record: 49 of the 0x50000 unit's setup writes taken from
+	 * front_replay[] and done BEFORE the replay. It did not help and is not needed: the real fault was that main_replay[]
+	 * lacked that unit's whole setup -- Android does it in EVERY main open as a batch (lwis_ioreg_io_entry_rw_locked),
+	 * which the table's generator did not read. With the 74 writes in the table (11-19) frames end: 36 starts, 35 ends,
+	 * no error, where before the frame stalled 2.4 ms in with error bit 3 on both blocks and touching 0x500e8/0x50148
+	 * hung the phone.) */
 	{
 		unsigned lmpinit = 0, n = 0;
 
