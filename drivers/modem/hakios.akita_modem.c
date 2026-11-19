@@ -173,6 +173,9 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define SIT_IND_RADIO_STATE_CHANGED     0x0802u
 #define SIT_IND_RADIO_READY             0x0803u
 #define SIT_GET_SIGNAL_STRENGTH         0x0900u
+#define SIT_SET_DEVICE_INFO             0x0922u
+#define SIT_SET_AP_SYSTEM_TIME          0x0949u
+#define SIT_IND_NTW_STATE_CHANGED       0x070eu
 #define SIT_GET_BASEBAND_VERSION        0x0901u
 #define SIT_IND_SIGNAL_STRENGTH         0x0906u
 
@@ -864,6 +867,8 @@ sit_name(unsigned id)
 		{ SIT_GET_RADIO_POWER, "GET_RADIO_POWER" }, { SIT_IND_RADIO_STATE_CHANGED, "IND_RADIO_STATE_CHANGED" },
 		{ SIT_IND_RADIO_READY, "IND_RADIO_READY" }, { SIT_GET_SIGNAL_STRENGTH, "GET_SIGNAL_STRENGTH" },
 		{ SIT_GET_BASEBAND_VERSION, "GET_BASEBAND_VERSION" }, { SIT_IND_SIGNAL_STRENGTH, "IND_SIGNAL_STRENGTH" },
+		{ SIT_SET_DEVICE_INFO, "SET_DEVICE_INFO" }, { SIT_SET_AP_SYSTEM_TIME, "SET_AP_SYSTEM_TIME" },
+		{ SIT_IND_NTW_STATE_CHANGED, "IND_NTW_STATE_CHANGED" }, { 0x0248, "IND 0x0248" }, { 0x0306, "IND_STK_SESSION_END" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -1164,7 +1169,44 @@ modem_run(void)
 			{ SIT_GET_SIGNAL_STRENGTH, 0, { 0 } },
 		};
 		unsigned next = 0;
-		uint64_t next_at = now_ms();
+		uint64_t next_at;
+		clock_sec_t seconds = 0;
+		clock_usec_t micro = 0;
+		uint8_t when[6], info[128];
+		uint64_t days, of_day, era, doe, yoe, doy, mp, year, month, day;
+
+		/*
+		 * As rild begins: the time (year - 1900, month from 0, day, hour, minute, second: UTC) and who we are -- four
+		 * 32-byte names, Android's own for this phone (the model, a build, the device, the system's version). The modem's
+		 * indications (SIM, radio ready, network, signal) start only after the second one's answer.
+		 */
+		clock_get_calendar_microtime(&seconds, &micro);
+		days = seconds / 86400;
+		of_day = seconds % 86400;
+		days += 719468;                         /* days to a date (the civil calendar from a day count) */
+		era = days / 146097;
+		doe = days - era * 146097;
+		yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+		doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+		mp = (5 * doy + 2) / 153;
+		day = doy - (153 * mp + 2) / 5 + 1;
+		month = mp < 10 ? mp + 3 : mp - 9;
+		year = yoe + era * 400 + (month <= 2 ? 1 : 0);
+		when[0] = (uint8_t)(year - 1900);
+		when[1] = (uint8_t)(month - 1);
+		when[2] = (uint8_t)day;
+		when[3] = (uint8_t)(of_day / 3600);
+		when[4] = (uint8_t)(of_day / 60 % 60);
+		when[5] = (uint8_t)(of_day % 60);
+		printf("modem: 8: the time told: %llu-%02llu-%02llu %02u:%02u:%02u UTC\n", year, month, day, when[3], when[4], when[5]);
+		(void)sit_request(SIT_SET_AP_SYSTEM_TIME, when, sizeof(when));
+		memset(info, 0, sizeof(info));
+		strlcpy((char *)info, "Pixel 8a", 32);
+		strlcpy((char *)info + 32, "CP1A.260505.005.A1", 32);
+		strlcpy((char *)info + 64, "akita", 32);
+		strlcpy((char *)info + 96, "16", 32);
+		(void)sit_request(SIT_SET_DEVICE_INFO, info, sizeof(info));
+		next_at = now_ms() + 1500;
 
 		t0 = now_ms();
 		for (uint32_t word = rd(ipc, IPC_CP2AP_MSG), status = rd(ipc, IPC_CP2AP_STATUS); now_ms() - t0 < 1000ull * listen_s;) {
