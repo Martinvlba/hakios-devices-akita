@@ -194,6 +194,7 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
  * { u16 1, id, length, token, u16 0, u16 error } + values; an indication { u16 2, id, length, u16 0 } + values.
  */
 #define SIT_GET_SIM_STATUS              0x0200u
+#define SIT_VERIFY_SIM_PIN              0x0201u
 #define SIT_IND_SIM_STATUS_CHANGED      0x0210u
 #define SIT_GET_CS_REG_STATE            0x0700u
 #define SIT_GET_PS_REG_STATE            0x0701u
@@ -1074,6 +1075,85 @@ SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_baseband, CTLFLAG_RD | CTLFLAG_LO
 
 static bool sit_request(unsigned id, const uint8_t *parameters, uint32_t len);
 
+/*
+ * (11-19) The SIM's PIN. A card whose application waits for its PIN (state 2) registers nowhere; Darwin has no telephony
+ * here to ask for it, so SpringBoard (userland/src/inject_sb.c) asks and writes the digits to kern.hakios.cellular_pin;
+ * this thread sends them (SIT_VERIFY_SIM_PIN: the length, 8 characters, the application's identifier as the card's status
+ * gave it -- ~/akita/ref/modem-android/sit-layouts.md, from rild's library) and the buffer is wiped. THE DIGITS ARE NEVER
+ * PRINTED, here or anywhere: a request is logged by its number alone, the answer holds only the tries left.
+ * cellular_pin_state: 0 no PIN is wanted (or not known), 1 wanted, 2 sent and not answered yet, 3 accepted, 4 refused
+ * (wrong: cellular_pin_tries says how many tries the card has left before it wants its PUK).
+ */
+static int cellular_pin_state, cellular_pin_tries = -1;
+static uint8_t sim_aid[16], sim_aid_len;
+static char pin_waiting[9];
+static volatile bool pin_to_send;
+static unsigned sit_answer_error;       /* the error of the answer sit_understand() is looking at */
+
+static int
+pin_sysctl SYSCTL_HANDLER_ARGS
+{
+	char digits[16] = "";
+	int error = sysctl_handle_string(oidp, digits, sizeof(digits), req);
+	size_t n = strnlen(digits, sizeof(digits));
+
+	(void)arg1;
+	(void)arg2;
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	for (size_t i = 0; i < n; i++) {
+		if (digits[i] < '0' || digits[i] > '9') {
+			n = 0;
+		}
+	}
+	if (n < 4 || n > 8) {
+		bzero(digits, sizeof(digits));
+		return EINVAL;
+	}
+	if ((cellular_pin_state != 1 && cellular_pin_state != 4) || pin_to_send) {
+		bzero(digits, sizeof(digits));
+		return EBUSY;                   /* (no PIN is wanted, or one is on its way) */
+	}
+	bzero(pin_waiting, sizeof(pin_waiting));
+	memcpy(pin_waiting, digits, n);
+	bzero(digits, sizeof(digits));
+	cellular_pin_state = 2;
+	pin_to_send = true;
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, cellular_pin, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0, pin_sysctl, "A",
+    "the SIM's PIN, to be sent to the card (write only; 4 to 8 digits)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_pin_state, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_pin_state, 0,
+    "the SIM's PIN: 0 not wanted, 1 wanted, 2 sent, 3 accepted, 4 refused");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_pin_tries, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_pin_tries, 0,
+    "the tries the SIM's PIN has left (-1: not known)");
+
+/* (the modem's thread: a PIN that was written goes out, and is wiped) */
+static void
+pin_send(void)
+{
+	uint8_t request[26];
+	size_t n;
+
+	if (!pin_to_send) {
+		return;
+	}
+	n = strnlen(pin_waiting, 8);
+	bzero(request, sizeof(request));
+	request[0] = (uint8_t)n;
+	memcpy(request + 1, pin_waiting, n);
+	request[9] = sim_aid_len;
+	memcpy(request + 10, sim_aid, sim_aid_len);
+	bzero(pin_waiting, sizeof(pin_waiting));
+	pin_to_send = false;
+	if (!sit_request(SIT_VERIFY_SIM_PIN, request, sizeof(request))) {
+		cellular_pin_state = 4;
+	}
+	bzero(request, sizeof(request));
+	printf("modem: %u: the SIM's PIN sent to the card (%u digits; the card had %d tries left)\n", step, (unsigned)n, cellular_pin_tries);
+}
+
 static int32_t
 s32_at(const uint8_t *d, uint32_t off)
 {
@@ -1107,15 +1187,32 @@ sit_understand(unsigned type, unsigned id, const uint8_t *d, uint32_t n)
 		int state = d[0] == 3 ? 1 : d[0];
 
 		if (state == 1 && d[2] != 0 && n >= 3 + 63) {
-			printf("modem: %u: the SIM: present, %u application%s; the first: type %u, state %u (5 ready, 2 PIN, 3 PUK), PIN1 state %u\n",
-			    step, d[2], d[2] == 1 ? "" : "s", d[3], d[4], d[3 + 57]);
+			printf("modem: %u: the SIM: present, %u application%s; the first: type %u, state %u (5 ready, 2 PIN, 3 PUK), PIN1 state %u, "
+			    "%u tries left\n", step, d[2], d[2] == 1 ? "" : "s", d[3], d[4], d[3 + 57], d[3 + 59]);
+			sim_aid_len = d[3 + 3] <= 16 ? d[3 + 3] : 0;
+			memcpy(sim_aid, d + 3 + 4, sim_aid_len);
+			cellular_pin_tries = d[3 + 59];
 			if (d[4] == 5) {
 				state = 5;
+				if (cellular_pin_state != 0) {
+					cellular_pin_state = 3;
+				}
+			} else if (d[4] == 2 && cellular_pin_state != 2 && cellular_pin_state != 4) {
+				cellular_pin_state = 1;         /* (the PIN is wanted) */
 			}
 		} else if (state != cellular_sim) {
 			printf("modem: %u: the SIM: card state %u (0 absent, 1 present, 2 error), %u applications\n", step, d[0], d[2]);
 		}
 		cellular_sim = state;
+	} else if (type == 1 && id == SIT_VERIFY_SIM_PIN) {
+		if (n >= 4 && s32_at(d, 0) >= 0) {
+			cellular_pin_tries = s32_at(d, 0);
+		}
+		cellular_pin_state = sit_answer_error == 0 ? 3 : 4;
+		printf("modem: %u: the SIM's PIN: %s (error %u); %d tries left\n", step, sit_answer_error == 0 ? "ACCEPTED" : "refused",
+		    sit_answer_error, cellular_pin_tries);
+		(void)sit_request(SIT_GET_SIM_STATUS, NULL, 0);
+		(void)sit_request(SIT_GET_PS_REG_STATE, NULL, 0);
 	} else if (type == 1 && id == SIT_GET_PS_REG_STATE && n >= 4) {
 		bool registered = d[0] == 1 || d[0] == 5;
 
@@ -1170,7 +1267,7 @@ static const char *
 sit_name(unsigned id)
 {
 	static const struct { uint16_t id; const char *name; } names[] = {
-		{ SIT_GET_SIM_STATUS, "GET_SIM_STATUS" }, { SIT_IND_SIM_STATUS_CHANGED, "IND_SIM_STATUS_CHANGED" },
+		{ SIT_GET_SIM_STATUS, "GET_SIM_STATUS" }, { SIT_VERIFY_SIM_PIN, "VERIFY_SIM_PIN" }, { SIT_IND_SIM_STATUS_CHANGED, "IND_SIM_STATUS_CHANGED" },
 		{ 0x0246, "IND_SIM_PB_READY" }, { 0x024d, "GET_SLOT_STATUS" }, { 0x024e, "IND_SIM_SLOT_STATUS_CHANGED" },
 		{ SIT_GET_CS_REG_STATE, "GET_CS_REG_STATE" }, { SIT_GET_PS_REG_STATE, "GET_PS_REG_STATE" },
 		{ SIT_GET_OPERATOR, "GET_OPERATOR" }, { SIT_SET_RADIO_POWER, "SET_RADIO_POWER" },
@@ -1243,6 +1340,7 @@ frames_say(const struct queue *q)
 				    type == 2 ? "indication" : "message", id, name, length > head ? length - head : 0, shown > head ? text + 3 * head : "");
 			}
 			if (channel == CH_RIL && length >= head && length <= sizeof(payload) - 1) {
+				sit_answer_error = type == 1 && length >= 12 ? payload[10] | payload[11] << 8 : 0;
 				sit_understand(type, id, payload + head, length - head);
 			}
 			if (type == 1 && id == SIT_GET_BASEBAND_VERSION && shown > 14) {
@@ -1738,6 +1836,7 @@ restart:
 		if (link_sleep) {
 			link_follow();
 		}
+		pin_send();
 		if (ask_every_s != 0 && now_ms() - t0 >= 1000ull * ask_every_s) {
 			t0 = now_ms();
 			(void)sit_request(SIT_GET_RADIO_POWER, NULL, 0);        /* (a request now and then: the wake from our side) */
