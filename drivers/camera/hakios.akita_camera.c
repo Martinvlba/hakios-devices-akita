@@ -6271,6 +6271,7 @@ static struct { vm_offset_t va; uint64_t seq, time; uint32_t lines, gain64, fll;
 static struct { bool pending; uint32_t lines, gain64, fll; } fd_ask;
 static uint32_t fd_lines = 6304, fd_gain64 = 16 * FD_GAIN_UNITY, fd_fll = 6315;        /* (what Android's open leaves) */
 static uint32_t fd_sensor = 2;                          /* the number the frames carry (what was last asked for) */
+static unsigned fd_reopen, fd_sessions;                 /* camera_reopen=N, a test: the first session closed after N frames */
 
 static uint64_t
 fd_ms_since(uint64_t t)
@@ -6320,7 +6321,64 @@ fd_exposure(int bus, uint32_t lines, uint32_t gain64, uint32_t fll)
 	fd_fll = fll;
 }
 
-/* one session: the front camera up, frames until nobody wants them, everything down. False: it could not start */
+/*
+ * (11-19) The front end closed as Android closes it after the MAIN camera (its trace of 11-17, cam4: the writes of its
+ * close, in their order): the link and the PHY's lanes off, the PHY's reset bits, blocks 0 and 7 stopped and their
+ * interrupts acknowledged and masked, the units' (0x37000, 0x3b000, 0x50000) and the PDMA's, every CSIS link's reset
+ * request, and the front end's soft reset (fe+0x20008 <- 0xf, +0x20010 <- 1), twice. After it an open starts again
+ * from the front end's reset state -- what a second open in one boot lacked (11-18: "the commit's status bit never
+ * came"). The sensor must be in standby already.
+ */
+static void
+fd_close_main(vm_offset_t fe, vm_offset_t csis, vm_offset_t sreg)
+{
+	static const struct { uint8_t where; uint32_t off, val; uint16_t wait_us; } close_seq[] = {
+		{ 1, 0xc1800, 0, 0 }, { 1, 0xc1900, 0, 0 }, { 1, 0xc1a00, 0, 0 }, { 1, 0x10004, 0x205e03, 0 },
+		{ 1, 0xc181c, 0x200, 0 }, { 1, 0xc191c, 0x200, 0 }, { 1, 0xc1a1c, 0x200, 0 }, { 2, 0x500, 0, 700 },
+		{ 1, 0x10010, 0, 0 }, { 1, 0x10018, 0, 50 },
+		{ 0, 0x20418, 0, 0 }, { 0, 0x2041c, 0, 0 }, { 0, 0x20418, 0, 0 }, { 0, 0x200a4, 0x1, 0 }, { 0, 0x2201c, 0, 0 },
+		{ 0, 0x22018, 0, 0 }, { 0, 0x200a4, 0x80, 0 }, { 0, 0x29000, 0, 0 }, { 0, 0x28800, 0, 260 },
+		{ 0, 0x20410, 0, 0 }, { 0, 0x20430, 0x9, 0 }, { 0, 0x20444, 0x10, 0 }, { 0, 0x20458, 0, 240 },
+		{ 0, 0x22010, 0, 0 }, { 0, 0x22030, 0x8, 0 }, { 0, 0x22044, 0x10, 0 }, { 0, 0x22058, 0, 40 },
+		{ 0, 0x37308, 0, 80 }, { 0, 0x3730c, 0x64, 40 }, { 0, 0x37028, 0, 0 }, { 0, 0x37500, 0, 0 }, { 0, 0x37900, 0, 0 },
+		{ 0, 0x37b00, 0, 0 }, { 0, 0x37c00, 0, 0 }, { 0, 0x37d00, 0, 0 }, { 0, 0x37e00, 0, 0 }, { 0, 0x37f00, 0, 0 },
+		{ 0, 0x38000, 0, 0 }, { 0, 0x38100, 0, 0 }, { 0, 0x38200, 0, 0 }, { 0, 0x38300, 0, 0 }, { 0, 0x38400, 0, 0 },
+		{ 0, 0x38500, 0, 0 }, { 0, 0x38600, 0, 0 }, { 0, 0x38700, 0, 0 }, { 0, 0x38800, 0, 0 }, { 0, 0x38900, 0, 0 },
+		{ 0, 0x38a00, 0, 30 }, { 0, 0x3b30c, 0x1, 15 }, { 0, 0x3b028, 0, 240 }, { 0, 0x3730c, 0x44, 0 },
+		{ 0, 0x500f0, 0x1, 120 }, { 0, 0x50150, 0x10, 30 }, { 0, 0x90000, 0, 110 }, { 0, 0x9002c, 0, 0 },
+		{ 0, 0x90040, 0, 70 }, { 0, 0x3730c, 0x40, 0 }, { 0, 0x500f0, 0, 0 }, { 0, 0x50150, 0, 0 }, { 0, 0x20430, 0x1, 0 },
+		{ 0, 0x22030, 0, 60 }, { 0, 0x3730c, 0, 0 }, { 0, 0x3b30c, 0, 0 }, { 0, 0x20430, 0, 0 }, { 0, 0x20444, 0, 0 },
+		{ 0, 0x22044, 0, 550 }, { 0, 0x30c08, 0x2, 0 }, { 0, 0x30d08, 0x2, 8000 },
+		{ 3, 0, 0, 300 }, { 3, 0, 0, 350 },                     /* (3: every CSIS link's +0x04 <- 0x5002) */
+		{ 0, 0x20094, 0, 0 }, { 0, 0x2011c, 0, 120 }, { 0, 0x30f00, 0, 470 },
+		{ 3, 0, 0, 30 }, { 0, 0x20008, 0xf, 0 }, { 0, 0x20010, 0x1, 1200 },
+		{ 3, 0, 0, 30 }, { 0, 0x20008, 0xf, 0 }, { 0, 0x20010, 0x1, 1200 },
+	};
+
+	for (unsigned i = 0; i < sizeof(close_seq) / sizeof(close_seq[0]); i++) {
+		switch (close_seq[i].where) {
+		case 0:
+			wr(fe + close_seq[i].off, close_seq[i].val);
+			break;
+		case 1:
+			wr(csis + close_seq[i].off, close_seq[i].val);
+			break;
+		case 2:
+			wr(sreg + close_seq[i].off, close_seq[i].val);
+			break;
+		default:
+			for (unsigned l = 0; l < 12; l++) {
+				wr(csis + l * 0x10000 + 0x04, 0x5002);
+			}
+			break;
+		}
+		if (close_seq[i].wait_us) {
+			delay(close_seq[i].wait_us);
+		}
+	}
+}
+
+/* one session: the camera up, frames until nobody wants them (asleep in standby then), or closed. False: it could not start */
 static bool
 fd_session(void)
 {
@@ -6336,7 +6394,7 @@ fd_session(void)
 	uint32_t mux, div;
 	unsigned on = 0, starts = 0, ends = 0, errs = 0;
 	int newest = -1;
-	bool marked[2] = { false, false }, ok = false, stopping = false, stop_sent = false;
+	bool marked[2] = { false, false }, ok = false, stopping = false, stop_sent = false, closing = false;
 	uint64_t stop_time = 0;
 	unsigned stop_after = 0, queued = 1;
 
@@ -6509,6 +6567,8 @@ fd_session(void)
 	lck_mtx_unlock(&fd_lock);
 	ok = true;
 	fd_last_read = mach_absolute_time();    /* (the start took its time: five seconds for the first read from here) */
+	fd_sessions++;
+	PE_parse_boot_argn("camera_reopen", &fd_reopen, sizeof(fd_reopen));
 	printf("akita camera: device: the %s camera streams for Darwin\n", FD_NAME);
 	for (;;) {
 		uint32_t v424 = rd(fe + 0x20424), v438 = rd(fe + 0x20438);
@@ -6613,6 +6673,19 @@ fd_session(void)
 			}
 			wr(fe + 0x20110, 0);
 		}
+		if (!closing && g != NULL && fd_reopen != 0 && fd_sessions == 1 && ends >= fd_reopen) {
+			/* (camera_reopen=N: the session ended on purpose -- the sensor stopped between frames as below, then the front
+			 * end closed as Android closes it; the next read opens it again) */
+			closing = true;
+			stopping = true;
+			stop_sent = false;
+			stop_time = mach_absolute_time();
+			stop_after = ends + 2;
+			if (fd_fll < FD_FLL_STOP - 300) {
+				fd_fll = FD_FLL_STOP;
+				fd_exposure(c->bus, fd_lines, fd_gain64, fd_fll);
+			}
+		}
 		if (!stopping && (!fd_is_open || fd_ms_since(fd_last_read) > 5000)) {
 			/*
 			 * Nobody wants frames: the SENSOR to standby and nothing else, the front end left as it is, and
@@ -6646,7 +6719,11 @@ fd_session(void)
 			stop_time = mach_absolute_time();
 			printf("akita camera: device: no frame ended in 700 ms: the sensor to standby where it is\n");
 		}
-		if (stopping && stop_sent && fd_ms_since(stop_time) > 20) {
+		if (closing && stop_sent && fd_ms_since(stop_time) > 40) {
+			printf("akita camera: device: the %s camera's session is closed after %u frames (a test: camera_reopen)\n", FD_NAME, ends);
+			break;
+		}
+		if (stopping && !closing && stop_sent && fd_ms_since(stop_time) > 20) {
 			uint8_t v = 1;
 
 			lck_mtx_lock(&fd_lock);
@@ -6688,7 +6765,10 @@ stop:
 	}
 	delay(50000);
 	printf("akita camera: device: the %s camera stopped (%s): %u frames, %u starts, %u errors\n", FD_NAME,
-	    !fd_is_open ? "closed" : "nobody reads", ends, starts, errs);
+	    closing ? "closed for another open" : !fd_is_open ? "closed" : "nobody reads", ends, starts, errs);
+	if (closing && g != NULL) {
+		fd_close_main(fe, csis, sreg);
+	}
 	wr(fe + 0x90000, 0);
 	wr(sreg + 0x500, rd(sreg + 0x500) & ~(g ? g->dphy_reset : FRONT_DPHY_RESET_BITS));
 	cam_smc(SMC_PRIV_REG, PMU_CSI_PHY_ISO, PRIV_REG_WRITE, rd(pmu + 0x1ebc) & ~1u);
