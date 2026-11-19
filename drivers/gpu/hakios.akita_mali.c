@@ -2871,17 +2871,50 @@ akita_mali_snapshot(uint64_t *snap, unsigned most)
 	return n;
 }
 
+/*
+ * (11-20) NOT A QUEUE THAT STANDS STILL: one that has work and has not moved for STUCK_MS is left out -- the display
+ * does not wait for it. Maps' queue, restarted after GPU faults (its terrain's vertex shader), stayed blocked with work
+ * outstanding for good; every frame of the window server then waited the display's whole 500 ms for "the GPU done":
+ * the screen at two frames a second for as long as Maps lived (the tester: "the whole system goes to 5 fps"). The
+ * surface the panel is about to show has its own marks (busyNow) besides; this is the catch-all behind them. Said once
+ * a queue; it counts again as soon as it moves.
+ */
+#define STUCK_MS 100
 bool
 akita_mali_done(const uint64_t *snap, unsigned n)
 {
+	static uint64_t last_reached[MAX_GROUPS][MAX_QUEUES], last_moved[MAX_GROUPS][MAX_QUEUES];
+	static uint8_t said[MAX_GROUPS][MAX_QUEUES];
+	uint64_t now = mach_absolute_time(), stuck_abs;
+	bool done = true;
+
+	nanoseconds_to_absolutetime((uint64_t)STUCK_MS * NSEC_PER_MSEC, &stuck_abs);
 	for (unsigned i = 0; i < n; i++) {
 		unsigned g = i / MAX_QUEUES, q = i % MAX_QUEUES;
+		uint64_t reached;
 
-		if (snap[i] != 0 && groups[g].used && q < groups[g].queues && akita_mali_reached((int)g, q) < snap[i]) {
-			return false;
+		if (snap[i] == 0 || !groups[g].used || q >= groups[g].queues) {
+			continue;
+		}
+		reached = akita_mali_reached((int)g, q);
+		if (reached != last_reached[g][q] || last_moved[g][q] == 0 || reached >= groups[g].q[q].submitted) {
+			last_reached[g][q] = reached;       /* (it moved, or has nothing to do: the clock starts again) */
+			last_moved[g][q] = now;
+			said[g][q] = 0;
+		}
+		if (reached < snap[i]) {
+			if (now - last_moved[g][q] > stuck_abs) {
+				if (!said[g][q]) {
+					said[g][q] = 1;
+					printf("mali: group %u queue %u stands still at %llu of %llu for %u ms: the display no longer waits for it\n", g, q,
+					    reached, groups[g].q[q].submitted, STUCK_MS);
+				}
+				continue;
+			}
+			done = false;
 		}
 	}
-	return true;
+	return done;
 }
 
 /* every group's queues as the firmware sees them (a wait that timed out asks for this) */
