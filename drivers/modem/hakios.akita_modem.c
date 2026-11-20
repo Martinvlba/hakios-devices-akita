@@ -187,6 +187,9 @@ extern uint32_t akita_pcie0_msi_take(void);              /* the root complex's M
 #define CH_BOOT                 241u
 #define CH_RFS                  41u             /* umts_rfs0: the modem's file service */
 #define CH_RIL                  245u            /* umts_ipc0: the command protocol, SIM 1's stack */
+#define CH_GNSS_BOOT            240u            /* gnss_boot: the GNSS receiver's code load, through the modem */
+#define GNSS_FW_PHYS            (IPC_PHYS + 0x800000u)  /* cp_rmem's GNSS_FW region: Kepler's firmware, 4 MB */
+#define GNSS_FW_SIZE            0x400000u
 
 /*
  * The command protocol ("SIT"; the numbers are the names' in Android's vendor.radio.protocol.sit.base, the layout as
@@ -266,6 +269,7 @@ struct toc_entry { char name[12]; uint32_t file_offset, load_address, size, crc,
 #define TOC_ENTRIES             8u
 #define DOWNLOAD_CHUNK          0xc000u
 
+static unsigned int gnss_on;
 static unsigned int steps, step, listen_s = 20, link_sleep = 1, ask_every_s, radio_on, restarts, crash_after_s, use_irq = 1;
 static volatile uint8_t *ipc, *msi, *pktproc, *pin_hsi1, *pin_alive, *doorbell;
 static struct akita_modem_file *firmware;
@@ -1765,6 +1769,11 @@ rfs_message(const uint8_t *m, uint32_t length)
 	}
 }
 
+/* the GNSS receiver's code load (gnss_boot_run, below): the answer last seen on its channel */
+static uint8_t gnss_answer[16];
+static uint32_t gnss_answer_len;
+static bool gnss_answered;
+
 /* the raw queue's frames: the file service's served, the others said */
 static void
 raw_serve(void)
@@ -1782,7 +1791,11 @@ raw_serve(void)
 		if (frame_take(&RAW_RX, &channel, payload, 2048, &length, &config) <= 0) {
 			return;
 		}
-		if (channel == CH_RFS && length <= 2048 && (config & 0xc000) == 0xc000) {
+		if (channel == CH_GNSS_BOOT) {
+			gnss_answer_len = length < sizeof(gnss_answer) ? length : sizeof(gnss_answer);
+			memcpy(gnss_answer, payload, gnss_answer_len);
+			gnss_answered = true;
+		} else if (channel == CH_RFS && length <= 2048 && (config & 0xc000) == 0xc000) {
 			rfs_message(payload, length);
 		} else if (channel == CH_RFS && length <= 2048 && config == 0) {
 			rfs_message(payload, length);   /* (the modem's own frames here carry 0: whole messages all the same) */
@@ -1791,6 +1804,100 @@ raw_serve(void)
 			    channel, length, config, payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]);
 		}
 	}
+}
+
+/*
+ * The GNSS receiver (Samsung Kepler, devices/akita/drivers/gnss) is started by the modem: the phone puts its firmware
+ * in the modem's shared memory (the GNSS_FW region) and asks the modem, on channel 240 (Android's /dev/gnss_boot), to
+ * power the chip and load it. What gnssd was seen to send (11-20; each answered on the same channel by { command, its
+ * length, ... }) and, on Android, done again by hand with the same result (tools-ext/kepler):
+ *   01 02                                   the state: answered 01 05 00 <state> 00 00 00 (Android: 1, then 2 once powered; Darwin's first: 0, then 1)
+ *   09 0e 00 00 02 01 00..                  power on (answered 09 05 00 ..)
+ *   03 02, 04 02                            (answered 03 01 00, 04 01 00)
+ *   01 02                                   state 2
+ *   the firmware (fw/kepler.bin) at the region's start; 05 0e 00 00 00.. <u32 size>        load it (05 01 00)
+ *   the configuration block (fw/gnss-cfg.bin, 0x390 bytes) over the region's start; 05 0e 04 00 00.. <u32 size>
+ *   09 0e 20 00 02 00 01 00 00 60 00..      run (09 05 00 ..): CHPP on the chip's SPI link some 0.3 s later
+ * akita_gnss_state: 0 not asked, 1 under way, 2 running, -1 failed (read by the GNSS driver).
+ */
+int akita_gnss_state;
+
+static bool
+gnss_boot_command(const uint8_t *c, uint32_t n, uint32_t wait_ms)
+{
+	uint64_t until = now_ms() + wait_ms;
+
+	gnss_answered = false;
+	if (!frame_put(&RAW_TX, CH_GNSS_BOOT, c, n, NULL, 0)) {
+		printf("modem: gnss: command %02x %02x: the raw queue is full\n", c[0], c[2]);
+		return false;
+	}
+	message(MSG_SEND_RAW);
+	while (!gnss_answered && now_ms() < until) {
+		frames_say(&FMT_RX);
+		raw_serve();
+		if (link_sleep) {
+			link_follow();
+		}
+		sleep_ms(5);
+	}
+	if (!gnss_answered) {
+		printf("modem: gnss: command %02x %02x %02x %02x: no answer in %u ms\n", c[0], c[1], c[2], n > 4 ? c[4] : 0, wait_ms);
+		return false;
+	}
+	printf("modem: gnss: command %02x %02x %02x %02x: answered %02x %02x %02x %02x %02x %02x %02x\n", c[0], c[1], c[2],
+	    n > 4 ? c[4] : 0, gnss_answer[0], gnss_answer[1], gnss_answer[2], gnss_answer[3], gnss_answer[4], gnss_answer[5],
+	    gnss_answer[6]);
+	return gnss_answer[0] == c[0];
+}
+
+static void
+gnss_boot_run(void)
+{
+	static const uint8_t state[] = { 0x01, 0x02 }, power[14] = { 0x09, 0x0e, 0, 0, 0x02, 0x01 }, c3[] = { 0x03, 0x02 },
+	    c4[] = { 0x04, 0x02 }, run[14] = { 0x09, 0x0e, 0x20, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x60 };
+	uint8_t load_fw[14] = { 0x05, 0x0e }, load_cfg[14] = { 0x05, 0x0e, 0x04 };
+	const uint8_t *fw, *cfg;
+	uint64_t fw_size = 0, cfg_size = 0;
+	static volatile uint8_t *region;
+
+	akita_gnss_state = 1;
+	fw = hakios_image_file("fw", "kepler.bin", &fw_size, NULL);
+	cfg = hakios_image_file("fw", "gnss-cfg.bin", &cfg_size, NULL);
+	if (fw == NULL || cfg == NULL || fw_size == 0 || fw_size > GNSS_FW_SIZE || cfg_size == 0 || cfg_size > fw_size) {
+		printf("modem: gnss: no fw/kepler.bin or fw/gnss-cfg.bin in the image (%llu, %llu bytes): the receiver left off\n",
+		    fw_size, cfg_size);
+		akita_gnss_state = -1;
+		return;
+	}
+	if (region == NULL) {
+		region = map_ram(GNSS_FW_PHYS, GNSS_FW_SIZE);
+	}
+	if (region == NULL) {
+		akita_gnss_state = -1;
+		return;
+	}
+	memcpy(load_fw + 10, &fw_size, 4);
+	memcpy(load_cfg + 10, &cfg_size, 4);
+	printf("modem: gnss: starting the receiver (kepler.bin %llu bytes, its configuration %llu)\n", fw_size, cfg_size);
+	if (!gnss_boot_command(state, sizeof(state), 3000) || !gnss_boot_command(power, sizeof(power), 3000) ||
+	    !gnss_boot_command(c3, sizeof(c3), 3000) || !gnss_boot_command(c4, sizeof(c4), 3000) ||
+	    !gnss_boot_command(state, sizeof(state), 3000)) {
+		akita_gnss_state = -1;
+		return;
+	}
+	shared_put(region, fw, (uint32_t)fw_size);
+	if (!gnss_boot_command(load_fw, sizeof(load_fw), 5000)) {
+		akita_gnss_state = -1;
+		return;
+	}
+	shared_put(region, cfg, (uint32_t)cfg_size);
+	if (!gnss_boot_command(load_cfg, sizeof(load_cfg), 5000) || !gnss_boot_command(run, sizeof(run), 5000)) {
+		akita_gnss_state = -1;
+		return;
+	}
+	printf("modem: gnss: THE RECEIVER RUNS\n");
+	akita_gnss_state = 2;
 }
 
 static void
@@ -2162,6 +2269,9 @@ restart:
 			}
 			doorbell_owed = false;
 			rfs.size = 0;
+			if (akita_gnss_state != 0) {
+				akita_gnss_state = 0;   /* (the modem powers the receiver: started again with it) */
+			}
 			if (++restarts > 3) {
 				printf("modem: 9: started again three times already: left off\n");
 				return;
@@ -2171,6 +2281,9 @@ restart:
 		}
 		frames_say(&FMT_RX);
 		raw_serve();
+		if (gnss_on && akita_gnss_state == 0 && now_ms() - t_stay >= 3000) {
+			gnss_boot_run();        /* (once, three seconds into this step: the file service's first exchange over) */
+		}
 		if (link_sleep) {
 			link_follow();
 		}
@@ -2220,6 +2333,7 @@ akita_modem_init(void)
 	}
 	PE_parse_boot_argn("modem_delay", &delay_s, sizeof(delay_s));
 	PE_parse_boot_argn("modem_listen", &listen_s, sizeof(listen_s));
+	PE_parse_boot_argn("gnss", &gnss_on, sizeof(gnss_on));    /* (the GNSS receiver: started at step 9) */
 	PE_parse_boot_argn("modem_link_sleep", &link_sleep, sizeof(link_sleep));
 	PE_parse_boot_argn("modem_radio", &radio_on, sizeof(radio_on));
 	PE_parse_boot_argn("modem_crash_after", &crash_after_s, sizeof(crash_after_s));

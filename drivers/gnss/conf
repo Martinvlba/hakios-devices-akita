@@ -1,0 +1,8 @@
+# devices/akita/drivers/gnss/conf: the Pixel 8a's GNSS receiver (docs/drivers-config.md, docs/porting/drivers.md).
+
+driver AKITA_GNSS
+	file    bsd/dev/hakios.akita_gnss.c
+	requires AKITA_MODEM
+	help    the Pixel 8a's GNSS receiver, Samsung's Kepler on zuma's spi@111E0000 (USI3 of HSI0), started by the modem
+	help    (gnss=N with modem=9): its SPI link and handshake pins, Android's CHPP transport, gnssd's start messages
+	help    (fw/gnss-start.bin), the receiver's fixes into kern.hakios.gnss_*. Needs fw-gnss/
