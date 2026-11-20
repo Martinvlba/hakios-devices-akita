@@ -2112,7 +2112,8 @@ aoc_boot_image(const uint8_t *f, uint64_t size)
 		 */
 		{ 0x1009, 0 }, { 0x100A, aoc_mm_on ? 0u : 1u }, { 0x100B, 0 }, { 0x1010, 0 },     /* VNOM, monitor mode off, UART, ultrasonic */
 		{ 0x1011, (uint32_t)mach_absolute_time() },             /* a seed */
-		{ 0x1012, chip_rev }, { 0x1013, chip_type }, { 0x1014, 1 }, { 0x1015, aoc_mm_on ? 0u : 1u },   /* the chip, gnss-type 1, VoLTE MIF */
+		/* (the chip's revision as Android passes it on this phone, 0x11: read from CHIPID here it came out 0x1) */
+		{ 0x1012, chip_rev == 0x1 ? 0x11u : chip_rev }, { 0x1013, chip_type }, { 0x1014, 1 }, { 0x1015, aoc_mm_on ? 0u : 1u },   /* the chip, gnss-type 1, VoLTE MIF */
 		{ 0x1016, 0x9865000 }, { 0x1017, 0 },                   /* the SoC's product id, the Wi-Fi chip (as Android) */
 	};
 	volatile uint32_t *p = (volatile uint32_t *)(dram + image_size);
