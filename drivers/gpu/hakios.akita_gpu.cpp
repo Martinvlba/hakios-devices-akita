@@ -489,6 +489,68 @@ releasedAt(uint32_t sid)
 	return 0;
 }
 
+/*
+ * THE WINDOW SERVER'S FRAME RECORDED (11-20): the grace above (fb_busy_grace_us, 2.5 ms after the surface's last mark)
+ * is for a later stage not recorded yet -- and it made a frame whose GPU work ended after ~5.6 ms into a refresh miss it
+ * (vsync-dtl: GPU done at 5.4 ms, shown-ready at 8.3; every frame done later went a refresh late). backboardd now says
+ * when CoreAnimation's display update is finished (AppleCLCDDisplay::finish_update returned, userland/src/inject.c:
+ * kern.hakios.ws_frame): every stage of that frame recorded by then, its marks made. A surface first marked before the
+ * last such word, its marks gone: drawn, no grace. Without the word (another drawer, no injection) the grace as before.
+ * Boot-arg fb_ws_frame=0: never trusted.
+ */
+static uint64_t gWSFinishAt, gWSFrames, gWSNoGrace;
+static struct { uint32_t sid; uint64_t at; } gMarked[16];
+static unsigned gMarkedNext;
+static uint32_t gWSOn = 0xffffffff;
+
+static void
+markedNow(uint32_t sid)
+{
+	for (unsigned i = 0; i < 16; i++) {
+		if (gMarked[i].sid == sid) {
+			gMarked[i].at = mach_absolute_time();
+			return;
+		}
+	}
+	gMarked[gMarkedNext % 16].sid = sid;
+	gMarked[gMarkedNext % 16].at = mach_absolute_time();
+	gMarkedNext++;
+}
+
+/* (gLock held) the window server finished a frame after this surface's first mark: every stage of it is recorded */
+static bool
+wsRecorded(uint32_t sid)
+{
+	if (gWSOn == 0xffffffff && !PE_parse_boot_argn("fb_ws_frame", &gWSOn, sizeof(gWSOn))) {
+		gWSOn = 1;
+	}
+	if (!gWSOn || gWSFinishAt == 0) {
+		return false;
+	}
+	for (unsigned i = 0; i < 16; i++) {
+		if (gMarked[i].sid == sid) {
+			return gMarked[i].at != 0 && gWSFinishAt > gMarked[i].at;
+		}
+	}
+	return false;
+}
+
+/* kern.hakios.ws_frame (hakios.akita_display.c): backboardd's display update finished */
+extern "C" void hakios_ws_frame_finished(void);
+
+void
+hakios_ws_frame_finished(void)
+{
+	if (gLock == NULL) {
+		return;
+	}
+	IOLockLock(gLock);
+	gWSFinishAt = mach_absolute_time();
+	gWSFrames++;
+	thread_wakeup((event_t)gBusy);         /* (a grace waiting on it ends) */
+	IOLockUnlock(gLock);
+}
+
 static void
 busyChange(uint32_t sid, int32_t delta)
 {
@@ -522,6 +584,7 @@ busyChange(uint32_t sid, int32_t delta)
 		}
 	}
 	if (delta > 0 && free_slot >= 0) {
+		markedNow(sid);         /* (the frame's first mark of this surface: see wsRecorded) */
 		gBusy[free_slot].sid = sid;
 		gBusy[free_slot].count = delta;
 		thread_wakeup((event_t)gBusy);
@@ -587,7 +650,7 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		idle_grace = 1;
 	}
 	if (idle_grace && surface != NULL && milliseconds != 0 && grace_us != 0 && !busyNow(surface->sid) &&
-	    akita_mali_done(snap, n)) {
+	    akita_mali_done(snap, n) && !wsRecorded(surface->sid)) {
 		released = releasedAt(surface->sid);
 		idle_recent = released != 0 && mach_absolute_time() - released < grace_abs;
 	}
@@ -613,6 +676,10 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		 */
 		until = idle_recent ? released + grace_abs : mach_absolute_time() + grace_abs;
 		while (grace_us != 0 && mach_absolute_time() < until && mach_absolute_time() < deadline) {
+			if (!busyNow(surface->sid) && wsRecorded(surface->sid)) {
+				gWSNoGrace++;
+				break;
+			}
 			if (busyNow(surface->sid)) {
 				gBusyStages++;
 				gIdleStages += idle_recent;
@@ -652,8 +719,9 @@ MiniIOSurfaceDrawn(MiniIOSurface *surface, uint64_t milliseconds)
 		    ns / 1000 / gDrawnWaits, gDrawnWaits, gDrawnLate);
 		absolutetime_to_nanoseconds(gBusyWaitAbs, &ns);
 		IOLog("HakiosGPU: ... %llu of them waited for command buffers still drawing into the surface, %llu us each; %llu "
-		    "later stages caught in the grace (%llu of them after an idle GPU, %llu such graces)\n", gBusyWaits,
-		    gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages, gIdleStages, gIdleGraces);
+		    "later stages caught in the grace (%llu of them after an idle GPU, %llu such graces); %llu graces cut short by "
+		    "the window server's word (%llu words)\n", gBusyWaits,
+		    gBusyWaits ? ns / 1000 / gBusyWaits : 0, gBusyStages, gIdleStages, gIdleGraces, gWSNoGrace, gWSFrames);
 		IOLog("HakiosGPU: memory of the phone's RAM the GPU holds: %llu MB in %u buffers of programs (the most so far %llu "
 		    "MB), %llu MB the driver's own (firmware, page tables, tiler heaps); IOSurfaces apart; given back while "
 		    "something else still had the memory: %llu buffers of %llu MB in all, %llu surfaces' buffers; kept until "

@@ -181,6 +181,39 @@ static volatile uint32_t shown_index, queued = NO_BUFFER;
 static uint32_t flips, flips_dropped;
 /* (for a frame counter in user space: inject_sb.c's cube, sb_cube=1 -- the panel's real rate, not what was drawn) */
 SYSCTL_DECL(_kern_hakios);
+/*
+ * kern.hakios.ws_frame (write, anybody): backboardd's word that CoreAnimation finished a display update -- the frame's
+ * every stage recorded (userland/src/inject.c, after AppleCLCDDisplay::finish_update). The GPU glue then shows a drawn
+ * surface without its 2.5 ms grace for a later stage (hakios.akita_gpu.cpp: wsRecorded). Weak: no Mali, no use.
+ */
+extern void hakios_ws_frame_finished(void) __attribute__((weak));
+extern void hakios_tl(const char *format, ...) __printflike(1, 2);
+static uint64_t abs_us(uint64_t abs);
+static uint32_t ws_frame_tl = 2;
+
+static int
+ws_frame_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = 0, error = sysctl_handle_int(oidp, &value, 0, req);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (hakios_ws_frame_finished != NULL) {
+		hakios_ws_frame_finished();
+	}
+	if (ws_frame_tl == 2) {
+		uint32_t on = 0;
+
+		ws_frame_tl = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on != 0;
+	}
+	if (ws_frame_tl) {
+		hakios_tl("tl: u %llu\n", abs_us(mach_absolute_time()));
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, ws_frame, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    ws_frame_sysctl, "I", "the window server finished a frame (write)");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, display_flips, CTLFLAG_RD | CTLFLAG_LOCKED, &flips, 0,
     "surfaces put on the panel since boot");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, display_dropped, CTLFLAG_RD | CTLFLAG_LOCKED, &flips_dropped, 0,
@@ -223,6 +256,7 @@ static volatile uint32_t vblank_hz;
 static volatile uint64_t vblank_period;         /* the refresh's length (mach_absolute_time units): the vblank thread's sleep */
 static volatile bool vblank_paused;             /* measure_hz has the frame-done bit to itself */
 static uint32_t vs_on = 1;                      /* vsync_clock=0: the vsync clock off (see vs_caught) */
+static uint32_t display_tl;                     /* display_tl=1: a "tl: d" line per switch (flip_pending) */
 static uint32_t one_a_refresh = 1;              /* flip_one=0: two switches in one gap allowed (see do_switch) */
 
 static int
@@ -254,6 +288,7 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	PE_parse_boot_argn("display_sleep", &sleep_mode, sizeof(sleep_mode));
 	PE_parse_boot_argn("vsync_clock", &vs_on, sizeof(vs_on));
 	PE_parse_boot_argn("flip_one", &one_a_refresh, sizeof(one_a_refresh));
+	PE_parse_boot_argn("display_tl", &display_tl, sizeof(display_tl));
 	max_nits = max_nits < 100 ? 100 : max_nits > 1400 ? 1400 : max_nits;
 	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);     /* (the panel's commands: panel_commands) */
 	if (health_on) {
@@ -443,6 +478,9 @@ say_flipper(void)
  * 6 % instead of 8-12 %; the same refresh told twice 1 in 6585 instead of 1 in 6.
  */
 static uint64_t switch_fd;
+/* display_tl=1: a "tl: d" line per switch -- asked (scanout), switched, the frame done before, the way, the first look */
+static uint64_t tl_req_at;
+extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 static uint64_t beat_fd(uint64_t now, uint64_t period);
 
 /* the queued surface or buffer onto the panel (flip_lock held); RACE_CHECK: count a read that started meanwhile */
@@ -593,6 +631,9 @@ flip_pending(uint64_t period)
 {
 	uint64_t t0 = mach_absolute_time(), now, fd, last_busy = 0, spun = 0, step, near, safe, give_up, spin_most;
 	bool done = false, first = true;
+	char way = '?';
+	uint32_t look1 = 0;     /* the first look: 1 busy, 2 beat too old, 4 no beat, 8 same refresh as the last switch, 16 not in the gap */
+	uint64_t req = tl_req_at, fd_tl = 0;
 
 	nanoseconds_to_absolutetime(5 * NSEC_PER_USEC, &step);
 	nanoseconds_to_absolutetime(1500 * NSEC_PER_USEC, &near);
@@ -609,6 +650,12 @@ flip_pending(uint64_t period)
 			lck_mtx_unlock(flip_lock);
 			return;                         /* (nothing queued after all) */
 		}
+		if (first) {
+			uint64_t f = beat_fd(now, period);
+
+			look1 = (busy ? 1 : 0) | (now - vblank_sync_at >= 2 * period ? 2 : 0) | (f == 0 ? 4 : 0) |
+			    (f != 0 && f == switch_fd ? 8 : 0) | (f != 0 && !busy && !dpp_idle(false, now - f) ? 16 : 0);
+		}
 		if (busy) {
 			last_busy = now;
 			fd = beat_fd(now, period);
@@ -623,11 +670,15 @@ flip_pending(uint64_t period)
 			}
 			vblank_count++;
 			flip_count(now, last_busy, &flips_fresh);
+			fd_tl = now;
+			way = 'r';
 			do_switch();
 			done = true;
 		} else if (first && op_status_works && now - vblank_sync_at < 2 * period && (fd = beat_fd(now, period)) != 0 &&
 		    (!one_a_refresh || fd != switch_fd) && dpp_idle(false, now - fd)) {
 			flip_count(now, fd, &flips_at_once);
+			fd_tl = fd;
+			way = 'o';
 			do_switch();
 			done = true;
 		} else {
@@ -644,11 +695,16 @@ flip_pending(uint64_t period)
 				} else {
 					flip_count(now, fd, &flips_stale);
 				}
+				way = 'f';
 				do_switch();
 				done = true;
 			}
 		}
 		lck_mtx_unlock(flip_lock);
+		if (done && display_tl) {
+			hakios_tl("tl: d asked %llu switched %llu fd %llu way %c look %#x\n", abs_us(req), abs_us(now), abs_us(fd_tl), way,
+			    look1);
+		}
 		first = false;
 		if (done) {
 			break;
@@ -849,6 +905,7 @@ display_scanout(uint64_t phys, uint32_t row_bytes)
 	lck_mtx_lock(flip_lock);
 	scan_stride = row_bytes;
 	scan_phys = phys;
+	tl_req_at = mach_absolute_time();
 	lck_mtx_unlock(flip_lock);
 	thread_wakeup((event_t)&vblank_at);             /* (the flipper: at once if DPP0 idles now) */
 }
