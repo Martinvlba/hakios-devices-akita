@@ -222,6 +222,8 @@ static void panel_commands(void);
 static volatile uint32_t vblank_hz;
 static volatile uint64_t vblank_period;         /* the refresh's length (mach_absolute_time units): the vblank thread's sleep */
 static volatile bool vblank_paused;             /* measure_hz has the frame-done bit to itself */
+static uint32_t vs_on = 1;                      /* vsync_clock=0: the vsync clock off (see vs_caught) */
+static uint32_t one_a_refresh = 1;              /* flip_one=0: two switches in one gap allowed (see do_switch) */
 
 static int
 display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *height, uint32_t *row_bytes)
@@ -250,6 +252,8 @@ display_buffers(vm_offset_t va[3], uint32_t *count, uint32_t *width, uint32_t *h
 	PE_parse_boot_argn("display_dimming", &dimming, sizeof(dimming));
 	PE_parse_boot_argn("display_dark_ms", &dark_ms, sizeof(dark_ms));
 	PE_parse_boot_argn("display_sleep", &sleep_mode, sizeof(sleep_mode));
+	PE_parse_boot_argn("vsync_clock", &vs_on, sizeof(vs_on));
+	PE_parse_boot_argn("flip_one", &one_a_refresh, sizeof(one_a_refresh));
 	max_nits = max_nits < 100 ? 100 : max_nits > 1400 ? 1400 : max_nits;
 	dsim = (volatile uint32_t *)ml_io_map(DSIM0, 0x1000);     /* (the panel's commands: panel_commands) */
 	if (health_on) {
@@ -429,10 +433,27 @@ say_flipper(void)
 	fd_after_max_us = wake_late_max_us = 0;
 }
 
+/*
+ * ONE FRAME A REFRESH (11-20): a switch "at once in DPP0's idle gap" was made even when the gap had had one already --
+ * two swaps within ~3.6 ms, the first replaced before the panel read it (yet told shown: scanned() said so, its
+ * presentation time the same refresh as the next one's, which CoreAnimation drops). 16 % of a scroll's swaps
+ * (vsync-clock3). Now the second waits for the read after (the first is shown for a refresh), as a vsync'd display does.
+ * switch_fd: the frame done before the last switch. Boot-arg flip_one=0: as before. MEASURED (rc.jobs.akitascroll's
+ * zigzag, vsync-one/one2 against five runs before): frames a refresh late 19 / 24 % instead of 37-41 %, over 16.7 ms
+ * 6 % instead of 8-12 %; the same refresh told twice 1 in 6585 instead of 1 in 6.
+ */
+static uint64_t switch_fd;
+static uint64_t beat_fd(uint64_t now, uint64_t period);
+
 /* the queued surface or buffer onto the panel (flip_lock held); RACE_CHECK: count a read that started meanwhile */
 static void
 do_switch(void)
 {
+	{
+		uint64_t now = mach_absolute_time(), fd = beat_fd(now, vblank_period);
+
+		switch_fd = fd != 0 ? fd : now;
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");        /* (the frame's last writes out of the write buffers) */
 	if (scan_phys != 0) {
 		/* a surface scanned out where it is (zero copy): its address and its rows' stride */
@@ -463,6 +484,75 @@ do_switch(void)
 
 /* the last frame done seen arrive (not estimated): the beat's phase is only trusted for 12 refreshes after one */
 static volatile uint64_t vblank_sync_at;
+
+/*
+ * THE VSYNC CLOCK (11-20): what the framebuffer tells CoreAnimation as a refresh's time (frame info's
+ * Presentation_time, the vsync notifications). vblank_at was that before: exact only at the refreshes caught as they
+ * come (every 8th), else the time a late wake-up found the bit -- up to ~1 ms after. CoreAnimation puts its frame
+ * timer's phase on every time told (IOMFBDisplay::add_timing: the timing reference) and throws its period average away
+ * whenever two disagree by a 16th of a refresh (0.5 ms at 120 Hz), so its frames' start wandered by up to a
+ * millisecond. Now a phase-locked loop fed by the exact catches alone: vs_ref the beat's phase, vs_period its length
+ * (a refresh's error spread over the refreshes since the last catch, an eighth of it taken); a time told is the last
+ * beat on that grid before now -- never in the future (add_timing drops a time later than now), never off the beat.
+ * Lock lost (an error over a quarter refresh, a new rate, a second without a catch): back to vblank_at until the next
+ * catch. Boot-arg vsync_clock=0: vblank_at as before.
+ */
+static volatile uint64_t vs_ref, vs_period;
+static uint32_t vs_locks, vs_relocks;
+/* per source of catches (0 the beat's look, 1 a read's end seen while flipping): count, sum of |error| (us), over 100 us */
+static uint32_t vs_n[2], vs_far[2];
+static uint64_t vs_abs_us[2];
+
+static void
+vs_caught(uint64_t now, int src)
+{
+	uint64_t nominal = vblank_period, ref = vs_ref, period = vs_period, n, predicted;
+	int64_t err;
+
+	if (nominal == 0) {
+		return;
+	}
+	if (ref == 0 || period == 0 || now <= ref || period > nominal + nominal / 50 || period < nominal - nominal / 50) {
+		vs_period = nominal;
+		vs_ref = now;
+		vs_locks++;
+		return;
+	}
+	n = (now - ref + period / 2) / period;
+	if (n == 0) {
+		return;
+	}
+	predicted = ref + n * period;
+	err = (int64_t)(now - predicted);
+	{
+		uint64_t e = abs_us(err < 0 ? (uint64_t)-err : (uint64_t)err);
+
+		vs_n[src]++;
+		vs_abs_us[src] += e;
+		vs_far[src] += e > 100;
+	}
+	if (err > (int64_t)(period / 4) || err < -(int64_t)(period / 4) || n > (uint64_t)(2 * NSEC_PER_SEC / 8333333)) {
+		vs_period = nominal;
+		vs_ref = now;
+		vs_relocks++;
+		return;
+	}
+	vs_period = (uint64_t)((int64_t)period + err / (int64_t)n / 8);
+	vs_ref = (uint64_t)((int64_t)predicted + err / 4);
+}
+
+/* the last refresh before NOW on the vsync clock (0: not locked) */
+static uint64_t
+vs_beat(uint64_t now)
+{
+	uint64_t ref = vs_ref, period = vs_period, one_second;
+
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_second);
+	if (!vs_on || ref == 0 || period == 0 || now < ref || now - ref > one_second) {
+		return 0;
+	}
+	return ref + (now - ref) / period * period;
+}
 
 /* the frame done last due before NOW by the beat (0: no recent beat -- four refreshes without one, or none seen
  * arrive for 12: flip2 showed the phase drifting off when only estimated, and switches "in the gap" landed in a read) */
@@ -529,13 +619,14 @@ flip_pending(uint64_t period)
 			vblank_at = now;
 			if (now - last_busy < step * 8) {
 				vblank_sync_at = now;   /* (caught as it came: the beat exact) */
+				vs_caught(now, 1);
 			}
 			vblank_count++;
 			flip_count(now, last_busy, &flips_fresh);
 			do_switch();
 			done = true;
 		} else if (first && op_status_works && now - vblank_sync_at < 2 * period && (fd = beat_fd(now, period)) != 0 &&
-		    dpp_idle(false, now - fd)) {
+		    (!one_a_refresh || fd != switch_fd) && dpp_idle(false, now - fd)) {
 			flip_count(now, fd, &flips_at_once);
 			do_switch();
 			done = true;
@@ -641,17 +732,24 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 			}
 		}
 		t0 = mach_absolute_time();
-		while (mach_absolute_time() - t0 < window_abs) {
+		{
+		uint64_t clear_at = 0, look;   /* (the last look that found the bit clear) */
+		while ((look = mach_absolute_time()) - t0 < window_abs) {
 			if (rdma[RDMA_IRQ / 4] & FRAME_DONE) {
 				seen = true;
-				fresh = mach_absolute_time() != t0 && mach_absolute_time() - t0 > step_abs;
+				/* caught as it came only when the look before, a few us ago, found it clear: not after a delay()
+				 * (which sleeps here: a bit found after one was set who knows when -- the vsync clock's noise) */
+				fresh = clear_at != 0 && look - clear_at < 4 * step_abs;
 				break;
 			}
+			clear_at = look;
 			if (mach_absolute_time() - t0 < (precise ? catch_abs : short_abs)) {
 				spin_abs(step_abs);
 			} else {
 				delay(50);
+				clear_at = 0;
 			}
+		}
 		}
 		now = mach_absolute_time();
 		rdma[RDMA_IRQ / 4] = FRAME_DONE;
@@ -660,6 +758,7 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 			/* when it was: now if seen arrive, else the beat's (the last one due before now) */
 			if (fresh) {
 				vblank_at = vblank_sync_at = now;
+				vs_caught(now, 0);
 				need_sync = false;
 			} else {
 				vblank_at = vblank_at == 0 || period_abs == 0 || now < vblank_at + period_abs ? now :
@@ -683,6 +782,15 @@ flipper(__unused void *arg, __unused wait_result_t wr)
 			say_at = now;
 			said_flips = flips;
 			say_flipper();
+			{
+				uint64_t ns = 0;
+
+				absolutetime_to_nanoseconds(vs_period, &ns);
+				printf("akita_display: vsync clock %s: a refresh %llu.%03llu us, %u locks, %u lost; catches off the beat: "
+				    "looked %u (mean %llu us, %u over 100), read's end %u (mean %llu us, %u over 100)\n", vs_beat(now) != 0 ?
+				    "locked" : "not locked", ns / 1000, ns % 1000, vs_locks, vs_relocks, vs_n[0], vs_n[0] ? vs_abs_us[0] /
+				    vs_n[0] : 0, vs_far[0], vs_n[1], vs_n[1] ? vs_abs_us[1] / vs_n[1] : 0, vs_far[1]);
+			}
 		}
 	}
 }
@@ -695,7 +803,13 @@ display_refresh_hz(void)
 
 	return hz >= 112 && hz <= 128 ? 120 : hz >= 55 && hz <= 65 ? 60 : hz;
 }
-static uint64_t display_vblank_time(void) { return vblank_at; }
+static uint64_t
+display_vblank_time(void)
+{
+	uint64_t beat = vs_beat(mach_absolute_time());
+
+	return beat != 0 ? beat : vblank_at;
+}
 /* (for the governor's frame boost: the panel's measured rate, hakios.akita_dvfs.c) */
 uint32_t akita_display_refresh(void);
 uint32_t akita_display_refresh(void) { return vblank_hz; }
