@@ -1639,10 +1639,40 @@ usf_vector(const uint8_t *b, uint32_t len, uint32_t at, uint32_t *data, uint32_t
 	return *data + *n <= len || *data + *n * 4 <= len;
 }
 
+/* what the sensors last said, for iOS: kern.hakios.motion (read by backboardd's injected HID services, inject.c) */
+static struct {
+	uint32_t version;               /* 1 */
+	uint32_t accel_seq, light_seq, proximity_seq;
+	uint64_t accel_ns;              /* the AoC's time stamp */
+	float accel[3];                 /* m/s2, Android's axes (x right, y up, z out of the screen; +9.8 on z lying face up) */
+	float lux, proximity;
+} usf_motion = { .version = 1 };
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_OPAQUE(_kern_hakios, OID_AUTO, motion, CTLFLAG_RD | CTLFLAG_LOCKED, &usf_motion, sizeof(usf_motion), "S",
+    "the AoC's sensors, the latest: accelerometer (m/s2), light (lux), proximity");
+
 static void
 usf_event(const uint8_t *e, uint32_t n)
 {
 	usf_events++;
+	if (n >= 28) {
+		/* the latest of each for iOS (kern.hakios.motion): USF type 1 accelerometer (m/s2, Android's axes), 9 light
+		 * (lux first), 3 proximity (its first value: the distance, 5 = far) */
+		uint32_t type = usf_u16(e, 12), dlen = e[15];
+		uint64_t ts = (uint64_t)usf_u32(e, 16) | (uint64_t)usf_u32(e, 20) << 32;
+
+		if (type == 1 && dlen >= 12 && n >= 36) {
+			memcpy(usf_motion.accel, e + 24, 12);
+			usf_motion.accel_ns = ts;
+			usf_motion.accel_seq++;
+		} else if (type == 9 && dlen >= 4) {
+			memcpy(&usf_motion.lux, e + 24, 4);
+			usf_motion.light_seq++;
+		} else if (type == 3 && dlen >= 4) {
+			memcpy(&usf_motion.proximity, e + 24, 4);
+			usf_motion.proximity_seq++;
+		}
+	}
 	if (n < 24 || usf_said >= 12) {
 		return;
 	}
@@ -1997,6 +2027,24 @@ usf_probe(void)
 		}
 	}
 	printf("akita aoc: usf: %u events in 20 s (%u before)\n", usf_events - before, before);
+	/* ... and from then on for ever: the latest values kept for iOS (kern.hakios.motion) */
+	for (uint64_t said = mach_absolute_time();;) {
+		int n = aoc_read(usf_svc, buf, sizeof(buf), 20);
+		if (n >= 16 && n <= (int)sizeof(buf)) {
+			const uint8_t *m = buf + 4;
+			uint32_t ml = (uint32_t)n - 4, root = usf_u32(m, 0), ka = usf_field(m, ml, root, 0), va = usf_field(m, ml, root, 1), d, dn;
+			if (ka && usf_u32(m, ka) == 9 && usf_vector(m, ml, va, &d, &dn) && d + dn <= ml) {
+				usf_event(m + d, dn);
+			}
+		}
+		uint64_t ns;
+		absolutetime_to_nanoseconds(mach_absolute_time() - said, &ns);
+		if (ns > 300ull * NSEC_PER_SEC) {
+			said = mach_absolute_time();
+			printf("akita aoc: usf: %u events so far (accelerometer %u, light %u, proximity %u)\n", usf_events,
+			    usf_motion.accel_seq, usf_motion.light_seq, usf_motion.proximity_seq);
+		}
+	}
 }
 
 /*
