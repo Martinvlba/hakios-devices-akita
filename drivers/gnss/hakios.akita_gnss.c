@@ -132,6 +132,10 @@ static int gnss_state;                  /* 0 off, 1 the link set up, 2 CHPP open
 static int gnss_fixes, gnss_valid, gnss_sv, gnss_lat, gnss_lon, gnss_acc, gnss_flags, gnss_kind;
 static int gnss_utc_date, gnss_utc_time;        /* yyyymmdd, hhmmssmmm (with the milliseconds) */
 static int gnss_fix_seq;                /* counts every fix read (valid or not): a reader sees a new one by it */
+#define NVM_SIZE        334             /* the chip's memory save (below: kern.hakios.gnss_nvm) */
+static uint8_t gnss_nvm[NVM_SIZE];
+static int gnss_nvm_saves;              /* the chip's saves read since the start */
+static bool gnss_nvm_given;             /* written from user space */
 
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_state, 0,
@@ -332,8 +336,14 @@ fix_read(const uint8_t *b, uint32_t n)
 	gnss_fix_seq++;
 	/* (the log gets the fix's quality only: never its position) */
 	if (gnss_fix_seq <= 3 || gnss_valid != was_valid || gnss_fix_seq % 60 == 0) {
-		printf("gnss: report %d: %s, flags 0x%x, kind %u, %u satellites, accuracy field %u, UTC %08d %09d\n", gnss_fix_seq,
-		    gnss_valid ? "A FIX" : "no fix", flags, b[20], sv, acc, gnss_utc_date, gnss_utc_time);
+		int32_t u60, u80, u84;
+
+		memcpy(&u60, b + 60, 4);
+		memcpy(&u80, b + 80, 4);
+		memcpy(&u84, b + 84, 4);
+		printf("gnss: report %d: %s, flags 0x%x, kind %u, %u satellites, accuracy field %d (+60 %d, +80 %d, +84 %d), UTC %08d %09d\n",
+		    gnss_fix_seq, gnss_valid ? "A FIX" : "no fix", flags, b[20], sv, (int32_t)acc, u60, u80, u84, gnss_utc_date,
+		    gnss_utc_time);
 	}
 }
 
@@ -353,6 +363,12 @@ betp_in(const uint8_t *q, uint32_t n)
 		}
 		if (q[i] == 0x43 && q[i + 1] == 0x01) {
 			fix_read(q + i + 16, len);
+		}
+		if (q[i] == 0xad && q[i + 1] == 0x08 && len == NVM_SIZE) {
+			memcpy(gnss_nvm, q + i + 16, NVM_SIZE);
+			if (gnss_nvm_saves++ == 0) {
+				printf("gnss: the chip's first memory save kept (kern.hakios.gnss_nvm)\n");
+			}
 		}
 		i += 16 + len;
 	}
@@ -552,6 +568,79 @@ chpp_send(const uint8_t *payload, uint32_t n, const char *what)
 	return false;
 }
 
+/* ---- the chip's memory and the time ---------------------------------------------------------------------------------- */
+
+/*
+ * The chip saves what it knows (class 0xad id 8, 334 bytes, every few seconds while it navigates: gnssd keeps it in
+ * /data/vendor/gps/NVM9x) and is given it back at the start, in the same message. kern.hakios.gnss_nvm holds the last
+ * one it sent; written before step 3 (a daemon keeping it on the data volume), it replaces the captured one in the
+ * start messages: the next start is then not a cold one.
+ */
+
+static int
+sysctl_gnss_nvm SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int error = SYSCTL_OUT(req, gnss_nvm, NVM_SIZE);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (req->newlen != NVM_SIZE) {
+		return EINVAL;
+	}
+	error = SYSCTL_IN(req, gnss_nvm, NVM_SIZE);
+	if (error == 0) {
+		gnss_nvm_given = true;
+	}
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gnss_nvm, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_gnss_nvm, "S",
+    "the GNSS chip's last memory save (334 bytes); written before its start: given back to it");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_nvm_saves, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_nvm_saves, 0, "the chip's memory saves read");
+
+/*
+ * One of our start messages brought up to date: the time (0xd7 2: +8 u16 GPS week, +10 and +14 the time of week in
+ * microseconds, high and low u32 -- from the kernel's clock, the modem's network time or the RTC) and the chip's memory
+ * (0xad 8: the save kept, when one was given). Messages: { class, id, u16 2, ..., +16 u16 20, +18 u16 length } + data.
+ */
+static void
+start_message_update(uint8_t *q, uint32_t n)
+{
+	for (uint32_t i = 0; i + 20 <= n;) {
+		uint8_t *m = q + i;
+		uint32_t hs = m[16] | m[17] << 8, len = m[18] | m[19] << 8;
+
+		if (m[2] != 2 || hs != 20 || i + 20 + len > n) {
+			break;
+		}
+		if (m[0] == 0xd7 && m[1] == 0x02 && len >= 18) {
+			clock_sec_t sec;
+			clock_usec_t usec;
+			uint64_t gps, tow;
+			uint32_t hi, lo;
+			uint16_t week;
+
+			clock_get_calendar_microtime(&sec, &usec);
+			if (sec > 1700000000) {         /* (a clock that is set: after 2023) */
+				gps = (uint64_t)sec - 315964800ull + 18;        /* the GPS epoch, 18 leap seconds */
+				week = (uint16_t)(gps / 604800);
+				tow = (gps % 604800) * 1000000ull + usec;
+				hi = (uint32_t)(tow >> 32);
+				lo = (uint32_t)tow;
+				memcpy(m + 20 + 8, &week, 2);
+				memcpy(m + 20 + 10, &hi, 4);
+				memcpy(m + 20 + 14, &lo, 4);
+			}
+		}
+		if (m[0] == 0xad && m[1] == 0x08 && len == NVM_SIZE && gnss_nvm_given) {
+			memcpy(m + 20, gnss_nvm, NVM_SIZE);
+			printf("gnss: 3: the chip's memory given back (a save kept from before)\n");
+		}
+		i += 20 + len;
+	}
+}
+
 /* ---- the run ------------------------------------------------------------------------------------------------------- */
 
 static void
@@ -645,6 +734,7 @@ gnss_run(void)
 			link_poll(wait > 3000 ? 3000 : wait);
 			memcpy(payload, "\x10\x02\x00\x00\x02\x00", 6);
 			memcpy(payload + 6, script + o + 6, n);
+			start_message_update(payload + 6, n);
 			(void)chpp_send(payload, 6u + n, "a start message");
 			sent++;
 			o += 6u + n;

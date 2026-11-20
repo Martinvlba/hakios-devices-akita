@@ -1729,6 +1729,83 @@ usf_payload(const uint8_t *in, uint32_t n, const uint8_t **p, uint32_t *plen, ui
 	return true;
 }
 
+/*
+ * THE SENSOR REGISTRY (11-20): the AoC's sensor core knows no sensor until the AP gives it the board's registry
+ * scripts -- Android's sensors HAL does after every AoC start (traced across an AoC reset on Android,
+ * fdtrace of its writes): to the AoC's file-system object (UUID d76a14cc..., object 5) type 24 requests { the script's text, the
+ * board's CDT 0x46100 } -- /vendor/etc/sensors/registry/akita_common, _pvt, _proto, _dev, _dvt .reg (the AoC keeps
+ * what the CDT filters select), append/motion_state.reg, power.reg, the factory calibration (/fac_cal/...) and
+ * /persist from the phone's /mnt/vendor/persist -- and type 22 (/dev/display_info/0: the panel). Big ones in
+ * fragments (kind 3: { 1, total, offset, up to 940 bytes of the whole message }). Those writes, as Android sent them,
+ * are fw/usf-registry.bin ("HKUR0001", then { u16 length, u16 1 if an answer comes after it } + the message; this
+ * phone's calibration: never in git, fw-sensors/); sent here unchanged, before the list is asked for.
+ */
+static uint32_t
+usf_registry_push(uint8_t *buf, uint32_t cap)
+{
+	static const uint8_t fs_uuid[16] = { 0xd7, 0x6a, 0x14, 0xcc, 0x26, 0x4d, 0xee, 0xa1, 0xc6, 0x40, 0x6f, 0x8b, 0x46, 0x16, 0x82, 0xc0 };
+	static uint8_t out[1100];
+	uint8_t req[sizeof(usf_t_lookup)];
+	uint32_t in, il, st, plen, fs = 0, sent = 0, answered = 0;
+	const uint8_t *p, *file;
+	uint64_t size = 0;
+
+	file = hakios_image_file("fw", "usf-registry.bin", &size, NULL);
+	if (file == NULL || size < 8 || memcmp(file, "HKUR0001", 8) != 0) {
+		printf("akita aoc: usf: no fw/usf-registry.bin: the sensor core gets no registry (and knows no sensor)\n");
+		return 0;
+	}
+	memcpy(req, usf_t_lookup, sizeof(usf_t_lookup));
+	memcpy(req + USF_AT_UUID, fs_uuid, 16);
+	if (usf_request(req, sizeof(usf_t_lookup), buf, cap, &in, &il, 1000) && usf_payload(buf + in, il, &p, &plen, &st)) {
+		uint32_t f = usf_field(p, plen, usf_u32(p, 0), 0);
+		fs = f ? usf_u32(p, f) : 0;
+	}
+	if (fs != 5) {
+		printf("akita aoc: usf: the file system is object %u, not Android's 5: the registry (addressed to 5) not sent\n", fs);
+		return 0;
+	}
+	for (uint64_t o = 8; o + 4 <= size;) {
+		uint16_t len, expect;
+
+		memcpy(&len, file + o, 2);
+		memcpy(&expect, file + o + 2, 2);
+		if (o + 4 + len > size || len + 4u > sizeof(out)) {
+			break;
+		}
+		out[0] = USF_CHANNEL; out[1] = out[2] = out[3] = 0;
+		memcpy(out + 4, file + o + 4, len);
+		if (!aoc_write(usf_svc, out, len + 4u)) {
+			printf("akita aoc: usf: the queue to the AoC is full at the registry's message %u\n", sent);
+			break;
+		}
+		sent++;
+		o += 4u + len;
+		if (!expect) {
+			continue;
+		}
+		/* its answer (any response: a kind 2; events said as they come) */
+		for (int waited = 0; waited < 1000;) {
+			int n = aoc_read(usf_svc, buf, cap, 10);
+			if (n < 0) {
+				waited += 10;
+				continue;
+			}
+			if (n < 16 || (uint32_t)n > cap) {
+				continue;
+			}
+			const uint8_t *m = buf + 4;
+			uint32_t ml = (uint32_t)n - 4, root = usf_u32(m, 0), ka = usf_field(m, ml, root, 0);
+			if (ka && usf_u32(m, ka) == 2) {
+				answered++;
+				break;
+			}
+		}
+	}
+	printf("akita aoc: usf: the registry given to the sensor core: %u messages sent, %u answered\n", sent, answered);
+	return answered;
+}
+
 static void
 usf_probe(void)
 {
@@ -1818,6 +1895,7 @@ usf_probe(void)
 			printf("akita aoc: usf: type 32 {1} %s\n", usf_request(req, sizeof(usf_t_32), buf, sizeof(buf), &in, &il, 1000) ? "answered" : "NOT answered");
 		}
 	}
+	(void)usf_registry_push(buf, sizeof(buf));
 	/* type 5: the registry's sensors (the info template's shape: no payload); asked again for 30 s while empty */
 	for (int again = 0; again < 60 && nids == 0; again++) {
 		if (again != 0) {
@@ -1921,9 +1999,126 @@ usf_probe(void)
 	printf("akita aoc: usf: %u events in 20 s (%u before)\n", usf_events - before, before);
 }
 
+/*
+ * THE AoC's SysMMU (11-20, read only): Android's aoc_configure_sysmmu maps the firmware's own table (image_config's
+ * sysmmu entries, 7 in this aoc.bin: the carveout 0x98000000 -> 0x94000000 48 MB, 0x9b000000 -> 0x97000000 4 MB, and
+ * peripheral windows 0x9e000000 -> 0x15100000, 0x9e200000 -> 0x16400000, 0x9e500000 -> 0x11200000, 0x9e300000 ->
+ * 0x40000000, 0x9e380000 -> 0x40400000) into the SysMMU at 0x19090000 (samsung,sysmmu-v9) after every AoC start; this
+ * driver does not. Said: whether it is on and where its page table is.
+ */
+static void
+aoc_sysmmu_say(const char *when)
+{
+	static vm_offset_t mmu;
+
+	if (mmu == 0) {
+		mmu = ml_io_map(0x19090000ULL, 0x10000);
+	}
+	if (mmu == 0) {
+		return;
+	}
+	printf("akita aoc: sysmmu (%s): CTRL 0x%x STATUS 0x%x VERSION 0x%x; VM0 CTRL 0x%x FLPT_BASE 0x%x ATTRIBUTE 0x%x; contexts 0x%x\n",
+	    when, *(volatile uint32_t *)(mmu + 0x0), *(volatile uint32_t *)(mmu + 0x8), *(volatile uint32_t *)(mmu + 0x34),
+	    *(volatile uint32_t *)(mmu + 0x8000), *(volatile uint32_t *)(mmu + 0x8404), *(volatile uint32_t *)(mmu + 0x8408),
+	    *(volatile uint32_t *)(mmu + 0x100));
+}
+
+/*
+ * ... and set up as Android does (boot-arg aocmmu=1, 11-20): a page table of the firmware's own entries (copied out of
+ * its image_config when it is loaded: aoc_sysmmu_table), 1 MB sections where an entry allows them and 4 KB pages
+ * elsewhere, then the registers Android's samsung_iommu_v9 was seen to write after an AoC restart (rwmmio trace):
+ * FLPT_BASE (+0x8404, the table >> 12), ATTRIBUTE 0x20f84 (+0x8408: the walk non-cacheable), PMMU 0 (+0x2ffc), the
+ * default stream 0x10b (+0x2000), 29 streams { 0x10b (the first 0x100010b), 0x301, SID, 0x3f } from +0x2010, CTRL_VM
+ * 0x25 (+0x8000: on), invalidate all (+0x8010). Entries: a section (pa >> 4) | 2 | read 1<<4 | write 1<<5; a second
+ * level (its table >> 4) | 1, small pages (pa >> 4) | 2 | read 1<<2 | write 1<<3.
+ */
+#define AOC_MMU_ENTRIES_MAX     16
+static uint64_t aoc_sysmmu_table[AOC_MMU_ENTRIES_MAX];
+static uint32_t aoc_sysmmu_count;
+
+static bool
+aoc_sysmmu_setup(void)
+{
+	static const uint8_t sids[] = { 0x2, 0x3, 0x4, 0x5, 0x6, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+	    0x26, 0x27, 0x28, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 };
+	static vm_offset_t mmu, l1, l2pool;
+	static uint32_t l2used;
+	const uint32_t L1_BYTES = 65536 * 4, L2_BYTES = 1024, L2_POOL = 64 * 1024;
+
+	if (aoc_sysmmu_count == 0) {
+		printf("akita aoc: sysmmu: the firmware gave no table\n");
+		return false;
+	}
+	if (mmu == 0) {
+		mmu = ml_io_map(0x19090000ULL, 0x10000);
+	}
+	if (mmu == 0 || (*(volatile uint32_t *)(mmu + 0x34) >> 28) != 0x9) {
+		printf("akita aoc: sysmmu: not answering (version 0x%x): left alone\n", mmu ? *(volatile uint32_t *)(mmu + 0x34) : 0);
+		return false;
+	}
+	if (l1 == 0 && (kmem_alloc_contig(kernel_map, &l1, L1_BYTES, L1_BYTES - 1, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_PERMANENT,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || kmem_alloc_contig(kernel_map, &l2pool, L2_POOL, PAGE_SIZE - 1, 0, 0,
+	    KMA_KOBJECT | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)) {
+		printf("akita aoc: sysmmu: no memory for its table\n");
+		l1 = 0;
+		return false;
+	}
+	volatile uint32_t *t1 = (volatile uint32_t *)l1;
+	for (uint32_t i = 0; i < aoc_sysmmu_count; i++) {
+		uint64_t v = aoc_sysmmu_table[i];
+		uint64_t va = (v & 0xfffff) << 12, pa = ((v >> 20) & 0xffffff) << 12, size = ((v >> 44) & 0xfffff) << 12;
+
+		printf("akita aoc: sysmmu: 0x%llx -> 0x%llx, 0x%llx bytes\n", va, pa, size);
+		for (uint64_t off = 0; off < size;) {
+			uint64_t a = va + off, b = pa + off;
+			uint32_t i1 = (uint32_t)(a >> 20);
+
+			if (((a | b) & 0xfffff) == 0 && size - off >= (1u << 20)) {
+				t1[i1] = (uint32_t)(b >> 4) | 2 | (1u << 4) | (1u << 5);
+				off += 1u << 20;
+				continue;
+			}
+			if ((t1[i1] & 7) != 1) {        /* a second-level table for this megabyte */
+				if (l2used + L2_BYTES > L2_POOL) {
+					printf("akita aoc: sysmmu: out of second-level tables\n");
+					return false;
+				}
+				t1[i1] = (uint32_t)(kvtophys(l2pool + l2used) >> 4) | 1;
+				l2used += L2_BYTES;
+			}
+			volatile uint32_t *t2 = (volatile uint32_t *)(l2pool + ((((uint64_t)(t1[i1] & ~0x3fu)) << 4) - kvtophys(l2pool)));
+			t2[(a >> 12) & 0xff] = (uint32_t)(b >> 4) | 2 | (1u << 2) | (1u << 3);
+			off += 1u << 12;
+		}
+	}
+	for (vm_offset_t line = l1; line < l1 + L1_BYTES; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	for (vm_offset_t line = l2pool; line < l2pool + L2_POOL; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__builtin_arm_dsb(0xf);
+	wr(mmu, 0x8404, (uint32_t)(kvtophys(l1) >> 12));
+	wr(mmu, 0x8408, 0x20f84);
+	wr(mmu, 0x2ffc, 0);
+	wr(mmu, 0x2000, 0x10b);
+	for (uint32_t i = 0; i < sizeof(sids); i++) {
+		wr(mmu, 0x2010 + 16 * i, i == 0 ? 0x100010b : 0x10b);
+		wr(mmu, 0x2014 + 16 * i, 0x301);
+		wr(mmu, 0x2018 + 16 * i, sids[i]);
+		wr(mmu, 0x201c + 16 * i, 0x3f);
+	}
+	wr(mmu, 0x8000, rd(mmu, 0x8000) | 1);
+	wr(mmu, 0x8010, 1);
+	__builtin_arm_dsb(0xf);
+	aoc_sysmmu_say("set up");
+	return true;
+}
+
 static void
 aoc_usf_thread(__unused void *arg, __unused wait_result_t wr_)
 {
+	aoc_sysmmu_say("before the sensors' probe");
 	usf_probe();
 }
 
@@ -2015,6 +2210,17 @@ aoc_boot_image(const uint8_t *f, uint64_t size)
 
 	uint32_t auth_magic = *(const uint32_t *)(f + 1024), generation = *(const uint32_t *)(f + 1028);
 	const uint8_t *cfg = f + 1024 + (generation == 2 ? 384 : 352);         /* header_v2: a 64-byte hash */
+	{
+		/* the SysMMU's entries (image_config: +20 u16 sysmmu offset, +22 its size, 8 bytes an entry; aoc_sysmmu_setup) */
+		uint16_t so = *(const uint16_t *)(cfg + 20), ss = *(const uint16_t *)(cfg + 22);
+
+		aoc_sysmmu_count = 0;
+		if (so < 256 && so + ss <= 256 && ss % 8 == 0) {
+			for (uint32_t i = 0; i < ss / 8 && i < AOC_MMU_ENTRIES_MAX; i++) {
+				memcpy(&aoc_sysmmu_table[aoc_sysmmu_count++], cfg + so + 8 * i, 8);
+			}
+		}
+	}
 	uint32_t fw_start = *(const uint32_t *)(cfg + 4), fw_size = *(const uint32_t *)(cfg + 8);
 	const uint8_t *sb = f + AOC_AUTH_HEADER_SIZE;
 	uint32_t sb_magic = *(const uint32_t *)sb, image_size = *(const uint32_t *)(sb + 12);
@@ -2131,6 +2337,15 @@ aoc_boot_image(const uint8_t *f, uint64_t size)
 	    chip_type, chip_rev);
 	delay(300000);
 	wr(aoc_req, 0, 1);
+	{
+		uint32_t mmu_on = 0;
+
+		PE_parse_boot_argn("aocmmu", &mmu_on, sizeof(mmu_on));
+		if (mmu_on) {
+			delay(1000);
+			(void)aoc_sysmmu_setup();
+		}
+	}
 	if (akita_trusty_aoc_cmd(1, &state) != 0) {         /* GSA_AOC_START */
 		printf("akita aoc: GSA_AOC_START refused\n");
 		return;
