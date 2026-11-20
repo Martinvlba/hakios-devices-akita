@@ -2091,6 +2091,8 @@ aoc_boot_image(const uint8_t *f, uint64_t size)
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	printf("akita aoc: THE GSA LOADED THE IMAGE in %llu ms\n", ns / 1000000);
 	/* the firmware's parameters at the IPC block (aoc_pass_fw_information), as Android passes them */
+	uint32_t aoc_mm_on = 0;
+	PE_parse_boot_argn("aocmm", &aoc_mm_on, sizeof(aoc_mm_on));
 	vm_offset_t chip = ml_io_map(CHIPID_PHYS, 0x1000);
 	uint32_t chip_type = chip ? rd(chip, 0) & 0xf : 0, r10 = chip ? rd(chip, 0x10) : 0;
 	uint32_t chip_rev = (((r10 >> 20) & 0xf) << 4) | ((r10 >> 16) & 0xf);
@@ -2102,9 +2104,16 @@ aoc_boot_image(const uint8_t *f, uint64_t size)
 		{ 0x1007, AOC_BINARY_DRAM_BASE + sensor }, { 0x1008, 4u << 20 },
 		{ 0x100C, AOC_BINARY_DRAM_BASE + playback }, { 0x100D, 0x4000 },
 		{ 0x100E, AOC_BINARY_DRAM_BASE + capture }, { 0x100F, 0x10000 },
-		{ 0x1009, 0 }, { 0x100A, 0 }, { 0x100B, 0 }, { 0x1010, 0 },     /* VNOM, monitor mode, UART, ultrasonic */
+		/*
+		 * (11-20) AS ANDROID PASSES THEM (its aoc_pass_fw_information traced at an AoC restart, rwmmio): 0x100A
+		 * kAOCDisableMM = 1 -- the AoC's monitor mode OFF ("AoC Monitor Mode disabled"); it was 0 here, monitor mode
+		 * on, and the sensor core registered no sensor at all (USF's list empty, TODO 34) --, 0x1015
+		 * kAOCVolteReleaseMif = 1, 0x1016 kAOCChipProductId (0x9865000), 0x1017 kAOCWifiChip (0). aocmm=1: as before.
+		 */
+		{ 0x1009, 0 }, { 0x100A, aoc_mm_on ? 0u : 1u }, { 0x100B, 0 }, { 0x1010, 0 },     /* VNOM, monitor mode off, UART, ultrasonic */
 		{ 0x1011, (uint32_t)mach_absolute_time() },             /* a seed */
-		{ 0x1012, chip_rev }, { 0x1013, chip_type }, { 0x1014, 1 }, { 0x1015, 0 },   /* the chip, gnss-type 1 */
+		{ 0x1012, chip_rev }, { 0x1013, chip_type }, { 0x1014, 1 }, { 0x1015, aoc_mm_on ? 0u : 1u },   /* the chip, gnss-type 1, VoLTE MIF */
+		{ 0x1016, 0x9865000 }, { 0x1017, 0 },                   /* the SoC's product id, the Wi-Fi chip (as Android) */
 	};
 	volatile uint32_t *p = (volatile uint32_t *)(dram + image_size);
 	uint32_t num = sizeof(kv) / sizeof(kv[0]);
