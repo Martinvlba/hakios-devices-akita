@@ -223,10 +223,27 @@ pd_off_init(void)
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, pd_off_init);
 
+void hakios_platform_halt(int reboot);
+
+/* The backstop: an orderly restart that has not happened 30 s later (a file system's sync that hangs) is forced. */
+static void
+test_time_up_hard(__unused thread_call_param_t a, __unused thread_call_param_t b)
+{
+	printf("akita: test_reboot_after: the orderly restart hung: restarting at once\n");
+	hakios_platform_halt(1);
+}
+
 static void
 test_time_up(__unused thread_call_param_t a, __unused thread_call_param_t b)
 {
+	static thread_call_t hard;
+	uint64_t deadline;
+
 	printf("akita: test_reboot_after: the test build's time is up: restarting (to the active slot)\n");
+	hard = thread_call_allocate_with_options(test_time_up_hard, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH,
+	    THREAD_CALL_OPTIONS_ONCE);
+	clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(hard, deadline);
 	(void)reboot_kernel(0 /* RB_AUTOBOOT */, (char *)"akita: the test build's time limit");
 }
 
